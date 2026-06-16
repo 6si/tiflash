@@ -18,6 +18,7 @@
 #include <Common/PODArray.h>
 #include <Common/typeid_cast.h>
 #include <Core/Field.h>
+#include <DataTypes/IDataType.h>
 #include <common/StringRef.h>
 
 #include <cassert>
@@ -36,12 +37,6 @@ namespace DB
  * This enables downstream operators (filter, group-by, join) to operate directly
  * on dictionary IDs without decoding. When decoding is needed, call `decode()`
  * to produce a regular IColumn.
- *
- * The column can be used in two modes:
- *   1. Encoded mode (default): operators that understand dictionary encoding
- *      can use getDictionaryIds() and getDictionary() directly.
- *   2. Decoded mode: call convertToFullColumn() or decode() to get the
- *      materialized column with all values expanded.
  */
 class ColumnDictionary final : public COWPtrHelper<IColumn, ColumnDictionary>
 {
@@ -57,27 +52,28 @@ private:
     /// The data type of the dictionary entries (for decode)
     DataTypePtr value_type;
 
-    ColumnDictionary(std::vector<Field> dictionary_, PaddedPODArray<UInt32> ids_, DataTypePtr value_type_)
+    ColumnDictionary(std::vector<Field> dictionary_, PaddedPODArray<UInt32> && ids_, DataTypePtr value_type_)
         : dictionary(std::move(dictionary_))
         , ids(std::move(ids_))
         , value_type(std::move(value_type_))
     {}
 
-    ColumnDictionary(const ColumnDictionary &) = default;
+    /// Copy constructor used by COWPtrHelper::clone()
+    ColumnDictionary(const ColumnDictionary & src)
+        : dictionary(src.dictionary)
+        , ids(src.ids.begin(), src.ids.end())
+        , value_type(src.value_type)
+    {}
 
 public:
-    /// Create a ColumnDictionary from a pre-built dictionary and ID array
-    static Ptr create(std::vector<Field> dictionary_, PaddedPODArray<UInt32> ids_, DataTypePtr value_type_)
-    {
-        return ColumnDictionary::create(std::move(dictionary_), std::move(ids_), std::move(value_type_));
-    }
-
+    /// Create a ColumnDictionary from a pre-built dictionary and ID array.
+    /// Uses COWPtrHelper::create() which invokes the private constructor via friendship.
     static MutablePtr createMutable(
         std::vector<Field> dictionary_,
-        PaddedPODArray<UInt32> ids_,
+        PaddedPODArray<UInt32> && ids_,
         DataTypePtr value_type_)
     {
-        return MutablePtr(new ColumnDictionary(std::move(dictionary_), std::move(ids_), std::move(value_type_)));
+        return ColumnDictionary::create(std::move(dictionary_), std::move(ids_), std::move(value_type_));
     }
 
     const char * getFamilyName() const override { return "Dictionary"; }
@@ -172,6 +168,36 @@ public:
         throw Exception("updateWeakHash32 not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
     }
 
+    void updateWeakHash32(
+        WeakHash32 & /*hash*/,
+        const TiDB::TiDBCollatorPtr &,
+        String &,
+        const BlockSelective &) const override
+    {
+        throw Exception("updateWeakHash32 not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+    }
+
+    void insertRangeFrom(const IColumn & /*src*/, size_t /*start*/, size_t /*length*/) override
+    {
+        throw Exception("insertRangeFrom not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+    }
+
+    void insertManyFrom(const IColumn & /*src*/, size_t /*position*/, size_t /*length*/) override
+    {
+        throw Exception("insertManyFrom not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+    }
+
+    void insertDisjunctFrom(const IColumn & /*src*/, const std::vector<size_t> & /*position_vec*/) override
+    {
+        throw Exception("insertDisjunctFrom not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+    }
+
+    void insertManyDefaults(size_t length) override
+    {
+        for (size_t i = 0; i < length; ++i)
+            ids.push_back(0);
+    }
+
     ColumnPtr filter(const Filter & filt, ssize_t result_size_hint) const override;
     ColumnPtr permute(const Permutation & perm, size_t limit) const override;
 
@@ -186,11 +212,16 @@ public:
         throw Exception("getPermutation not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
     }
 
-    MutablePtr cloneResized(size_t new_size) const override
+    ColumnPtr replicateRange(size_t /*start_row*/, size_t /*end_row*/, const IColumn::Offsets & /*offsets*/) const override
     {
-        auto new_ids = ids;
+        throw Exception("replicateRange not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+    }
+
+    MutableColumnPtr cloneResized(size_t new_size) const override
+    {
+        PaddedPODArray<UInt32> new_ids(ids.begin(), ids.end());
         new_ids.resize(new_size);
-        return MutablePtr(new ColumnDictionary(dictionary, std::move(new_ids), value_type));
+        return ColumnDictionary::createMutable(dictionary, std::move(new_ids), value_type);
     }
 
     size_t byteSize() const override { return ids.size() * sizeof(UInt32) + dictionary.size() * 16; }
@@ -199,16 +230,45 @@ public:
 
     void forEachSubcolumn(ColumnCallback) override {}
 
-    MutableColumns scatter(ColumnIndex /*num_columns*/, const Selector & /*selector*/) const override
+    ScatterColumns scatter(ColumnIndex /*num_columns*/, const Selector & /*selector*/) const override
     {
         throw Exception("scatter not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
     }
 
+    ScatterColumns scatter(ColumnIndex /*num_columns*/, const Selector & /*selector*/, const BlockSelective & /*selective*/) const override
+    {
+        throw Exception("scatter not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+    }
+
+    void scatterTo(ScatterColumns & /*columns*/, const Selector & /*selector*/) const override
+    {
+        throw Exception("scatterTo not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+    }
+
+    void scatterTo(ScatterColumns & /*columns*/, const Selector & /*selector*/, const BlockSelective & /*selective*/) const override
+    {
+        throw Exception("scatterTo not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+    }
+
+    void gather(ColumnGathererStream & /*gatherer_stream*/) override
+    {
+        throw Exception("gather not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+    }
+
+    void getExtremes(Field & min, Field & max) const override
+    {
+        if (dictionary.empty())
+        {
+            min = Field();
+            max = Field();
+            return;
+        }
+        min = dictionary.front();
+        max = dictionary.back();
+    }
+
     /// Whether this column is dictionary-encoded (always true for this type)
     bool isDictionaryEncoded() const { return true; }
-
-private:
-    MutablePtr clone() const override { return MutablePtr(new ColumnDictionary(*this)); }
 };
 
 } // namespace DB

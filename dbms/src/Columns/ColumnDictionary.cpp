@@ -26,7 +26,6 @@ ColumnPtr ColumnDictionary::decode() const
     if (!value_type)
         throw Exception("ColumnDictionary: value_type is null, cannot decode", ErrorCodes::NOT_IMPLEMENTED);
 
-    // Create a mutable column of the appropriate type and populate it
     auto result = value_type->createColumn();
     result->reserve(ids.size());
 
@@ -51,7 +50,6 @@ ColumnPtr ColumnDictionary::filter(const Filter & filt, ssize_t result_size_hint
             "Size of filter doesn't match size of column",
             ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
 
-    // Filter the IDs array, keep the dictionary intact
     PaddedPODArray<UInt32> new_ids;
     if (result_size_hint > 0)
         new_ids.reserve(result_size_hint);
