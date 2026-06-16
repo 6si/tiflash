@@ -213,7 +213,7 @@ UInt32 CompressionCodecDictionary::compressDataInteger(const char * source, UInt
 template <std::integral T>
 void CompressionCodecDictionary::decompressDataInteger(
     const char * source,
-    UInt32 source_size,
+    UInt32 /*source_size*/,
     char * dest,
     UInt32 uncompressed_size) const
 {
@@ -352,7 +352,7 @@ UInt32 CompressionCodecDictionary::compressDataString(const char * source, UInt3
 
 void CompressionCodecDictionary::decompressDataString(
     const char * source,
-    UInt32 source_size,
+    UInt32 /*source_size*/,
     char * dest,
     UInt32 uncompressed_size) const
 {
