@@ -26,6 +26,7 @@ enum class CompressionMethod
     QPL = 4, /// The Intel Query Processing Library (QPL) is an open-source library to provide high-performance query processing operations
     NONE = 5, /// No compression
     Lightweight = 6, /// Lightweight compression
+    Dictionary = 7, /// Dictionary encoding for low-cardinality columns
 };
 
 } // namespace DB

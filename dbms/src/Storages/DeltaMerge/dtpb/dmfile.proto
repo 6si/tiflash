@@ -51,6 +51,17 @@ message ChecksumConfig {
     repeated ChecksumDebugInfo debug_info = 5;
 }
 
+message DictEncodingMeta {
+    // Number of distinct values in the dictionary
+    optional uint32 dict_cardinality = 1;
+    // Number of bits used per dictionary ID
+    optional uint32 bit_width = 2;
+    // Whether this segment is dictionary-encoded
+    optional bool is_dict_encoded = 3;
+    // The compression data type of dictionary entries
+    optional uint32 data_type_byte = 4;
+}
+
 message ColumnStat {
     optional int64 col_id = 1;
     optional string type_name = 2;
@@ -68,6 +79,11 @@ message ColumnStat {
     optional string additional_data_for_test = 101;
     optional VectorIndexFileProps vector_index = 102;
     repeated VectorIndexFileProps vector_indexes = 103;
+
+    // Dictionary encoding metadata (Phase 1: encoded columnstore)
+    optional DictEncodingMeta dict_encoding = 104;
+    // Encoding version for forward compatibility
+    optional uint32 encoding_version = 105;
 }
 
 message ColumnStats {
