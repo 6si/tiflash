@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <IO/Compression/CompressionCodecDeltaFOR.h>
+#include <IO/Compression/CompressionCodecDictionary.h>
 #include <IO/Compression/CompressionCodecFOR.h>
 #include <IO/Compression/CompressionCodecFactory.h>
 #include <IO/Compression/CompressionCodecLZ4.h>
@@ -188,6 +189,11 @@ CompressionCodecPtr CompressionCodecFactory::create(const CompressionSetting & s
                 CompressionSetting setting(method, CompressionSetting::getDefaultLevel(method));
                 return getStaticCodec<CompressionCodecLZ4>(setting);
             }
+            else if (setting.method_byte == CompressionMethodByte::Dictionary)
+            {
+                // Dictionary codec supports string/non-integer types directly
+                return std::make_unique<CompressionCodecDictionary>(setting.data_type);
+            }
             else
                 return nullptr;
         }
@@ -204,6 +210,8 @@ CompressionCodecPtr CompressionCodecFactory::create(const CompressionSetting & s
         return getStaticCodec<CompressionCodecRunLength>(setting);
     case CompressionMethodByte::FOR:
         return getStaticCodec<CompressionCodecFOR>(setting);
+    case CompressionMethodByte::Dictionary:
+        return std::make_unique<CompressionCodecDictionary>(setting.data_type);
     default:
         throw Exception(
             ErrorCodes::UNKNOWN_COMPRESSION_METHOD,
