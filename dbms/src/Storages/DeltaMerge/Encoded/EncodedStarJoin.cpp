@@ -224,6 +224,145 @@ IColumn::Filter EncodedStarJoin::computeJoinFilter(
     return filter;
 }
 
+EncodedStarJoin::StarJoinResult EncodedStarJoin::fusedLeftJoinGroupBySum(
+    const ColumnDictionary & fact_join_col,
+    const PaddedPODArray<Int64> & fact_agg_values,
+    const DimensionHashTable & dim_table)
+{
+    StarJoinResult result;
+    result.used_encoded_path = true;
+    result.rows_joined = 0;
+    result.rows_not_joined = 0;
+
+    const auto & ids = fact_join_col.getDictionaryIds();
+    const auto & dictionary = fact_join_col.getDictionary();
+
+    if (ids.size() != fact_agg_values.size())
+        throw Exception("Fact join column and aggregate column have different sizes", ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
+
+    // Group layout: [NULL group at index 0] + [dimension groups at index 1..N]
+    // Total groups = 1 (NULL) + dim_table.num_groups
+    size_t total_groups = 1 + dim_table.num_groups;
+    result.num_groups = total_groups;
+
+    // Build group keys: index 0 = Null, index 1..N = dimension group keys
+    result.group_keys.reserve(total_groups);
+    result.group_keys.emplace_back(Field()); // NULL group
+    for (const auto & gk : dim_table.group_keys)
+        result.group_keys.push_back(gk);
+
+    // Pre-compute join for each dictionary entry
+    auto dict_join = precomputeJoinForDictionary(dictionary, dim_table);
+
+    // Single pass — fused LEFT JOIN + group-by + SUM
+    std::vector<Int64> sums(total_groups, 0);
+    result.group_counts.resize(total_groups, 0);
+
+    for (size_t i = 0; i < ids.size(); ++i)
+    {
+        UInt32 dict_id = ids[i];
+        const auto & join_entry = dict_join[dict_id];
+
+        if (join_entry.matches)
+        {
+            // Matched rows go into dimension group (offset by 1 for NULL group)
+            UInt32 gid = join_entry.dimension_group_id + 1;
+            sums[gid] += fact_agg_values[i];
+            result.group_counts[gid]++;
+            result.rows_joined++;
+        }
+        else
+        {
+            // Non-matching rows accumulate into NULL group (index 0)
+            sums[0] += fact_agg_values[i];
+            result.group_counts[0]++;
+            result.rows_not_joined++;
+        }
+    }
+
+    result.aggregated_values.reserve(total_groups);
+    for (size_t i = 0; i < total_groups; ++i)
+        result.aggregated_values.emplace_back(sums[i]);
+
+    return result;
+}
+
+EncodedStarJoin::StarJoinResult EncodedStarJoin::fusedLeftJoinGroupByCount(
+    const ColumnDictionary & fact_join_col,
+    const DimensionHashTable & dim_table)
+{
+    StarJoinResult result;
+    result.used_encoded_path = true;
+    result.rows_joined = 0;
+    result.rows_not_joined = 0;
+
+    const auto & ids = fact_join_col.getDictionaryIds();
+    const auto & dictionary = fact_join_col.getDictionary();
+
+    // Group layout: [NULL group at index 0] + [dimension groups at index 1..N]
+    size_t total_groups = 1 + dim_table.num_groups;
+    result.num_groups = total_groups;
+
+    result.group_keys.reserve(total_groups);
+    result.group_keys.emplace_back(Field()); // NULL group
+    for (const auto & gk : dim_table.group_keys)
+        result.group_keys.push_back(gk);
+
+    // Pre-compute join for each dictionary entry
+    auto dict_join = precomputeJoinForDictionary(dictionary, dim_table);
+
+    // Single pass — fused LEFT JOIN + group-by + COUNT
+    result.group_counts.resize(total_groups, 0);
+
+    for (size_t i = 0; i < ids.size(); ++i)
+    {
+        UInt32 dict_id = ids[i];
+        const auto & join_entry = dict_join[dict_id];
+
+        if (join_entry.matches)
+        {
+            result.group_counts[join_entry.dimension_group_id + 1]++;
+            result.rows_joined++;
+        }
+        else
+        {
+            result.group_counts[0]++;
+            result.rows_not_joined++;
+        }
+    }
+
+    result.aggregated_values.reserve(total_groups);
+    for (size_t i = 0; i < total_groups; ++i)
+        result.aggregated_values.emplace_back(UInt64(result.group_counts[i]));
+
+    return result;
+}
+
+std::vector<Field> EncodedStarJoin::computeLeftJoinOutput(
+    const ColumnDictionary & fact_join_col,
+    const DimensionHashTable & dim_table)
+{
+    const auto & ids = fact_join_col.getDictionaryIds();
+    const auto & dictionary = fact_join_col.getDictionary();
+
+    // Pre-compute join for each dictionary entry
+    auto dict_join = precomputeJoinForDictionary(dictionary, dim_table);
+
+    // For each fact row, emit matched dimension value or Null
+    std::vector<Field> output(ids.size());
+    for (size_t i = 0; i < ids.size(); ++i)
+    {
+        UInt32 dict_id = ids[i];
+        const auto & join_entry = dict_join[dict_id];
+
+        if (join_entry.matches)
+            output[i] = Field(join_entry.dimension_value);
+        else
+            output[i] = Field(); // Null for non-matching rows
+    }
+    return output;
+}
+
 bool EncodedStarJoin::isApplicable(
     const IColumn & fact_join_col,
     size_t dimension_size,

@@ -331,4 +331,216 @@ TEST_F(EncodedStarJoinTest, FusedJoinCountPartialMatch)
     EXPECT_EQ(result.aggregated_values[1].get<UInt64>(), 2u);
 }
 
+// ==================== LEFT JOIN Tests ====================
+
+TEST_F(EncodedStarJoinTest, LeftJoinSumPartialMatch)
+{
+    // Fact table: FK values {1,2,3,4,5}, some not in dimension
+    auto fact_col = createIntDictCol({1, 2, 3, 4, 5}, {0, 1, 2, 3, 4, 0, 1, 2, 3, 4});
+    PaddedPODArray<Int64> amounts = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+
+    // Dimension only has keys {1, 3, 5} mapping to groups {100, 100, 200}
+    PaddedPODArray<Int64> dim_keys = {1, 3, 5};
+    PaddedPODArray<Int64> dim_values = {100, 100, 200};
+    auto dim_table = EncodedStarJoin::buildDimensionTable(dim_keys, dim_values);
+
+    auto result = EncodedStarJoin::fusedLeftJoinGroupBySum(*fact_col, amounts, dim_table);
+
+    ASSERT_TRUE(result.used_encoded_path);
+    EXPECT_EQ(result.rows_joined, 6u);      // keys 1,3,5 × 2 occurrences each
+    EXPECT_EQ(result.rows_not_joined, 4u);  // keys 2,4 × 2 occurrences each
+
+    // Total groups = 1 (NULL) + 2 (dimension groups 100, 200) = 3
+    EXPECT_EQ(result.num_groups, 3u);
+
+    // Group keys: [NULL, 100, 200]
+    EXPECT_TRUE(result.group_keys[0].isNull());
+    EXPECT_EQ(result.group_keys[1].get<Int64>(), 100);
+    EXPECT_EQ(result.group_keys[2].get<Int64>(), 200);
+
+    // NULL group (index 0): keys 2,4 → amounts 20+40+70+90 = 220
+    EXPECT_EQ(result.aggregated_values[0].get<Int64>(), 220);
+    // Group 100 (index 1): keys 1,3 → amounts 10+30+60+80 = 180
+    EXPECT_EQ(result.aggregated_values[1].get<Int64>(), 180);
+    // Group 200 (index 2): key 5 → amounts 50+100 = 150
+    EXPECT_EQ(result.aggregated_values[2].get<Int64>(), 150);
+}
+
+TEST_F(EncodedStarJoinTest, LeftJoinSumAllMatch)
+{
+    // All fact keys exist in dimension — NULL group should be empty
+    auto fact_col = createIntDictCol({1, 2, 3}, {0, 1, 2, 0, 1, 2});
+    PaddedPODArray<Int64> amounts = {10, 20, 30, 40, 50, 60};
+
+    PaddedPODArray<Int64> dim_keys = {1, 2, 3};
+    PaddedPODArray<Int64> dim_values = {10, 20, 10};
+    auto dim_table = EncodedStarJoin::buildDimensionTable(dim_keys, dim_values);
+
+    auto result = EncodedStarJoin::fusedLeftJoinGroupBySum(*fact_col, amounts, dim_table);
+
+    ASSERT_TRUE(result.used_encoded_path);
+    EXPECT_EQ(result.rows_joined, 6u);
+    EXPECT_EQ(result.rows_not_joined, 0u);
+
+    // Groups: [NULL, 10, 20]
+    EXPECT_EQ(result.num_groups, 3u);
+    EXPECT_TRUE(result.group_keys[0].isNull());
+
+    // NULL group sum = 0 (no unmatched rows)
+    EXPECT_EQ(result.aggregated_values[0].get<Int64>(), 0);
+    // Group 10 (keys 1,3): 10+30+40+60 = 140
+    EXPECT_EQ(result.aggregated_values[1].get<Int64>(), 140);
+    // Group 20 (key 2): 20+50 = 70
+    EXPECT_EQ(result.aggregated_values[2].get<Int64>(), 70);
+}
+
+TEST_F(EncodedStarJoinTest, LeftJoinSumNoMatch)
+{
+    // No fact keys match dimension — all rows go to NULL group
+    auto fact_col = createIntDictCol({10, 20, 30}, {0, 1, 2, 0, 1});
+    PaddedPODArray<Int64> amounts = {5, 15, 25, 35, 45};
+
+    // Dimension has completely different keys
+    PaddedPODArray<Int64> dim_keys = {100, 200};
+    PaddedPODArray<Int64> dim_values = {1, 2};
+    auto dim_table = EncodedStarJoin::buildDimensionTable(dim_keys, dim_values);
+
+    auto result = EncodedStarJoin::fusedLeftJoinGroupBySum(*fact_col, amounts, dim_table);
+
+    ASSERT_TRUE(result.used_encoded_path);
+    EXPECT_EQ(result.rows_joined, 0u);
+    EXPECT_EQ(result.rows_not_joined, 5u);
+
+    // Groups: [NULL, 1, 2] — but only NULL has data
+    EXPECT_EQ(result.num_groups, 3u);
+    EXPECT_TRUE(result.group_keys[0].isNull());
+
+    // NULL group sum = 5+15+25+35+45 = 125
+    EXPECT_EQ(result.aggregated_values[0].get<Int64>(), 125);
+    // Dimension groups have sum = 0
+    EXPECT_EQ(result.aggregated_values[1].get<Int64>(), 0);
+    EXPECT_EQ(result.aggregated_values[2].get<Int64>(), 0);
+}
+
+TEST_F(EncodedStarJoinTest, LeftJoinCountPartialMatch)
+{
+    // COUNT with LEFT JOIN semantics
+    auto fact_col = createIntDictCol({1, 2, 3, 4}, {0, 1, 2, 3, 0, 1, 2, 3, 0});
+
+    // Only keys 1, 3 in dimension
+    PaddedPODArray<Int64> dim_keys = {1, 3};
+    PaddedPODArray<Int64> dim_values = {10, 20};
+    auto dim_table = EncodedStarJoin::buildDimensionTable(dim_keys, dim_values);
+
+    auto result = EncodedStarJoin::fusedLeftJoinGroupByCount(*fact_col, dim_table);
+
+    ASSERT_TRUE(result.used_encoded_path);
+    EXPECT_EQ(result.rows_joined, 5u);     // key 1: 3 times, key 3: 2 times
+    EXPECT_EQ(result.rows_not_joined, 4u); // key 2: 2 times, key 4: 2 times
+
+    // Groups: [NULL, 10, 20]
+    EXPECT_EQ(result.num_groups, 3u);
+    EXPECT_TRUE(result.group_keys[0].isNull());
+
+    // NULL group count = 4 (unmatched rows)
+    EXPECT_EQ(result.aggregated_values[0].get<UInt64>(), 4u);
+    // Group 10 (key 1): 3 rows
+    EXPECT_EQ(result.aggregated_values[1].get<UInt64>(), 3u);
+    // Group 20 (key 3): 2 rows
+    EXPECT_EQ(result.aggregated_values[2].get<UInt64>(), 2u);
+}
+
+TEST_F(EncodedStarJoinTest, LeftJoinCountNoMatch)
+{
+    // All rows go to NULL group
+    auto fact_col = createIntDictCol({10, 20}, {0, 1, 0, 1, 0});
+
+    PaddedPODArray<Int64> dim_keys = {99};
+    PaddedPODArray<Int64> dim_values = {1};
+    auto dim_table = EncodedStarJoin::buildDimensionTable(dim_keys, dim_values);
+
+    auto result = EncodedStarJoin::fusedLeftJoinGroupByCount(*fact_col, dim_table);
+
+    ASSERT_TRUE(result.used_encoded_path);
+    EXPECT_EQ(result.rows_joined, 0u);
+    EXPECT_EQ(result.rows_not_joined, 5u);
+
+    // Groups: [NULL, 1]
+    EXPECT_EQ(result.num_groups, 2u);
+    EXPECT_TRUE(result.group_keys[0].isNull());
+
+    // NULL group count = 5
+    EXPECT_EQ(result.aggregated_values[0].get<UInt64>(), 5u);
+    // Dimension group count = 0
+    EXPECT_EQ(result.aggregated_values[1].get<UInt64>(), 0u);
+}
+
+TEST_F(EncodedStarJoinTest, LeftJoinOutput)
+{
+    // Test computeLeftJoinOutput: produces dimension values or NULL per fact row
+    auto fact_col = createIntDictCol({1, 2, 3, 4}, {0, 1, 2, 3, 0, 2});
+
+    // Dimension: key 1→100, key 3→300 (keys 2,4 not in dimension)
+    PaddedPODArray<Int64> dim_keys = {1, 3};
+    PaddedPODArray<Int64> dim_values = {100, 300};
+    auto dim_table = EncodedStarJoin::buildDimensionTable(dim_keys, dim_values);
+
+    auto output = EncodedStarJoin::computeLeftJoinOutput(*fact_col, dim_table);
+
+    ASSERT_EQ(output.size(), 6u);
+
+    // Row 0: key=1 → matched, dim value=100
+    EXPECT_EQ(output[0].get<Int64>(), 100);
+    // Row 1: key=2 → NOT matched → NULL
+    EXPECT_TRUE(output[1].isNull());
+    // Row 2: key=3 → matched, dim value=300
+    EXPECT_EQ(output[2].get<Int64>(), 300);
+    // Row 3: key=4 → NOT matched → NULL
+    EXPECT_TRUE(output[3].isNull());
+    // Row 4: key=1 → matched, dim value=100
+    EXPECT_EQ(output[4].get<Int64>(), 100);
+    // Row 5: key=3 → matched, dim value=300
+    EXPECT_EQ(output[5].get<Int64>(), 300);
+}
+
+TEST_F(EncodedStarJoinTest, LeftJoinOutputAllNull)
+{
+    // No matches — all output should be NULL
+    auto fact_col = createIntDictCol({5, 6, 7}, {0, 1, 2, 0});
+
+    PaddedPODArray<Int64> dim_keys = {100};
+    PaddedPODArray<Int64> dim_values = {999};
+    auto dim_table = EncodedStarJoin::buildDimensionTable(dim_keys, dim_values);
+
+    auto output = EncodedStarJoin::computeLeftJoinOutput(*fact_col, dim_table);
+
+    ASSERT_EQ(output.size(), 4u);
+    for (size_t i = 0; i < output.size(); ++i)
+        EXPECT_TRUE(output[i].isNull()) << "Row " << i << " should be NULL";
+}
+
+TEST_F(EncodedStarJoinTest, LeftJoinSumEmptyDimension)
+{
+    // LEFT JOIN with empty dimension — all rows in NULL group
+    auto fact_col = createIntDictCol({1, 2, 3}, {0, 1, 2, 0, 1});
+    PaddedPODArray<Int64> amounts = {10, 20, 30, 40, 50};
+
+    PaddedPODArray<Int64> dim_keys;
+    PaddedPODArray<Int64> dim_values;
+    auto dim_table = EncodedStarJoin::buildDimensionTable(dim_keys, dim_values);
+
+    auto result = EncodedStarJoin::fusedLeftJoinGroupBySum(*fact_col, amounts, dim_table);
+
+    ASSERT_TRUE(result.used_encoded_path);
+    EXPECT_EQ(result.rows_joined, 0u);
+    EXPECT_EQ(result.rows_not_joined, 5u);
+
+    // Only the NULL group exists
+    EXPECT_EQ(result.num_groups, 1u);
+    EXPECT_TRUE(result.group_keys[0].isNull());
+
+    // NULL group sum = 10+20+30+40+50 = 150
+    EXPECT_EQ(result.aggregated_values[0].get<Int64>(), 150);
+}
+
 } // namespace DB::DM::tests

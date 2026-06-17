@@ -130,6 +130,25 @@ public:
         const ColumnDictionary & fact_join_col,
         const DimensionHashTable & dim_table);
 
+    /// Execute fused LEFT JOIN + group-by + SUM in a single pass.
+    /// Non-matching fact rows accumulate into a NULL group (group_keys[0] = Null).
+    static StarJoinResult fusedLeftJoinGroupBySum(
+        const ColumnDictionary & fact_join_col,
+        const PaddedPODArray<Int64> & fact_agg_values,
+        const DimensionHashTable & dim_table);
+
+    /// Execute fused LEFT JOIN + group-by + COUNT.
+    /// Non-matching fact rows are counted in the NULL group.
+    static StarJoinResult fusedLeftJoinGroupByCount(
+        const ColumnDictionary & fact_join_col,
+        const DimensionHashTable & dim_table);
+
+    /// Produce LEFT JOIN output columns: for each fact row, emit the matched
+    /// dimension value or Null if no match. Returns a vector of Fields.
+    static std::vector<Field> computeLeftJoinOutput(
+        const ColumnDictionary & fact_join_col,
+        const DimensionHashTable & dim_table);
+
     /// Check if an encoded star join is applicable.
     static bool isApplicable(
         const IColumn & fact_join_col,
