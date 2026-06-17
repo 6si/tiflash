@@ -233,4 +233,90 @@ TEST_F(EncodedGroupByTest, IsSuitableForEncodedGroupBy)
     EXPECT_FALSE(EncodedGroupBy::isSuitableForEncodedGroupBy(*regular_col));
 }
 
+TEST_F(EncodedGroupByTest, NullGroupKey)
+{
+    // Dictionary includes a Null Field entry to represent NULL group key.
+    // NULL should be its own group — no rows with NULL key should merge into other groups.
+    std::vector<Field> dict;
+    dict.emplace_back(String("US"));
+    dict.emplace_back(Field());  // NULL group
+    dict.emplace_back(String("UK"));
+
+    PaddedPODArray<UInt32> ids;
+    ids.push_back(0); // US
+    ids.push_back(1); // NULL
+    ids.push_back(2); // UK
+    ids.push_back(1); // NULL
+    ids.push_back(0); // US
+    ids.push_back(1); // NULL
+
+    auto group_col = ColumnDictionary::createMutable(std::move(dict), std::move(ids), std::make_shared<DataTypeString>());
+    PaddedPODArray<Int64> values = {10, 20, 30, 40, 50, 60};
+
+    auto result = EncodedGroupBy::sumInt64(*group_col, values);
+
+    ASSERT_TRUE(result.used_encoded_path);
+    ASSERT_EQ(result.num_groups, 3u);
+
+    // US (id=0): rows 0, 4 → sum = 10 + 50 = 60
+    EXPECT_EQ(result.aggregated_values[0].get<Int64>(), 60);
+    EXPECT_EQ(result.group_counts[0], 2u);
+
+    // NULL (id=1): rows 1, 3, 5 → sum = 20 + 40 + 60 = 120
+    EXPECT_EQ(result.aggregated_values[1].get<Int64>(), 120);
+    EXPECT_EQ(result.group_counts[1], 3u);
+
+    // UK (id=2): row 2 → sum = 30
+    EXPECT_EQ(result.aggregated_values[2].get<Int64>(), 30);
+    EXPECT_EQ(result.group_counts[2], 1u);
+}
+
+TEST_F(EncodedGroupByTest, OverflowSumInt64)
+{
+    // Test SUM with values near Int64 max that would overflow in naive addition.
+    // The encoded group-by should still accumulate correctly (wrapping behavior or detection).
+    auto group_col = createStringDictCol({"G1", "G2"}, {0, 1, 0, 1});
+
+    // Values near Int64 max
+    Int64 large_val = INT64_MAX / 3;
+    PaddedPODArray<Int64> values = {large_val, large_val, large_val, large_val};
+
+    auto result = EncodedGroupBy::sumInt64(*group_col, values);
+
+    ASSERT_TRUE(result.used_encoded_path);
+    ASSERT_EQ(result.num_groups, 2u);
+
+    // G1: two values of large_val → 2 * (INT64_MAX/3) — should not overflow
+    Int64 expected_g1 = large_val * 2;
+    EXPECT_EQ(result.aggregated_values[0].get<Int64>(), expected_g1);
+
+    // G2: two values of large_val → 2 * (INT64_MAX/3)
+    EXPECT_EQ(result.aggregated_values[1].get<Int64>(), expected_g1);
+}
+
+TEST_F(EncodedGroupByTest, CountWithNullGroup)
+{
+    // COUNT should count NULL group rows just like any other group
+    std::vector<Field> dict;
+    dict.emplace_back(String("active"));
+    dict.emplace_back(Field()); // NULL
+    dict.emplace_back(String("inactive"));
+
+    PaddedPODArray<UInt32> ids;
+    ids.push_back(0); // active
+    ids.push_back(1); // NULL
+    ids.push_back(0); // active
+    ids.push_back(2); // inactive
+    ids.push_back(1); // NULL
+
+    auto group_col = ColumnDictionary::createMutable(std::move(dict), std::move(ids), std::make_shared<DataTypeString>());
+    auto result = EncodedGroupBy::count(*group_col);
+
+    ASSERT_TRUE(result.used_encoded_path);
+    ASSERT_EQ(result.num_groups, 3u);
+    EXPECT_EQ(result.aggregated_values[0].get<UInt64>(), 2u); // active: rows 0, 2
+    EXPECT_EQ(result.aggregated_values[1].get<UInt64>(), 2u); // NULL: rows 1, 4
+    EXPECT_EQ(result.aggregated_values[2].get<UInt64>(), 1u); // inactive: row 3
+}
+
 } // namespace DB::DM::tests

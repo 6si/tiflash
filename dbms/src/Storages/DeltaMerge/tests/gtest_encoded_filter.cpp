@@ -235,4 +235,95 @@ TEST_F(EncodedFilterTest, LargeColumnPerformance)
     ASSERT_LE(result.count_passing, 3334u);
 }
 
+TEST_F(EncodedFilterTest, LikeMiddleWildcard)
+{
+    // Test LIKE with wildcard in the middle: "a%e" (starts with a, ends with e)
+    auto col = createStringDictCol({"apple", "axle", "banana", "acre", "orange"}, {0, 1, 2, 3, 4, 0, 1});
+
+    auto result = EncodedFilter::evaluateLike(*col, "a%e");
+
+    ASSERT_TRUE(result.used_encoded_path);
+    // "apple" matches, "axle" matches, "banana" no, "acre" matches, "orange" no
+    EXPECT_EQ(result.filter[0], 1); // apple
+    EXPECT_EQ(result.filter[1], 1); // axle
+    EXPECT_EQ(result.filter[2], 0); // banana
+    EXPECT_EQ(result.filter[3], 1); // acre
+    EXPECT_EQ(result.filter[4], 0); // orange
+    EXPECT_EQ(result.filter[5], 1); // apple
+    EXPECT_EQ(result.filter[6], 1); // axle
+}
+
+TEST_F(EncodedFilterTest, LikeNoWildcard)
+{
+    // LIKE without wildcards is equivalent to exact match
+    auto col = createStringDictCol({"hello", "world", "help"}, {0, 1, 2, 0, 1});
+
+    auto result = EncodedFilter::evaluateLike(*col, "hello");
+
+    ASSERT_TRUE(result.used_encoded_path);
+    ASSERT_EQ(result.count_passing, 2u);
+    EXPECT_EQ(result.filter[0], 1); // hello
+    EXPECT_EQ(result.filter[1], 0); // world
+    EXPECT_EQ(result.filter[2], 0); // help
+    EXPECT_EQ(result.filter[3], 1); // hello
+    EXPECT_EQ(result.filter[4], 0); // world
+}
+
+TEST_F(EncodedFilterTest, FilterThenGroupBy)
+{
+    // Combined filter + group-by pipeline:
+    // 1. Filter rows with encoded filter (WHERE status = 'active')
+    // 2. Apply filter to groupby column + values
+    // This simulates the real execution path of "WHERE status='active' GROUP BY region"
+    auto status_col = createStringDictCol(
+        {"active", "inactive", "pending"},
+        {0, 1, 0, 2, 0, 1, 0}); // 4 active, 2 inactive, 1 pending
+
+    // Step 1: Encoded filter on status = 'active'
+    auto filter_result = EncodedFilter::evaluateEquals(*status_col, Field(String("active")));
+    ASSERT_TRUE(filter_result.used_encoded_path);
+    ASSERT_EQ(filter_result.count_passing, 4u);
+
+    // Step 2: Build filtered data for group-by
+    // region IDs for each row: US=0, UK=1, US=0, DE=2, US=0, UK=1, DE=2
+    auto region_col = createStringDictCol(
+        {"US", "UK", "DE"},
+        {0, 1, 0, 2, 0, 1, 2});
+
+    // Apply filter to extract only active rows' region IDs
+    auto filtered_region = region_col->filter(filter_result.filter, -1);
+    ASSERT_EQ(filtered_region->size(), 4u);
+
+    // The active rows were at positions 0, 2, 4, 6 → regions US, US, US, DE
+    Field f;
+    filtered_region->get(0, f);
+    EXPECT_EQ(f.get<String>(), "US");
+    filtered_region->get(1, f);
+    EXPECT_EQ(f.get<String>(), "US");
+    filtered_region->get(2, f);
+    EXPECT_EQ(f.get<String>(), "US");
+    filtered_region->get(3, f);
+    EXPECT_EQ(f.get<String>(), "DE");
+}
+
+TEST_F(EncodedFilterTest, InPredicateWithNullValue)
+{
+    // IN predicate where one of the search values is effectively "not in dictionary"
+    auto col = createStringDictCol({"US", "UK", "DE", "FR"}, {0, 1, 2, 3, 0, 1});
+
+    // Search for values including one not in dictionary
+    std::vector<Field> values = {Field(String("US")), Field(String("JP"))};
+    auto result = EncodedFilter::evaluateIn(*col, values);
+
+    ASSERT_TRUE(result.used_encoded_path);
+    // Only US matches (JP not in dict)
+    ASSERT_EQ(result.count_passing, 2u);
+    EXPECT_EQ(result.filter[0], 1); // US
+    EXPECT_EQ(result.filter[1], 0); // UK
+    EXPECT_EQ(result.filter[2], 0); // DE
+    EXPECT_EQ(result.filter[3], 0); // FR
+    EXPECT_EQ(result.filter[4], 1); // US
+    EXPECT_EQ(result.filter[5], 0); // UK
+}
+
 } // namespace DB::DM::tests

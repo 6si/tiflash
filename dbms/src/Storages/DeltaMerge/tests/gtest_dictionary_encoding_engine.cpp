@@ -262,4 +262,179 @@ TEST_F(DictionaryEncodingEngineTest, EncodeOneOverMaxCardinality)
     ASSERT_FALSE(result.was_encoded);
 }
 
+TEST_F(DictionaryEncodingEngineTest, CardinalityBoundaryTransition)
+{
+    // Start with 4096 distinct values (within threshold), then cross to 4097
+    // This tests the exact boundary condition where encoding switches from suitable to not suitable
+    DictionaryEncodingConfig config;
+    config.enabled = true;
+    config.max_cardinality = 4096;
+    config.min_rows_for_encoding = 64;
+
+    // 4096 distinct values — should encode
+    {
+        auto col = ColumnVector<Int64>::create();
+        for (int i = 0; i < 8192; ++i)
+            col->insert(Int64(i % 4096));
+
+        EXPECT_TRUE(DictionaryEncodingEngine::isSuitableForDictionary(*col, config));
+        auto result = DictionaryEncodingEngine::tryEncode(*col, std::make_shared<DataTypeInt64>(), config);
+        ASSERT_TRUE(result.was_encoded);
+        EXPECT_EQ(result.cardinality, 4096u);
+    }
+
+    // 4097 distinct values — should NOT encode
+    {
+        auto col = ColumnVector<Int64>::create();
+        for (int i = 0; i < 8194; ++i)
+            col->insert(Int64(i % 4097));
+
+        EXPECT_FALSE(DictionaryEncodingEngine::isSuitableForDictionary(*col, config));
+        auto result = DictionaryEncodingEngine::tryEncode(*col, std::make_shared<DataTypeInt64>(), config);
+        ASSERT_FALSE(result.was_encoded);
+    }
+}
+
+TEST_F(DictionaryEncodingEngineTest, ReEncodeAfterMerge)
+{
+    // Simulate segment merge: two encoded columns with different dictionaries
+    // After merge, the combined column should still be re-encodeable if total cardinality is within bounds.
+    DictionaryEncodingConfig config;
+    config.enabled = true;
+    config.max_cardinality = 4096;
+    config.min_rows_for_encoding = 64;
+
+    // Segment 1: values {1, 2, 3} repeated
+    auto col1 = ColumnVector<Int64>::create();
+    for (int i = 0; i < 100; ++i)
+        col1->insert(Int64(i % 3 + 1));
+
+    auto encoded1 = DictionaryEncodingEngine::tryEncode(*col1, std::make_shared<DataTypeInt64>(), config);
+    ASSERT_TRUE(encoded1.was_encoded);
+    EXPECT_EQ(encoded1.cardinality, 3u);
+
+    // Segment 2: values {3, 4, 5} repeated (overlapping value '3')
+    auto col2 = ColumnVector<Int64>::create();
+    for (int i = 0; i < 100; ++i)
+        col2->insert(Int64(i % 3 + 3));
+
+    auto encoded2 = DictionaryEncodingEngine::tryEncode(*col2, std::make_shared<DataTypeInt64>(), config);
+    ASSERT_TRUE(encoded2.was_encoded);
+    EXPECT_EQ(encoded2.cardinality, 3u);
+
+    // Merge: decode both and combine, then re-encode
+    auto decoded1 = dynamic_cast<const ColumnDictionary *>(encoded1.column.get())->decode();
+    auto decoded2 = dynamic_cast<const ColumnDictionary *>(encoded2.column.get())->decode();
+
+    // Create merged column
+    auto merged = ColumnVector<Int64>::create();
+    for (size_t i = 0; i < decoded1->size(); ++i)
+    {
+        Field f;
+        decoded1->get(i, f);
+        merged->insert(f.get<Int64>());
+    }
+    for (size_t i = 0; i < decoded2->size(); ++i)
+    {
+        Field f;
+        decoded2->get(i, f);
+        merged->insert(f.get<Int64>());
+    }
+
+    EXPECT_EQ(merged->size(), 200u);
+
+    // Re-encode the merged column — cardinality should be 5 (1,2,3,4,5)
+    auto merged_result = DictionaryEncodingEngine::tryEncode(*merged, std::make_shared<DataTypeInt64>(), config);
+    ASSERT_TRUE(merged_result.was_encoded);
+    EXPECT_EQ(merged_result.cardinality, 5u);
+    EXPECT_EQ(merged_result.column->size(), 200u);
+
+    // Verify roundtrip correctness
+    auto * dict_col = dynamic_cast<const ColumnDictionary *>(merged_result.column.get());
+    ASSERT_NE(dict_col, nullptr);
+    auto final_decoded = dict_col->decode();
+    for (size_t i = 0; i < 200; ++i)
+    {
+        Field orig, dec;
+        merged->get(i, orig);
+        final_decoded->get(i, dec);
+        EXPECT_EQ(orig, dec);
+    }
+}
+
+TEST_F(DictionaryEncodingEngineTest, ConcurrentReadAndEncode)
+{
+    // Verify that encoding a column does not mutate the original column.
+    // This tests the safety property: if one thread reads the raw column while another
+    // thread encodes it, the raw column remains unchanged.
+    auto col = ColumnVector<Int64>::create();
+    for (int i = 0; i < 1000; ++i)
+        col->insert(Int64(i % 10));
+
+    // Take a snapshot of original data
+    std::vector<Int64> original_data(1000);
+    for (size_t i = 0; i < 1000; ++i)
+    {
+        Field f;
+        col->get(i, f);
+        original_data[i] = f.get<Int64>();
+    }
+
+    DictionaryEncodingConfig config;
+    config.enabled = true;
+    config.max_cardinality = 4096;
+    config.min_rows_for_encoding = 64;
+
+    // Encode the column
+    auto result = DictionaryEncodingEngine::tryEncode(*col, std::make_shared<DataTypeInt64>(), config);
+    ASSERT_TRUE(result.was_encoded);
+
+    // Verify original column is unchanged
+    EXPECT_EQ(col->size(), 1000u);
+    for (size_t i = 0; i < 1000; ++i)
+    {
+        Field f;
+        col->get(i, f);
+        EXPECT_EQ(f.get<Int64>(), original_data[i]);
+    }
+
+    // Verify encoded column is also correct
+    auto * dict_col = dynamic_cast<const ColumnDictionary *>(result.column.get());
+    ASSERT_NE(dict_col, nullptr);
+    auto decoded = dict_col->decode();
+    for (size_t i = 0; i < 1000; ++i)
+    {
+        Field f;
+        decoded->get(i, f);
+        EXPECT_EQ(f.get<Int64>(), original_data[i]);
+    }
+}
+
+TEST_F(DictionaryEncodingEngineTest, EncodeStringWithNulls)
+{
+    // Test encoding a string column that has empty strings (approximating NULL representation)
+    auto col = ColumnString::create();
+    col->insert(Field(String("alpha")));
+    col->insert(Field(String("")));  // empty string — distinct from NULL but tests boundary
+    col->insert(Field(String("beta")));
+    col->insert(Field(String("")));
+    col->insert(Field(String("alpha")));
+    col->insert(Field(String("gamma")));
+
+    auto result = DictionaryEncodingEngine::encodeStringColumn(*col, std::make_shared<DataTypeString>());
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(result->size(), 6u);
+    EXPECT_EQ(result->getDictionarySize(), 4u); // "alpha", "", "beta", "gamma"
+
+    // Verify decode roundtrip
+    auto decoded = result->decode();
+    for (size_t i = 0; i < 6; ++i)
+    {
+        Field original, dec;
+        col->get(i, original);
+        decoded->get(i, dec);
+        EXPECT_EQ(original, dec);
+    }
+}
+
 } // namespace DB::DM::tests

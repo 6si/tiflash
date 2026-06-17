@@ -244,4 +244,91 @@ TEST_F(EncodedStarJoinTest, LargeFactTable)
     EXPECT_EQ(result.num_groups, 3u);
 }
 
+TEST_F(EncodedStarJoinTest, PartialMatchJoin)
+{
+    // Some fact rows have FK values not in dimension — verify INNER JOIN semantics
+    // (unmatched rows are filtered out, not included with NULL)
+    auto fact_col = createIntDictCol({1, 2, 3, 4, 5}, {0, 1, 2, 3, 4, 0, 1, 2, 3, 4});
+    PaddedPODArray<Int64> amounts = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+
+    // Only keys 1, 3, 5 in dimension
+    PaddedPODArray<Int64> dim_keys = {1, 3, 5};
+    PaddedPODArray<Int64> dim_values = {100, 100, 200};
+    auto dim_table = EncodedStarJoin::buildDimensionTable(dim_keys, dim_values);
+
+    auto result = EncodedStarJoin::fusedJoinGroupBySum(*fact_col, amounts, dim_table);
+
+    ASSERT_TRUE(result.used_encoded_path);
+    EXPECT_EQ(result.rows_joined, 6u);   // keys 1,3,5 × 2 rows each
+    EXPECT_EQ(result.rows_not_joined, 4u); // keys 2,4 × 2 rows each
+
+    // Group 100 (keys 1, 3): rows 0,2,5,7 → sum = 10+30+60+80 = 180
+    EXPECT_EQ(result.aggregated_values[0].get<Int64>(), 180);
+    // Group 200 (key 5): rows 4,9 → sum = 50+100 = 150
+    EXPECT_EQ(result.aggregated_values[1].get<Int64>(), 150);
+}
+
+TEST_F(EncodedStarJoinTest, JoinFilterPartialMatch)
+{
+    // computeJoinFilter with partial matches — verify non-matching rows get 0
+    auto fact_col = createIntDictCol({10, 20, 30, 40, 50}, {0, 1, 2, 3, 4, 0, 1, 2});
+
+    // Only keys 10, 30, 50 in dimension
+    PaddedPODArray<Int64> dim_keys = {10, 30, 50};
+    PaddedPODArray<Int64> dim_values = {1, 1, 1};
+    auto dim_table = EncodedStarJoin::buildDimensionTable(dim_keys, dim_values);
+
+    auto filter = EncodedStarJoin::computeJoinFilter(*fact_col, dim_table);
+
+    ASSERT_EQ(filter.size(), 8u);
+    EXPECT_EQ(filter[0], 1); // 10 matches
+    EXPECT_EQ(filter[1], 0); // 20 no match
+    EXPECT_EQ(filter[2], 1); // 30 matches
+    EXPECT_EQ(filter[3], 0); // 40 no match
+    EXPECT_EQ(filter[4], 1); // 50 matches
+    EXPECT_EQ(filter[5], 1); // 10 matches
+    EXPECT_EQ(filter[6], 0); // 20 no match
+    EXPECT_EQ(filter[7], 1); // 30 matches
+}
+
+TEST_F(EncodedStarJoinTest, EmptyDimensionTable)
+{
+    // Dimension table is empty — no rows should match
+    auto fact_col = createIntDictCol({1, 2, 3}, {0, 1, 2, 0, 1});
+    PaddedPODArray<Int64> amounts = {100, 200, 300, 400, 500};
+
+    PaddedPODArray<Int64> dim_keys;
+    PaddedPODArray<Int64> dim_values;
+    auto dim_table = EncodedStarJoin::buildDimensionTable(dim_keys, dim_values);
+
+    auto result = EncodedStarJoin::fusedJoinGroupBySum(*fact_col, amounts, dim_table);
+
+    ASSERT_TRUE(result.used_encoded_path);
+    EXPECT_EQ(result.rows_joined, 0u);
+    EXPECT_EQ(result.rows_not_joined, 5u);
+}
+
+TEST_F(EncodedStarJoinTest, FusedJoinCountPartialMatch)
+{
+    // COUNT with partial dimension match
+    auto fact_col = createIntDictCol({1, 2, 3, 4}, {0, 1, 2, 3, 0, 1, 2, 3, 0});
+
+    // Only keys 1, 3 in dimension
+    PaddedPODArray<Int64> dim_keys = {1, 3};
+    PaddedPODArray<Int64> dim_values = {10, 20};
+    auto dim_table = EncodedStarJoin::buildDimensionTable(dim_keys, dim_values);
+
+    auto result = EncodedStarJoin::fusedJoinGroupByCount(*fact_col, dim_table);
+
+    ASSERT_TRUE(result.used_encoded_path);
+    EXPECT_EQ(result.rows_joined, 5u);    // key 1 appears 3 times, key 3 appears 2 times
+    EXPECT_EQ(result.rows_not_joined, 4u); // key 2 appears 2 times, key 4 appears 2 times
+    EXPECT_EQ(result.num_groups, 2u);
+
+    // Group 10 (key 1): 3 rows
+    EXPECT_EQ(result.aggregated_values[0].get<UInt64>(), 3u);
+    // Group 20 (key 3): 2 rows
+    EXPECT_EQ(result.aggregated_values[1].get<UInt64>(), 2u);
+}
+
 } // namespace DB::DM::tests
