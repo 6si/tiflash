@@ -103,6 +103,24 @@ struct JsonInferredSchema
 
     bool empty() const { return columns.empty(); }
     size_t numColumns() const { return columns.size(); }
+
+    /// Check if a specific path exists in this schema.
+    bool hasPath(const String & path) const
+    {
+        for (const auto & col : columns)
+            if (col.path == path)
+                return true;
+        return false;
+    }
+
+    /// Get the type for a specific path, or Null if not found.
+    JsonLeafType getPathType(const String & path) const
+    {
+        for (const auto & col : columns)
+            if (col.path == path)
+                return col.type;
+        return JsonLeafType::Null;
+    }
 };
 
 /// JsonSchemaTree: The core schema inference engine.
@@ -136,6 +154,17 @@ public:
     void reset();
 
     UInt64 totalRows() const { return total_rows_; }
+
+    /// Merge two finalized schemas into one unified schema.
+    /// Union of all paths; type conflicts resolved via promotion to Mixed.
+    /// Occurrence counts are summed; total_rows is summed.
+    static JsonInferredSchema mergeSchemas(
+        const JsonInferredSchema & schema_a,
+        const JsonInferredSchema & schema_b);
+
+    /// Promote two leaf types to a common type.
+    /// Same types stay; different types promote to Mixed.
+    static JsonLeafType promoteTypes(JsonLeafType a, JsonLeafType b);
 
 private:
     void mergeObject(JsonSchemaNodePtr & node, const StringRef & obj_data);

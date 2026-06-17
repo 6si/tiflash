@@ -327,4 +327,68 @@ void JsonSchemaTree::reset()
     non_null_rows_ = 0;
 }
 
+JsonLeafType JsonSchemaTree::promoteTypes(JsonLeafType a, JsonLeafType b)
+{
+    if (a == b)
+        return a;
+    if (a == JsonLeafType::Null)
+        return b;
+    if (b == JsonLeafType::Null)
+        return a;
+    // Different non-null types → Mixed
+    return JsonLeafType::Mixed;
+}
+
+JsonInferredSchema JsonSchemaTree::mergeSchemas(
+    const JsonInferredSchema & schema_a,
+    const JsonInferredSchema & schema_b)
+{
+    JsonInferredSchema result;
+    result.total_rows = schema_a.total_rows + schema_b.total_rows;
+    result.rows_with_json = schema_a.rows_with_json + schema_b.rows_with_json;
+
+    // Build a map from path → column for schema_b
+    std::unordered_map<String, const JsonShreddedColumn *> b_map;
+    for (const auto & col : schema_b.columns)
+        b_map[col.path] = &col;
+
+    // Add all paths from schema_a, merging with schema_b if present
+    std::unordered_map<String, bool> visited;
+    for (const auto & col_a : schema_a.columns)
+    {
+        visited[col_a.path] = true;
+        auto it = b_map.find(col_a.path);
+        if (it != b_map.end())
+        {
+            // Path exists in both — promote types and sum occurrences
+            const auto & col_b = *it->second;
+            result.columns.push_back(JsonShreddedColumn{
+                .path = col_a.path,
+                .type = promoteTypes(col_a.type, col_b.type),
+                .occurrence_count = col_a.occurrence_count + col_b.occurrence_count,
+                .is_array = col_a.is_array || col_b.is_array,
+            });
+        }
+        else
+        {
+            // Only in schema_a
+            result.columns.push_back(col_a);
+        }
+    }
+
+    // Add paths only in schema_b
+    for (const auto & col_b : schema_b.columns)
+    {
+        if (!visited.count(col_b.path))
+            result.columns.push_back(col_b);
+    }
+
+    // Sort by path for deterministic output
+    std::sort(result.columns.begin(), result.columns.end(), [](const auto & a, const auto & b) {
+        return a.path < b.path;
+    });
+
+    return result;
+}
+
 } // namespace DB::DM

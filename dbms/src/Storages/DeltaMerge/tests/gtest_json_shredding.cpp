@@ -685,4 +685,337 @@ TEST(JsonShreddingPerformanceTest, DualWriteEnablesBothPaths)
     JsonShreddingFlag::instance().setUseShredded(false); // Reset
 }
 
+// ============================================================================
+// Phase 5 Tests: Segment Merge & Delta Flush
+// ============================================================================
+
+} // namespace DB::DM::tests
+
+#include <Storages/DeltaMerge/JsonShredding/JsonSegmentMerger.h>
+
+namespace DB::DM::tests
+{
+
+class JsonSegmentMergeTest : public ::testing::Test
+{
+protected:
+    JsonShreddingConfig config;
+    void SetUp() override
+    {
+        config.max_leaves = 128;
+        config.max_children_per_node = 64;
+        config.sparse_children_check_threshold = 8;
+        config.sparse_children_ratio = 100;
+        config.absolute_sparse_ratio = 100;
+        config.min_rows_for_inference = 1;
+    }
+};
+
+TEST_F(JsonSegmentMergeTest, MergeIdenticalSchemas)
+{
+    // Two segments with the same schema (name:String, age:Int64)
+    auto json1 = buildBinaryJsonObject({{"name", "alice"}}, {{"age", 30}});
+    auto json2 = buildBinaryJsonObject({{"name", "bob"}}, {{"age", 25}});
+    auto json3 = buildBinaryJsonObject({{"name", "charlie"}}, {{"age", 35}});
+    auto json4 = buildBinaryJsonObject({{"name", "dave"}}, {{"age", 40}});
+
+    auto col_a = createJsonColumn({json1, json2});
+    auto col_b = createJsonColumn({json3, json4});
+
+    JsonShredder shredder(config);
+    auto seg_a = shredder.shred(assert_cast<const ColumnString &>(*col_a));
+    auto seg_b = shredder.shred(assert_cast<const ColumnString &>(*col_b));
+
+    // Verify schemas match
+    EXPECT_TRUE(JsonSegmentMerger::schemasMatch(seg_a.schema, seg_b.schema));
+
+    // Merge
+    JsonSegmentMerger merger(config);
+    auto merged = merger.mergeSegments(seg_a, seg_b);
+
+    // Verify merged result
+    EXPECT_EQ(merged.original_blob->size(), 4u); // 2 + 2 rows
+    EXPECT_EQ(merged.numSubColumns(), 2u); // name + age
+    EXPECT_EQ(merged.schema.total_rows, 4u);
+    EXPECT_EQ(merged.schema.rows_with_json, 4u);
+
+    // Verify sub-column row count
+    for (const auto & sub : merged.sub_columns)
+        EXPECT_EQ(sub.rows(), 4u);
+
+    // Verify occurrence counts are summed
+    for (const auto & col : merged.schema.columns)
+        EXPECT_EQ(col.occurrence_count, 4u); // 2 + 2
+}
+
+TEST_F(JsonSegmentMergeTest, MergeDifferentSchemas)
+{
+    // Segment A: {name, age}
+    auto json1 = buildBinaryJsonObject({{"name", "alice"}}, {{"age", 30}});
+    auto json2 = buildBinaryJsonObject({{"name", "bob"}}, {{"age", 25}});
+
+    // Segment B: {city, zip}
+    auto json3 = buildBinaryJsonObject({{"city", "NYC"}}, {{"zip", 10001}});
+    auto json4 = buildBinaryJsonObject({{"city", "LA"}}, {{"zip", 90001}});
+
+    auto col_a = createJsonColumn({json1, json2});
+    auto col_b = createJsonColumn({json3, json4});
+
+    JsonShredder shredder(config);
+    auto seg_a = shredder.shred(assert_cast<const ColumnString &>(*col_a));
+    auto seg_b = shredder.shred(assert_cast<const ColumnString &>(*col_b));
+
+    // Verify schemas differ
+    EXPECT_FALSE(JsonSegmentMerger::schemasMatch(seg_a.schema, seg_b.schema));
+
+    // Merge (should re-shred)
+    JsonSegmentMerger merger(config);
+    auto merged = merger.mergeSegments(seg_a, seg_b);
+
+    // Unified schema should have all 4 paths: age, city, name, zip
+    EXPECT_EQ(merged.original_blob->size(), 4u);
+    EXPECT_EQ(merged.schema.numColumns(), 4u);
+    EXPECT_TRUE(merged.schema.hasPath("name"));
+    EXPECT_TRUE(merged.schema.hasPath("age"));
+    EXPECT_TRUE(merged.schema.hasPath("city"));
+    EXPECT_TRUE(merged.schema.hasPath("zip"));
+
+    // Verify sub-columns exist for all paths
+    EXPECT_EQ(merged.numSubColumns(), 4u);
+
+    // First 2 rows should have name+age, rows 3-4 should have city+zip
+    // Path "name" in rows 3-4 should be NULL
+    for (const auto & sub : merged.sub_columns)
+        EXPECT_EQ(sub.rows(), 4u);
+}
+
+TEST_F(JsonSegmentMergeTest, MergeWithTypePromotion)
+{
+    // Segment A: status is String
+    auto json1 = buildBinaryJsonObject({{"status", "active"}});
+    auto json2 = buildBinaryJsonObject({{"status", "inactive"}});
+
+    // Segment B: status is Int64 (type conflict)
+    auto json3 = buildBinaryJsonObject({}, {{"status", 1}});
+    auto json4 = buildBinaryJsonObject({}, {{"status", 0}});
+
+    auto col_a = createJsonColumn({json1, json2});
+    auto col_b = createJsonColumn({json3, json4});
+
+    JsonShredder shredder(config);
+    auto seg_a = shredder.shred(assert_cast<const ColumnString &>(*col_a));
+    auto seg_b = shredder.shred(assert_cast<const ColumnString &>(*col_b));
+
+    // Type conflict: String vs Int64
+    EXPECT_EQ(seg_a.schema.getPathType("status"), JsonLeafType::String);
+    EXPECT_EQ(seg_b.schema.getPathType("status"), JsonLeafType::Int64);
+
+    // Merge — types should be promoted to Mixed
+    auto unified = JsonSchemaTree::mergeSchemas(seg_a.schema, seg_b.schema);
+    EXPECT_EQ(unified.getPathType("status"), JsonLeafType::Mixed);
+    EXPECT_EQ(unified.columns[0].occurrence_count, 4u); // 2 + 2
+}
+
+TEST_F(JsonSegmentMergeTest, DeltaFlushWithNewKeys)
+{
+    // Stable segment: {name, age}
+    auto json1 = buildBinaryJsonObject({{"name", "alice"}}, {{"age", 30}});
+    auto json2 = buildBinaryJsonObject({{"name", "bob"}}, {{"age", 25}});
+
+    auto col_stable = createJsonColumn({json1, json2});
+    JsonShredder shredder(config);
+    auto stable = shredder.shred(assert_cast<const ColumnString &>(*col_stable));
+
+    EXPECT_EQ(stable.schema.numColumns(), 2u); // name + age
+
+    // Delta has new keys: {name, age, email}
+    auto json3 = buildBinaryJsonObject({{"name", "charlie"}, {"email", "c@x.com"}}, {{"age", 35}});
+    auto delta_col = ColumnString::create();
+    delta_col->insertData(json3.data(), json3.size());
+
+    // Flush delta into stable
+    JsonSegmentMerger merger(config);
+    auto new_stable = merger.flushDelta(stable, *delta_col);
+
+    // New stable should have 3 paths: age, email, name
+    EXPECT_EQ(new_stable.original_blob->size(), 3u); // 2 stable + 1 delta
+    EXPECT_EQ(new_stable.schema.numColumns(), 3u);
+    EXPECT_TRUE(new_stable.schema.hasPath("name"));
+    EXPECT_TRUE(new_stable.schema.hasPath("age"));
+    EXPECT_TRUE(new_stable.schema.hasPath("email"));
+
+    // All sub-columns should have 3 rows
+    for (const auto & sub : new_stable.sub_columns)
+        EXPECT_EQ(sub.rows(), 3u);
+}
+
+TEST_F(JsonSegmentMergeTest, DeltaFlushWithDisappearingKeys)
+{
+    // Stable segment: {name, age, status}
+    auto json1 = buildBinaryJsonObject({{"name", "alice"}, {"status", "active"}}, {{"age", 30}});
+    auto json2 = buildBinaryJsonObject({{"name", "bob"}, {"status", "inactive"}}, {{"age", 25}});
+
+    auto col_stable = createJsonColumn({json1, json2});
+    JsonShredder shredder(config);
+    auto stable = shredder.shred(assert_cast<const ColumnString &>(*col_stable));
+
+    EXPECT_EQ(stable.schema.numColumns(), 3u); // age, name, status
+
+    // Delta has fewer keys: only {name} — "status" and "age" disappear
+    auto json3 = buildBinaryJsonObject({{"name", "charlie"}});
+    auto delta_col = ColumnString::create();
+    delta_col->insertData(json3.data(), json3.size());
+
+    // Flush delta — re-infers from ALL combined data
+    JsonSegmentMerger merger(config);
+    auto new_stable = merger.flushDelta(stable, *delta_col);
+
+    // Schema should still include all paths from combined data
+    EXPECT_EQ(new_stable.original_blob->size(), 3u);
+    // name appears in 3/3 rows, age in 2/3, status in 2/3 — all above 1% threshold
+    EXPECT_TRUE(new_stable.schema.hasPath("name"));
+    EXPECT_TRUE(new_stable.schema.hasPath("age"));
+    EXPECT_TRUE(new_stable.schema.hasPath("status"));
+
+    // For row 3 (delta), age and status should be NULL
+    for (const auto & sub : new_stable.sub_columns)
+        EXPECT_EQ(sub.rows(), 3u);
+}
+
+TEST_F(JsonSegmentMergeTest, ReadPathAcrossSegments)
+{
+    // Segment A: has "name" path
+    auto json1 = buildBinaryJsonObject({{"name", "alice"}}, {{"age", 30}});
+    auto json2 = buildBinaryJsonObject({{"name", "bob"}}, {{"age", 25}});
+
+    // Segment B: does NOT have "name" path
+    auto json3 = buildBinaryJsonObject({{"city", "NYC"}}, {{"zip", 10001}});
+    auto json4 = buildBinaryJsonObject({{"city", "LA"}}, {{"zip", 90001}});
+
+    auto col_a = createJsonColumn({json1, json2});
+    auto col_b = createJsonColumn({json3, json4});
+
+    JsonShredder shredder(config);
+    auto seg_a = shredder.shred(assert_cast<const ColumnString &>(*col_a));
+    auto seg_b = shredder.shred(assert_cast<const ColumnString &>(*col_b));
+
+    // Read "name" across both segments
+    std::vector<const ShreddedJsonData *> segments = {&seg_a, &seg_b};
+    auto result = JsonSegmentMerger::readPathAcrossSegments(segments, "name");
+
+    // Should have 4 rows total
+    const auto & nullable = assert_cast<const ColumnNullable &>(*result);
+    EXPECT_EQ(nullable.size(), 4u);
+
+    // First 2 rows (segment A) should have values
+    EXPECT_FALSE(nullable.isNullAt(0));
+    EXPECT_FALSE(nullable.isNullAt(1));
+
+    // Last 2 rows (segment B) should be NULL (path doesn't exist)
+    EXPECT_TRUE(nullable.isNullAt(2));
+    EXPECT_TRUE(nullable.isNullAt(3));
+}
+
+TEST_F(JsonSegmentMergeTest, UnifySchemas)
+{
+    auto json1 = buildBinaryJsonObject({{"name", "alice"}}, {{"age", 30}});
+    auto json2 = buildBinaryJsonObject({{"city", "NYC"}});
+    auto json3 = buildBinaryJsonObject({{"name", "bob"}, {"email", "b@x.com"}});
+
+    auto col_a = createJsonColumn({json1});
+    auto col_b = createJsonColumn({json2});
+    auto col_c = createJsonColumn({json3});
+
+    JsonShredder shredder(config);
+    auto seg_a = shredder.shred(assert_cast<const ColumnString &>(*col_a));
+    auto seg_b = shredder.shred(assert_cast<const ColumnString &>(*col_b));
+    auto seg_c = shredder.shred(assert_cast<const ColumnString &>(*col_c));
+
+    std::vector<const ShreddedJsonData *> segments = {&seg_a, &seg_b, &seg_c};
+    auto unified = JsonSegmentMerger::unifySchemas(segments);
+
+    // Union: age, city, email, name (sorted)
+    EXPECT_EQ(unified.numColumns(), 4u);
+    EXPECT_TRUE(unified.hasPath("age"));
+    EXPECT_TRUE(unified.hasPath("city"));
+    EXPECT_TRUE(unified.hasPath("email"));
+    EXPECT_TRUE(unified.hasPath("name"));
+    EXPECT_EQ(unified.total_rows, 3u);
+}
+
+TEST_F(JsonSegmentMergeTest, MergePreShreddingSegmentWithShreddedSegment)
+{
+    // Segment A: pre-shredding (no sub-columns, blob only)
+    ShreddedJsonData seg_a;
+    auto json1 = buildBinaryJsonObject({{"name", "alice"}}, {{"age", 30}});
+    auto json2 = buildBinaryJsonObject({{"name", "bob"}}, {{"age", 25}});
+    auto col_a = createJsonColumn({json1, json2});
+    seg_a.original_blob = col_a->getPtr();
+    // No sub-columns — simulating old segment
+
+    // Segment B: has shredded data
+    auto json3 = buildBinaryJsonObject({{"name", "charlie"}}, {{"age", 35}});
+    auto json4 = buildBinaryJsonObject({{"name", "dave"}}, {{"age", 40}});
+    auto col_b = createJsonColumn({json3, json4});
+    JsonShredder shredder(config);
+    auto seg_b = shredder.shred(assert_cast<const ColumnString &>(*col_b));
+
+    // Merge: pre-shredding + shredded
+    JsonSegmentMerger merger(config);
+    auto merged = merger.mergeSegments(seg_a, seg_b);
+
+    // Result should have all 4 rows with blobs merged
+    EXPECT_EQ(merged.original_blob->size(), 4u);
+    // Since seg_a has no schema, merge will re-shred from blobs
+    // seg_a.schema is empty so mergeSchemas yields seg_b's schema
+    // Then mergeWithReShred re-shreds all rows with the unified schema
+    EXPECT_EQ(merged.numSubColumns(), 2u); // name + age
+    for (const auto & sub : merged.sub_columns)
+        EXPECT_EQ(sub.rows(), 4u);
+}
+
+TEST_F(JsonSegmentMergeTest, MergeSchemasFunctionDirectly)
+{
+    // Test the static mergeSchemas function
+    JsonInferredSchema schema_a;
+    schema_a.total_rows = 100;
+    schema_a.rows_with_json = 90;
+    schema_a.columns.push_back({"name", JsonLeafType::String, 90, false});
+    schema_a.columns.push_back({"age", JsonLeafType::Int64, 80, false});
+
+    JsonInferredSchema schema_b;
+    schema_b.total_rows = 50;
+    schema_b.rows_with_json = 45;
+    schema_b.columns.push_back({"age", JsonLeafType::Int64, 40, false});
+    schema_b.columns.push_back({"email", JsonLeafType::String, 30, false});
+
+    auto merged = JsonSchemaTree::mergeSchemas(schema_a, schema_b);
+
+    // Verify totals are summed
+    EXPECT_EQ(merged.total_rows, 150u);
+    EXPECT_EQ(merged.rows_with_json, 135u);
+
+    // Verify union: age, email, name (sorted)
+    EXPECT_EQ(merged.numColumns(), 3u);
+
+    // age: present in both → occurrences summed, type stays Int64
+    EXPECT_TRUE(merged.hasPath("age"));
+    EXPECT_EQ(merged.getPathType("age"), JsonLeafType::Int64);
+
+    // name: only in A
+    EXPECT_TRUE(merged.hasPath("name"));
+    EXPECT_EQ(merged.getPathType("name"), JsonLeafType::String);
+
+    // email: only in B
+    EXPECT_TRUE(merged.hasPath("email"));
+    EXPECT_EQ(merged.getPathType("email"), JsonLeafType::String);
+
+    // Check age occurrence count = 80 + 40 = 120
+    for (const auto & col : merged.columns)
+    {
+        if (col.path == "age")
+            EXPECT_EQ(col.occurrence_count, 120u);
+    }
+}
+
 } // namespace DB::DM::tests
