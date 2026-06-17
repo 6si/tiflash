@@ -113,15 +113,12 @@ TEST_F(CompressionCodecDictionaryTest, Int32ExactlyMaxCardinality)
 
 TEST_F(CompressionCodecDictionaryTest, EmptyData)
 {
-    std::vector<int32_t> data;
     CompressionCodecDictionary codec(CompressionDataType::Int32);
 
-    UInt32 source_size = 0;
-    UInt32 max_compressed = codec.getCompressedReserveSize(source_size);
-    std::vector<char> compressed(max_compressed);
-    UInt32 compressed_size = codec.compress(nullptr, source_size, compressed.data());
-    // Should handle empty data gracefully
-    ASSERT_GE(compressed_size, 0u);
+    // ICompressionCodec::compress requires non-null source and source_size > 0.
+    // Verify getCompressedReserveSize handles zero gracefully.
+    UInt32 reserve = codec.getCompressedReserveSize(0);
+    ASSERT_GT(reserve, 0u);
 }
 
 TEST_F(CompressionCodecDictionaryTest, SingleElement)

@@ -68,8 +68,11 @@ UInt8 CompressionCodecDictionary::getMethodByte() const
 
 UInt32 CompressionCodecDictionary::getMaxCompressedDataSize(UInt32 uncompressed_size) const
 {
-    // Worst case: fallback header (10 bytes) + uncompressed data
-    return DICT_HEADER_SIZE + uncompressed_size;
+    // Worst case for dictionary path: header + dictionary entries + bit-packed IDs
+    // Dictionary entries can be up to uncompressed_size bytes.
+    // Bit-packed IDs: BitpackingPrimitives rounds up to groups of 32, with up to 32 bits each.
+    // Safe upper bound: header + raw data + one extra bitpacking group (32 * 4 bytes).
+    return DICT_HEADER_SIZE + uncompressed_size + 128;
 }
 
 bool CompressionCodecDictionary::isDataSuitableForDictionary(
