@@ -391,6 +391,10 @@ file(GLOB AWS_CRT_SRC
 
 list(APPEND AWS_SOURCES ${AWS_CRT_SRC})
 list(APPEND AWS_PUBLIC_INCLUDES "${AWS_CRT_DIR}/include/")
+set(PROJECT_VERSION_MAJOR 0)
+set(PROJECT_VERSION_MINOR 0)
+set(PROJECT_VERSION_PATCH 0)
+set(PROJECT_VERSION "0.0.0")
 configure_file("${AWS_CRT_DIR}/include/aws/crt/Config.h.in"
     ${CMAKE_CURRENT_BINARY_DIR}/include/aws/crt/Config.h @ONLY)
 
