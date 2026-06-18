@@ -300,6 +300,7 @@ list(APPEND AWS_SOURCES ${AWS_COMMON_SRC} ${AWS_COMMON_ARCH_SRC} ${AWS_COMMON_AV
 list(APPEND AWS_PUBLIC_INCLUDES
     "${AWS_COMMON_DIR}/include/"
     "${CMAKE_CURRENT_BINARY_DIR}/include"
+    "${AWS_COMMON_DIR}/source/external/libcbor"
 )
 
 
