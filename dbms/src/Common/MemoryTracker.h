@@ -20,6 +20,7 @@
 #include <common/types.h>
 
 #include <atomic>
+#include <memory>
 #include <boost/noncopyable.hpp>
 
 extern std::atomic<Int64> real_rss, proc_num_threads, baseline_of_query_mem_tracker;
