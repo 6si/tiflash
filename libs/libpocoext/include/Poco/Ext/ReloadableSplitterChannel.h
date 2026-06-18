@@ -15,9 +15,11 @@
 #pragma once
 
 
+#include <Poco/Mutex.h>
 #include <Poco/SplitterChannel.h>
 
 #include <functional>
+#include <vector>
 
 namespace Poco
 {
@@ -30,20 +32,32 @@ class ReloadableSplitterChannel : public SplitterChannel
 {
 public:
     using SplitterChannelValidator = std::function<void(Channel &, Util::AbstractConfiguration &)>;
+
+    void addChannel(Channel * pChannel)
+    {
+        SplitterChannel::addChannel(pChannel);
+        FastMutex::ScopedLock lock(_ourMutex);
+        _ourChannels.push_back(pChannel);
+    }
+
     void changeProperties(Util::AbstractConfiguration & config);
     // just for test now
     void setPropertiesValidator(SplitterChannelValidator validator) { properties_validator = validator; }
     void validateProperties(Util::AbstractConfiguration & expect_config)
     {
-        FastMutex::ScopedLock lock(_mutex);
-        for (auto it : _channels)
+        FastMutex::ScopedLock lock(_ourMutex);
+        for (auto * ch : _ourChannels)
         {
-            properties_validator(*it, expect_config);
+            properties_validator(*ch, expect_config);
         }
     }
 
 protected:
     void setPropertiesRecursively(Channel & channel, Util::AbstractConfiguration & config);
     SplitterChannelValidator properties_validator = nullptr; // just for test now
+
+private:
+    std::vector<Channel *> _ourChannels;
+    mutable FastMutex _ourMutex;
 };
 } // namespace Poco

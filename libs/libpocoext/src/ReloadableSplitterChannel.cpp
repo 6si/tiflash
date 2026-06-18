@@ -51,8 +51,8 @@ void ReloadableSplitterChannel::setPropertiesRecursively(Channel & channel, Util
 // only support FormattingChannel --> LevelFilterChannel/SourceFilterChannel --> ... --> LevelFilterChannel/SourceFilterChannel --> TiFlashLogFileChannel
 void ReloadableSplitterChannel::changeProperties(Util::AbstractConfiguration & config)
 {
-    FastMutex::ScopedLock lock(_mutex);
-    for (auto * chan : _channels)
+    FastMutex::ScopedLock lock(_ourMutex);
+    for (auto * chan : _ourChannels)
     {
         setPropertiesRecursively(*chan, config);
     }
