@@ -409,7 +409,7 @@ endif()
 cmake_dependent_option(CURL_USE_OPENSSL "Use OpenSSL code. Experimental" ${openssl_default} CURL_ENABLE_SSL OFF)
 option(CURL_DISABLE_OPENSSL_AUTO_LOAD_CONFIG "Disable automatic loading of OpenSSL configuration" OFF)
 
-count_true(enabled_ssl_options_count
+curl_count_true(enabled_ssl_options_count
     CURL_USE_SCHANNEL
     CURL_USE_SECTRANSP
     CURL_USE_OPENSSL
@@ -1350,6 +1350,10 @@ endif()
 
 
 # Ugly (but functional) way to include "Makefile.inc" by transforming it (= regenerate it).
+# Also define the curl_ prefixed version used by newer curl subdir CMakeLists.txt
+function(curl_transform_makefile_inc _input_file _output_file)
+  transform_makefile_inc("${_input_file}" "${_output_file}")
+endfunction()
 function(transform_makefile_inc INPUT_FILE OUTPUT_FILE)
   file(READ ${INPUT_FILE} MAKEFILE_INC_TEXT)
   string(REPLACE "$(top_srcdir)"   "\${CURL_SRC_DIR}" MAKEFILE_INC_TEXT ${MAKEFILE_INC_TEXT})
@@ -1366,6 +1370,18 @@ function(transform_makefile_inc INPUT_FILE OUTPUT_FILE)
 endfunction()
 
 include(GNUInstallDirs)
+
+# Define library target names expected by curl's lib/CMakeLists.txt
+set(LIB_NAME "libcurl")
+set(LIB_STATIC "libcurl_static")
+set(LIB_SHARED "libcurl_shared")
+if(BUILD_SHARED_LIBS)
+  set(LIB_SELECTED ${LIB_SHARED})
+  set(BUILD_STATIC_LIBS OFF)
+else()
+  set(LIB_SELECTED ${LIB_STATIC})
+  set(BUILD_STATIC_LIBS ON)
+endif()
 
 set(CURL_INSTALL_CMAKE_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME})
 set(TARGETS_EXPORT_NAME "${PROJECT_NAME}Targets")
@@ -1586,7 +1602,7 @@ write_basic_package_version_file(
 # Use:
 # * TARGETS_EXPORT_NAME
 # * PROJECT_NAME
-configure_package_config_file(${CURL_SRC_DIR}/CMake/curl-config.cmake.in
+configure_package_config_file(${CURL_SRC_DIR}/CMake/curl-config.in.cmake
     "${project_config}"
     INSTALL_DESTINATION ${CURL_INSTALL_CMAKE_DIR}
     )

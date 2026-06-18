@@ -91,7 +91,7 @@ target_no_warning(grpc++ implicit-const-int-float-conversion)
 target_no_warning(grpc++ unused-but-set-variable)
 
 execute_process(
-  COMMAND grep "//gpr_log(GPR_DEBUG, \"cannot set inq fd=%d errno=%d\", tcp->fd, errno);" "${_gRPC_SOURCE_DIR}/src/core/lib/iomgr/tcp_posix.cc"
+  COMMAND grep "//VLOG(2) << \"cannot set inq fd=\"" "${_gRPC_SOURCE_DIR}/src/core/lib/iomgr/tcp_posix.cc"
   RESULT_VARIABLE HAVE_APPLY_PATCH)
 # grep - Normally, the exit status is 0 if selected lines are found and 1 otherwise. But the exit status is 2 if an error occurred.
 if (HAVE_APPLY_PATCH EQUAL 1)

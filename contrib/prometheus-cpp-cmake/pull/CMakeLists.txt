@@ -22,7 +22,6 @@ add_library(pull
   ${PROMETHEUS_SRC_DIR}/pull/src/metrics_collector.cc
   ${PROMETHEUS_SRC_DIR}/pull/src/metrics_collector.h
 
-  ${PROMETHEUS_SRC_DIR}/pull/src/detail/base64.h
 
   $<$<BOOL:${USE_THIRDPARTY_LIBRARIES}>:$<TARGET_OBJECTS:civetweb>>
 )
