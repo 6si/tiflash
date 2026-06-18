@@ -83,6 +83,7 @@ set(OPERATING_SYSTEM "${CMAKE_SYSTEM_NAME}")
 set(OS "\"${CMAKE_SYSTEM_NAME}\"")
 
 include_directories(${CURL_SRC_DIR}/include)
+include_directories(${CURL_SRC_DIR}/lib)
 
 option(CURL_WERROR "Turn compiler warnings into errors" OFF)
 option(PICKY_COMPILER "Enable picky compiler options" ON)
