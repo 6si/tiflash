@@ -41,6 +41,7 @@ target_link_libraries(pull
 target_include_directories(pull
   PUBLIC
     $<BUILD_INTERFACE:${PROMETHEUS_SRC_DIR}/pull/include>
+    $<BUILD_INTERFACE:${PROMETHEUS_SRC_DIR}/util/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
   PRIVATE
     ${CIVETWEB_INCLUDE_DIRS}
