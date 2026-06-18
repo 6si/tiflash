@@ -46,7 +46,7 @@ public:
     template <
         typename S, //
         typename... Args,
-        fmt::enable_if_t<(fmt::detail::is_compiled_string<S>::value), int> = 0>
+        fmt::enable_if_t<(fmt::is_compiled_string<S>::value), int> = 0>
     constexpr FmtBuffer & fmtAppend(const S & s, Args &&... args)
     {
         fmt::format_to(std::back_inserter(buffer), s, std::forward<Args>(args)...);

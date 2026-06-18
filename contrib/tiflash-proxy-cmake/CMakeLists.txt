@@ -53,7 +53,11 @@ set(TIFLASH_RUST_ENV "CMAKE_POLICY_VERSION_MINIMUM=3.5" ${TIFLASH_RUST_ENV})
 
 # use `CFLAGS=-w CXXFLAGS=-w` to inhibit warning messages.
 if (TIFLASH_LLVM_TOOLCHAIN)
-    set(TIFLASH_RUST_ENV CMAKE=${CMAKE_COMMAND} "CFLAGS=-w -fuse-ld=lld" "CXXFLAGS=-w -fuse-ld=lld -stdlib=libc++" ${TIFLASH_RUST_ENV})
+    if (USE_LIBCXX)
+        set(TIFLASH_RUST_ENV CMAKE=${CMAKE_COMMAND} CC=${CMAKE_C_COMPILER} CXX=${CMAKE_CXX_COMPILER} "CFLAGS=-w -fuse-ld=lld" "CXXFLAGS=-w -fuse-ld=lld -stdlib=libc++" ${TIFLASH_RUST_ENV})
+    else()
+        set(TIFLASH_RUST_ENV CMAKE=${CMAKE_COMMAND} CC=${CMAKE_C_COMPILER} CXX=${CMAKE_CXX_COMPILER} "CFLAGS=-w -fuse-ld=lld" "CXXFLAGS=-w -fuse-ld=lld" ${TIFLASH_RUST_ENV})
+    endif()
 else()
     set(TIFLASH_RUST_ENV CMAKE=${CMAKE_COMMAND} CFLAGS=-w CXXFLAGS=-w ${TIFLASH_RUST_ENV})
 endif()
