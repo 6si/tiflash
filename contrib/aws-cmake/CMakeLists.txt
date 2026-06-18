@@ -336,6 +336,7 @@ if (OS_LINUX)
         "${AWS_IO_DIR}/source/linux/*.c"
         "${AWS_IO_DIR}/source/posix/*.c"
     )
+    list(APPEND AWS_PRIVATE_COMPILE_DEFS "-DAWS_ENABLE_EPOLL")
 elseif (OS_DARWIN)
     file(GLOB AWS_IO_OS_SRC
         "${AWS_IO_DIR}/source/bsd/*.c"
