@@ -84,6 +84,7 @@ set(OS "\"${CMAKE_SYSTEM_NAME}\"")
 
 include_directories(${CURL_SRC_DIR}/include)
 include_directories(${CURL_SRC_DIR}/lib)
+add_compile_definitions(_GNU_SOURCE)
 
 option(CURL_WERROR "Turn compiler warnings into errors" OFF)
 option(PICKY_COMPILER "Enable picky compiler options" ON)
