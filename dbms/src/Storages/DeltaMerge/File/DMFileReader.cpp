@@ -365,6 +365,8 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
 
     // JSON shredding read path: if shredded sub-columns exist for any column in this DMFile,
     // load them into the thread-local context so FunctionJsonExtract can use them.
+    // The sidecar contains data for the ENTIRE DMFile; we pass the pack's row range
+    // so getSubColumn() can slice to the current block's rows.
     if (JsonShreddingFlag::instance().useShredded())
     {
         const String & dmfile_path = dmfile->path();
@@ -377,7 +379,7 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
             const ShreddedJsonData * cached = JsonShreddedStore::getCached(dmfile_path, cd.name);
             if (cached)
             {
-                shred_ctx.setForCurrentBlock(cd.name, *cached);
+                shred_ctx.setForCurrentBlock(cd.name, *cached, start_row_offset, read_rows);
                 continue;
             }
             // Try loading from disk sidecar
@@ -389,7 +391,7 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
                     JsonShreddedStore::putCache(dmfile_path, cd.name, std::move(loaded.value()));
                     const ShreddedJsonData * newly_cached = JsonShreddedStore::getCached(dmfile_path, cd.name);
                     if (newly_cached)
-                        shred_ctx.setForCurrentBlock(cd.name, *newly_cached);
+                        shred_ctx.setForCurrentBlock(cd.name, *newly_cached, start_row_offset, read_rows);
                 }
             }
         }

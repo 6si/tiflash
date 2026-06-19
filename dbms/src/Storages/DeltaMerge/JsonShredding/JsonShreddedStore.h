@@ -34,9 +34,9 @@ namespace DB::DM
 ///
 /// Lifecycle:
 ///   1. Reader loads a block from DMFile that has a shredded sidecar
-///   2. Reader calls setForCurrentBlock() with the shredded data
+///   2. Reader calls setForCurrentBlock() with the shredded data + row range
 ///   3. Expression evaluation runs (including FunctionJsonExtract)
-///   4. FunctionJsonExtract calls getSubColumn() to get pre-extracted values
+///   4. FunctionJsonExtract calls getSubColumn() to get pre-extracted values (sliced to pack range)
 ///   5. After block processing, reader calls clear()
 class JsonShreddedBlockContext
 {
@@ -49,27 +49,38 @@ public:
 
     /// Set the shredded data for the current block being processed.
     /// col_name: the logical column name (e.g., "payload")
-    /// data: the shredded sub-columns for this block
-    void setForCurrentBlock(const String & col_name, const ShreddedJsonData & data)
+    /// data: the shredded sub-columns for the ENTIRE DMFile
+    /// row_offset: starting row within the DMFile for this pack batch
+    /// row_count: number of rows in this pack batch
+    void setForCurrentBlock(const String & col_name, const ShreddedJsonData & data, size_t row_offset, size_t row_count)
     {
-        current_data_[col_name] = &data;
+        current_data_[col_name] = BlockShreddedRef{&data, row_offset, row_count};
     }
 
     /// Get a specific sub-column for a path from the current block's shredded data.
-    /// Returns nullptr if not available.
+    /// Returns a column sliced to the current pack's row range.
+    /// Returns nullptr if not available or if the path doesn't exist in the sidecar.
     ColumnPtr getSubColumn(const String & col_name, const String & path) const
     {
         auto it = current_data_.find(col_name);
-        if (it == current_data_.end() || it->second == nullptr)
+        if (it == current_data_.end() || it->second.data == nullptr)
             return nullptr;
-        return JsonSubColumnReader::readPath(*it->second, path);
+        auto full_col = JsonSubColumnReader::readPath(*it->second.data, path);
+        if (!full_col)
+            return nullptr;
+        const auto & ref = it->second;
+        if (full_col->size() == ref.row_count)
+            return full_col;
+        if (full_col->size() < ref.row_offset + ref.row_count)
+            return nullptr;
+        return full_col->cut(ref.row_offset, ref.row_count);
     }
 
     /// Check if shredded data is available for a column.
     bool hasShredded(const String & col_name) const
     {
         auto it = current_data_.find(col_name);
-        return it != current_data_.end() && it->second != nullptr;
+        return it != current_data_.end() && it->second.data != nullptr;
     }
 
     /// Clear the context after block processing.
@@ -77,7 +88,14 @@ public:
 
 private:
     JsonShreddedBlockContext() = default;
-    std::unordered_map<String, const ShreddedJsonData *> current_data_;
+
+    struct BlockShreddedRef
+    {
+        const ShreddedJsonData * data = nullptr;
+        size_t row_offset = 0;
+        size_t row_count = 0;
+    };
+    std::unordered_map<String, BlockShreddedRef> current_data_;
 };
 
 /// Manages persistent storage of shredded JSON sub-columns alongside DMFiles.
