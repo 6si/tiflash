@@ -19,7 +19,9 @@
 #include <Storages/DeltaMerge/JsonShredding/JsonPathOptimizer.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonSchemaTree.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonShredder.h>
+#include <Storages/DeltaMerge/JsonShredding/JsonShreddedStore.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonShreddingConfig.h>
+#include <fmt/format.h>
 #include <TiDB/Decode/JsonBinary.h>
 #include <gtest/gtest.h>
 
@@ -649,6 +651,140 @@ TEST(JsonShreddingFlagTest, ToggleWriteFlag)
 
     // Restore default
     JsonShreddingFlag::instance().setWriteShredded(true);
+}
+
+// ============================================================================
+// BlockContext Column-ID Lookup Tests
+// Simulates the real query pipeline where PhysicalTableScan::buildProjection
+// renames columns from storage names (e.g., "payload") to DAG schema names
+// (e.g., "table_scan_3"). The context must find data via column_id even when
+// the name doesn't match.
+// ============================================================================
+
+TEST(JsonShreddedBlockContextTest, LookupByColumnIdAfterRename)
+{
+    // Simulate: DMFileReader stores context under storage name "payload" with col_id=5
+    // Expression evaluator looks up with DAG name "table_scan_3" with col_id=5
+    // Should find the data via column_id despite name mismatch.
+
+    JsonShreddingConfig config;
+    config.min_rows_for_inference = 1;
+    config.max_children_per_node = 64;
+
+    auto json1 = buildBinaryJsonObject({{"event", "click"}}, {{"count", 10}});
+    auto json2 = buildBinaryJsonObject({{"event", "view"}}, {{"count", 20}});
+    auto json3 = buildBinaryJsonObject({{"event", "purchase"}}, {{"count", 30}});
+
+    auto col = createJsonColumn({json1, json2, json3});
+    const auto & col_string = assert_cast<const ColumnString &>(*col);
+
+    JsonShredder shredder(config);
+    auto shredded = shredder.shred(col_string);
+    ASSERT_GT(shredded.numSubColumns(), 0u);
+
+    auto & ctx = JsonShreddedBlockContext::instance();
+    ctx.clear();
+
+    // Store under storage name "payload" with column_id=5
+    const Int64 col_id = 5;
+    ctx.setForCurrentBlock("payload", col_id, shredded, 0, 3);
+
+    // Lookup with SAME name should work (baseline)
+    auto result1 = ctx.getSubColumn("payload", col_id, "event");
+    ASSERT_NE(result1, nullptr);
+    EXPECT_EQ(result1->size(), 3u);
+
+    // Lookup with DIFFERENT name but same column_id should ALSO work
+    // This simulates the post-projection scenario
+    auto result2 = ctx.getSubColumn("table_scan_3", col_id, "event");
+    ASSERT_NE(result2, nullptr) << "column_id lookup should find data even with mismatched name";
+    EXPECT_EQ(result2->size(), 3u);
+
+    // Lookup with DIFFERENT name and WRONG column_id should fail
+    auto result3 = ctx.getSubColumn("table_scan_3", 999, "event");
+    EXPECT_EQ(result3, nullptr);
+
+    // Lookup with DIFFERENT name and col_id=0 (backward compat) should fail
+    // because name "table_scan_3" was never stored
+    auto result4 = ctx.getSubColumn("table_scan_3", 0, "event");
+    EXPECT_EQ(result4, nullptr);
+
+    // hasShredded should also work with column_id
+    EXPECT_TRUE(ctx.hasShredded("payload", col_id));
+    EXPECT_TRUE(ctx.hasShredded("table_scan_3", col_id));  // finds by id
+    EXPECT_FALSE(ctx.hasShredded("table_scan_3", 0));       // name-only lookup fails
+    EXPECT_FALSE(ctx.hasShredded("table_scan_3", 999));     // wrong id
+
+    ctx.clear();
+}
+
+TEST(JsonShreddedBlockContextTest, LookupByColumnIdWithRowSlicing)
+{
+    // Simulate: sidecar has 9 rows (full DMFile), but we're reading pack of 3 rows at offset 3
+    // column_id lookup should correctly slice to [3, 6)
+
+    JsonShreddingConfig config;
+    config.min_rows_for_inference = 1;
+    config.max_children_per_node = 64;
+
+    // Build 9 JSON documents
+    std::vector<String> jsons;
+    for (int i = 0; i < 9; ++i)
+        jsons.push_back(buildBinaryJsonObject({{"name", fmt::format("user_{}", i)}}, {{"id", i}}));
+
+    auto col = createJsonColumn(jsons);
+    const auto & col_string = assert_cast<const ColumnString &>(*col);
+
+    JsonShredder shredder(config);
+    auto shredded = shredder.shred(col_string);
+    ASSERT_EQ(shredded.numRows(), 9u);
+
+    auto & ctx = JsonShreddedBlockContext::instance();
+    ctx.clear();
+
+    // Store with row range [3, 3+3) simulating pack in the middle
+    const Int64 col_id = 7;
+    ctx.setForCurrentBlock("payload", col_id, shredded, 3, 3);
+
+    // Lookup with renamed column name but correct id
+    auto result = ctx.getSubColumn("table_scan_0", col_id, "id");
+    ASSERT_NE(result, nullptr) << "Should find via col_id and slice to 3 rows";
+    EXPECT_EQ(result->size(), 3u);
+
+    ctx.clear();
+}
+
+TEST(JsonShreddedBlockContextTest, BackwardCompatNameOnlyLookup)
+{
+    // Ensure backward compatibility: when col_id=0, lookup falls back to name-only
+    JsonShreddingConfig config;
+    config.min_rows_for_inference = 1;
+    config.max_children_per_node = 64;
+
+    auto json1 = buildBinaryJsonObject({{"status", "ok"}}, {});
+    auto col = createJsonColumn({json1});
+    const auto & col_string = assert_cast<const ColumnString &>(*col);
+
+    JsonShredder shredder(config);
+    auto shredded = shredder.shred(col_string);
+
+    auto & ctx = JsonShreddedBlockContext::instance();
+    ctx.clear();
+
+    // Store with col_id=0 (simulating unit test scenario without real column IDs)
+    ctx.setForCurrentBlock("payload", 0, shredded, 0, 1);
+
+    // Name-only lookup (2-arg overload) should work
+    auto result = ctx.getSubColumn("payload", "status");
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(result->size(), 1u);
+
+    // 3-arg overload with col_id=0 should also work via name fallback
+    auto result2 = ctx.getSubColumn("payload", 0, "status");
+    ASSERT_NE(result2, nullptr);
+    EXPECT_EQ(result2->size(), 1u);
+
+    ctx.clear();
 }
 
 // ============================================================================
