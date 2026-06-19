@@ -17,6 +17,7 @@
 #include <Columns/ColumnsNumber.h>
 #include <Common/assert_cast.h>
 #include <Core/ColumnWithTypeAndName.h>
+#include <Poco/File.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonPathOptimizer.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonSchemaTree.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonShredder.h>
@@ -25,6 +26,7 @@
 #include <fmt/format.h>
 #include <TiDB/Decode/JsonBinary.h>
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <thread>
 
@@ -1035,6 +1037,180 @@ TEST(JsonShreddingPerformanceTest, DualWriteEnablesBothPaths)
     // Restore defaults
     JsonShreddingFlag::instance().setUseShredded(true);
     JsonShreddingFlag::instance().setWriteShredded(true);
+}
+
+// ============================================================================
+// Dictionary Encoding Tests: Sidecar v2 with encoded string sub-columns
+// ============================================================================
+
+TEST(JsonShreddingSidecarTest, DictionaryEncodedStringSubColumns)
+{
+    // Verify that string sub-columns with low cardinality are dictionary-encoded
+    // in the sidecar, and correctly reconstructed on read.
+    JsonShreddingConfig config;
+    config.min_rows_for_inference = 1;
+    config.max_children_per_node = 64;
+
+    // Build 100 JSON rows with a low-cardinality "status" field (3 distinct values)
+    // and a numeric "count" field
+    std::vector<String> jsons;
+    const std::vector<String> statuses = {"active", "inactive", "pending"};
+    for (int i = 0; i < 100; ++i)
+    {
+        jsons.push_back(buildBinaryJsonObject(
+            {{"status", statuses[i % 3]}},
+            {{"count", static_cast<Int64>(i)}}));
+    }
+    auto col = createJsonColumn(jsons);
+    const auto & col_string = assert_cast<const ColumnString &>(*col);
+
+    JsonShredder shredder(config);
+    auto shredded = shredder.shred(col_string);
+
+    ASSERT_GT(shredded.numSubColumns(), 0u);
+    EXPECT_EQ(shredded.numRows(), 100u);
+
+    // Write sidecar (should dictionary-encode "status" since cardinality=3)
+    String test_dir = "/tmp/test_dict_sidecar_" + std::to_string(::getpid());
+    Poco::File(test_dir).createDirectories();
+
+    JsonShreddedStore::writeSidecar(test_dir, "payload", shredded);
+
+    // Read it back
+    auto read_result = JsonShreddedStore::readSidecar(test_dir, "payload");
+    ASSERT_TRUE(read_result.has_value());
+    EXPECT_EQ(read_result->schema.total_rows, 100u);
+    EXPECT_EQ(read_result->numSubColumns(), shredded.numSubColumns());
+
+    // Verify "status" sub-column data is correct after decode
+    auto status_col = JsonSubColumnReader::readPath(*read_result, "status");
+    ASSERT_NE(status_col, nullptr);
+    EXPECT_EQ(status_col->size(), 100u);
+
+    // Verify "count" sub-column (Int64, not dictionary-encoded)
+    auto count_col = JsonSubColumnReader::readPath(*read_result, "count");
+    ASSERT_NE(count_col, nullptr);
+    EXPECT_EQ(count_col->size(), 100u);
+
+    // Verify actual values
+    const auto & status_nullable = assert_cast<const ColumnNullable &>(*status_col);
+    for (int i = 0; i < 100; ++i)
+    {
+        ASSERT_FALSE(status_nullable.isNullAt(i));
+        String val = status_nullable.getNestedColumn().getDataAt(i).toString();
+        EXPECT_EQ(val, statuses[i % 3]) << "Mismatch at row " << i;
+    }
+
+    // Cleanup
+    Poco::File(test_dir).remove(true);
+}
+
+TEST(JsonShreddingSidecarTest, HighCardinalityNotDictionaryEncoded)
+{
+    // String sub-columns with cardinality > 4096 should NOT be dictionary-encoded
+    JsonShreddingConfig config;
+    config.min_rows_for_inference = 1;
+    config.max_children_per_node = 64;
+
+    // Build 5000 rows with unique "id" values (cardinality = 5000 > 4096)
+    std::vector<String> jsons;
+    for (int i = 0; i < 5000; ++i)
+    {
+        jsons.push_back(buildBinaryJsonObject(
+            {{"id", fmt::format("unique_id_{}", i)}},
+            {}));
+    }
+    auto col = createJsonColumn(jsons);
+    const auto & col_string = assert_cast<const ColumnString &>(*col);
+
+    JsonShredder shredder(config);
+    auto shredded = shredder.shred(col_string);
+
+    // Write and read back
+    String test_dir = "/tmp/test_highcard_sidecar_" + std::to_string(::getpid());
+    Poco::File(test_dir).createDirectories();
+
+    JsonShreddedStore::writeSidecar(test_dir, "payload", shredded);
+
+    auto read_result = JsonShreddedStore::readSidecar(test_dir, "payload");
+    ASSERT_TRUE(read_result.has_value());
+    EXPECT_EQ(read_result->schema.total_rows, 5000u);
+
+    // Verify data integrity (round-trip correctness even without encoding)
+    auto id_col = JsonSubColumnReader::readPath(*read_result, "id");
+    ASSERT_NE(id_col, nullptr);
+    EXPECT_EQ(id_col->size(), 5000u);
+
+    const auto & id_nullable = assert_cast<const ColumnNullable &>(*id_col);
+    for (int i = 0; i < 5000; ++i)
+    {
+        ASSERT_FALSE(id_nullable.isNullAt(i));
+        String val = id_nullable.getNestedColumn().getDataAt(i).toString();
+        EXPECT_EQ(val, fmt::format("unique_id_{}", i));
+    }
+
+    // Cleanup
+    Poco::File(test_dir).remove(true);
+}
+
+TEST(JsonShreddingSidecarTest, DictionaryEncodingDiskSizeSavings)
+{
+    // Verify that dictionary encoding reduces sidecar file size for low-cardinality columns
+    JsonShreddingConfig config;
+    config.min_rows_for_inference = 1;
+    config.max_children_per_node = 64;
+
+    // Build 10000 rows with 5 distinct long status strings
+    std::vector<String> jsons;
+    const std::vector<String> statuses = {
+        "processing_payment_gateway",
+        "awaiting_customer_response",
+        "shipped_via_express_delivery",
+        "returned_damaged_in_transit",
+        "completed_with_satisfaction"};
+    for (int i = 0; i < 10000; ++i)
+    {
+        jsons.push_back(buildBinaryJsonObject(
+            {{"long_status", statuses[i % 5]}},
+            {}));
+    }
+    auto col = createJsonColumn(jsons);
+    const auto & col_string = assert_cast<const ColumnString &>(*col);
+
+    JsonShredder shredder(config);
+    auto shredded = shredder.shred(col_string);
+
+    String test_dir = "/tmp/test_dictsize_sidecar_" + std::to_string(::getpid());
+    Poco::File(test_dir).createDirectories();
+
+    JsonShreddedStore::writeSidecar(test_dir, "payload", shredded);
+
+    // Check file size: dictionary-encoded should be much smaller than raw
+    // Raw: 10000 * ~27 chars avg = ~270KB for offsets+chars
+    // Dict: 5 entries * ~27 chars + 10000 * 4 bytes (IDs) = ~40KB
+    String col_file = test_dir + "/.json_shredded/payload/long_status.bin";
+    ASSERT_TRUE(Poco::File(col_file).exists());
+    auto file_size = Poco::File(col_file).getSize();
+
+    // Dictionary-encoded: should be well under 100KB
+    // (5 dict entries ~150 bytes + 10000 IDs * 4 bytes = ~40KB + null bitmap + header)
+    EXPECT_LT(file_size, 100000u) << "File too large — dictionary encoding may not be applied";
+
+    // Verify data round-trips correctly
+    auto read_result = JsonShreddedStore::readSidecar(test_dir, "payload");
+    ASSERT_TRUE(read_result.has_value());
+    auto status_col = JsonSubColumnReader::readPath(*read_result, "long_status");
+    ASSERT_NE(status_col, nullptr);
+    EXPECT_EQ(status_col->size(), 10000u);
+
+    const auto & nullable = assert_cast<const ColumnNullable &>(*status_col);
+    for (int i = 0; i < 10; ++i) // spot check first 10
+    {
+        String val = nullable.getNestedColumn().getDataAt(i).toString();
+        EXPECT_EQ(val, statuses[i % 5]);
+    }
+
+    Poco::File(test_dir).remove(true);
 }
 
 // ============================================================================

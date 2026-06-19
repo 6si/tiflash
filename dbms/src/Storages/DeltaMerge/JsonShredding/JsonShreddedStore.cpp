@@ -22,13 +22,27 @@
 #include <Poco/Path.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonShreddedStore.h>
 
+#include <unordered_map>
+
 namespace DB::DM
 {
 
 namespace
 {
 constexpr UInt32 SIDECAR_MAGIC = 0x4A534852; // "JSHR"
-constexpr UInt32 SIDECAR_VERSION = 1;
+constexpr UInt32 SIDECAR_VERSION = 2; // v2: supports dictionary encoding for string sub-columns
+constexpr UInt32 SIDECAR_VERSION_V1 = 1; // v1: raw columns only (still readable)
+
+/// Encoding type stored per sub-column in manifest
+enum class SubColumnEncoding : UInt8
+{
+    Raw = 0,
+    Dictionary = 1,
+};
+
+/// Configuration for dictionary encoding of shredded sub-columns
+constexpr size_t DICT_ENCODING_MAX_CARDINALITY = 4096;
+constexpr size_t DICT_ENCODING_MIN_ROWS = 64;
 
 String sanitizePath(const String & path)
 {
@@ -65,7 +79,44 @@ void JsonShreddedStore::writeSidecar(
     String dir = sidecarPath(dmfile_path, col_name);
     Poco::File(dir).createDirectories();
 
-    // Write manifest: magic, version, num_rows, num_sub_columns, schema
+    // Determine encoding for each sub-column
+    std::vector<SubColumnEncoding> encodings(data.sub_columns.size(), SubColumnEncoding::Raw);
+    size_t dict_encoded_count = 0;
+
+    for (size_t i = 0; i < data.sub_columns.size(); ++i)
+    {
+        const auto & sub_col = data.sub_columns[i];
+        // Dictionary encode string-typed sub-columns with low cardinality
+        if ((sub_col.type == JsonLeafType::String || sub_col.type == JsonLeafType::Mixed)
+            && sub_col.rows() >= DICT_ENCODING_MIN_ROWS)
+        {
+            const auto & nullable = assert_cast<const ColumnNullable &>(*sub_col.data);
+            const auto & nested = assert_cast<const ColumnString &>(nullable.getNestedColumn());
+            // Quick cardinality check using hash set
+            std::unordered_map<StringRef, UInt32> value_to_id;
+            bool suitable = true;
+            for (size_t row = 0; row < nested.size(); ++row)
+            {
+                auto ref = nested.getDataAt(row);
+                if (value_to_id.find(ref) == value_to_id.end())
+                {
+                    if (value_to_id.size() >= DICT_ENCODING_MAX_CARDINALITY)
+                    {
+                        suitable = false;
+                        break;
+                    }
+                    value_to_id[ref] = static_cast<UInt32>(value_to_id.size());
+                }
+            }
+            if (suitable && !value_to_id.empty())
+            {
+                encodings[i] = SubColumnEncoding::Dictionary;
+                ++dict_encoded_count;
+            }
+        }
+    }
+
+    // Write manifest: magic, version, num_rows, num_sub_columns, schema + encoding
     {
         String manifest_path = dir + "/manifest.bin";
         WriteBufferFromFile buf(manifest_path);
@@ -74,19 +125,22 @@ void JsonShreddedStore::writeSidecar(
         writeBinary(static_cast<UInt64>(data.numRows()), buf);
         writeBinary(static_cast<UInt32>(data.sub_columns.size()), buf);
 
-        // Write schema entries
-        for (const auto & sub_col : data.sub_columns)
+        // Write schema entries (v2: includes encoding type)
+        for (size_t i = 0; i < data.sub_columns.size(); ++i)
         {
+            const auto & sub_col = data.sub_columns[i];
             writeBinary(sub_col.path, buf);
             writeBinary(static_cast<UInt8>(sub_col.type), buf);
             writeBinary(static_cast<UInt8>(sub_col.is_array ? 1 : 0), buf);
+            writeBinary(static_cast<UInt8>(encodings[i]), buf);
         }
         buf.sync();
     }
 
     // Write each sub-column's data
-    for (const auto & sub_col : data.sub_columns)
+    for (size_t i = 0; i < data.sub_columns.size(); ++i)
     {
+        const auto & sub_col = data.sub_columns[i];
         String safe_path = sanitizePath(sub_col.path);
         String col_file = dir + "/" + safe_path + ".bin";
         WriteBufferFromFile buf(col_file);
@@ -99,54 +153,99 @@ void JsonShreddedStore::writeSidecar(
         writeBinary(static_cast<UInt64>(num_rows), buf);
         buf.write(reinterpret_cast<const char *>(null_map.data()), num_rows);
 
-        // Write data based on type
+        // Write data based on type + encoding
         const auto & nested = nullable.getNestedColumn();
-        switch (sub_col.type)
+
+        if (encodings[i] == SubColumnEncoding::Dictionary)
         {
-        case JsonLeafType::Int64:
-        {
-            const auto & typed = assert_cast<const ColumnInt64 &>(nested);
-            buf.write(reinterpret_cast<const char *>(typed.getData().data()), num_rows * sizeof(Int64));
-            break;
-        }
-        case JsonLeafType::UInt64:
-        {
-            const auto & typed = assert_cast<const ColumnUInt64 &>(nested);
-            buf.write(reinterpret_cast<const char *>(typed.getData().data()), num_rows * sizeof(UInt64));
-            break;
-        }
-        case JsonLeafType::Float64:
-        {
-            const auto & typed = assert_cast<const ColumnFloat64 &>(nested);
-            buf.write(reinterpret_cast<const char *>(typed.getData().data()), num_rows * sizeof(Float64));
-            break;
-        }
-        case JsonLeafType::Bool:
-        {
-            const auto & typed = assert_cast<const ColumnUInt8 &>(nested);
-            buf.write(reinterpret_cast<const char *>(typed.getData().data()), num_rows * sizeof(UInt8));
-            break;
-        }
-        case JsonLeafType::String:
-        case JsonLeafType::Mixed:
-        case JsonLeafType::Null:
-        {
+            // Dictionary-encoded string column: write dictionary + IDs
             const auto & typed = assert_cast<const ColumnString &>(nested);
-            // Write offsets then chars
-            const auto & offsets = typed.getOffsets();
-            const auto & chars = typed.getChars();
-            writeBinary(static_cast<UInt64>(offsets.size()), buf);
-            buf.write(reinterpret_cast<const char *>(offsets.data()), offsets.size() * sizeof(ColumnString::Offset));
-            writeBinary(static_cast<UInt64>(chars.size()), buf);
-            buf.write(reinterpret_cast<const char *>(chars.data()), chars.size());
-            break;
+            std::unordered_map<StringRef, UInt32> value_to_id;
+            std::vector<String> dictionary;
+            PaddedPODArray<UInt32> ids;
+            ids.reserve(num_rows);
+
+            for (size_t row = 0; row < num_rows; ++row)
+            {
+                auto ref = typed.getDataAt(row);
+                auto it = value_to_id.find(ref);
+                if (it == value_to_id.end())
+                {
+                    UInt32 id = static_cast<UInt32>(dictionary.size());
+                    value_to_id[ref] = id;
+                    dictionary.push_back(ref.toString());
+                    ids.push_back(id);
+                }
+                else
+                {
+                    ids.push_back(it->second);
+                }
+            }
+
+            // Write: cardinality, dictionary entries, then IDs
+            writeBinary(static_cast<UInt32>(dictionary.size()), buf);
+            for (const auto & entry : dictionary)
+                writeBinary(entry, buf);
+            // IDs as UInt32 array
+            buf.write(reinterpret_cast<const char *>(ids.data()), num_rows * sizeof(UInt32));
         }
+        else
+        {
+            // Raw encoding (unchanged from v1)
+            switch (sub_col.type)
+            {
+            case JsonLeafType::Int64:
+            {
+                const auto & typed = assert_cast<const ColumnInt64 &>(nested);
+                buf.write(reinterpret_cast<const char *>(typed.getData().data()), num_rows * sizeof(Int64));
+                break;
+            }
+            case JsonLeafType::UInt64:
+            {
+                const auto & typed = assert_cast<const ColumnUInt64 &>(nested);
+                buf.write(reinterpret_cast<const char *>(typed.getData().data()), num_rows * sizeof(UInt64));
+                break;
+            }
+            case JsonLeafType::Float64:
+            {
+                const auto & typed = assert_cast<const ColumnFloat64 &>(nested);
+                buf.write(reinterpret_cast<const char *>(typed.getData().data()), num_rows * sizeof(Float64));
+                break;
+            }
+            case JsonLeafType::Bool:
+            {
+                const auto & typed = assert_cast<const ColumnUInt8 &>(nested);
+                buf.write(reinterpret_cast<const char *>(typed.getData().data()), num_rows * sizeof(UInt8));
+                break;
+            }
+            case JsonLeafType::String:
+            case JsonLeafType::Mixed:
+            case JsonLeafType::Null:
+            {
+                const auto & typed = assert_cast<const ColumnString &>(nested);
+                const auto & offsets = typed.getOffsets();
+                const auto & chars = typed.getChars();
+                writeBinary(static_cast<UInt64>(offsets.size()), buf);
+                buf.write(
+                    reinterpret_cast<const char *>(offsets.data()),
+                    offsets.size() * sizeof(ColumnString::Offset));
+                writeBinary(static_cast<UInt64>(chars.size()), buf);
+                buf.write(reinterpret_cast<const char *>(chars.data()), chars.size());
+                break;
+            }
+            }
         }
         buf.sync();
     }
 
-    LOG_INFO(log(), "Wrote JSON shredding sidecar: dmfile={} col={} rows={} sub_columns={}",
-        dmfile_path, col_name, data.numRows(), data.sub_columns.size());
+    LOG_INFO(
+        log(),
+        "Wrote JSON shredding sidecar: dmfile={} col={} rows={} sub_columns={} dict_encoded={}",
+        dmfile_path,
+        col_name,
+        data.numRows(),
+        data.sub_columns.size(),
+        dict_encoded_count);
 }
 
 std::optional<ShreddedJsonData> JsonShreddedStore::readSidecar(
@@ -167,24 +266,45 @@ std::optional<ShreddedJsonData> JsonShreddedStore::readSidecar(
 
     readBinary(magic, manifest_buf);
     readBinary(version, manifest_buf);
-    if (magic != SIDECAR_MAGIC || version != SIDECAR_VERSION)
+    if (magic != SIDECAR_MAGIC || (version != SIDECAR_VERSION && version != SIDECAR_VERSION_V1))
         return std::nullopt;
 
     readBinary(num_rows, manifest_buf);
     readBinary(num_sub_columns, manifest_buf);
 
     // Read schema
-    std::vector<std::pair<String, JsonLeafType>> schema_entries;
-    std::vector<bool> is_array_entries;
-    for (UInt32 i = 0; i < num_sub_columns; ++i)
+    struct SchemaEntry
     {
         String path;
+        JsonLeafType type;
+        bool is_array;
+        SubColumnEncoding encoding;
+    };
+    std::vector<SchemaEntry> schema_entries;
+    schema_entries.reserve(num_sub_columns);
+
+    for (UInt32 i = 0; i < num_sub_columns; ++i)
+    {
+        SchemaEntry entry;
         UInt8 type_val, is_arr;
-        readBinary(path, manifest_buf);
+        readBinary(entry.path, manifest_buf);
         readBinary(type_val, manifest_buf);
         readBinary(is_arr, manifest_buf);
-        schema_entries.emplace_back(path, static_cast<JsonLeafType>(type_val));
-        is_array_entries.push_back(is_arr != 0);
+        entry.type = static_cast<JsonLeafType>(type_val);
+        entry.is_array = (is_arr != 0);
+
+        // v2 has encoding byte; v1 defaults to Raw
+        if (version >= SIDECAR_VERSION)
+        {
+            UInt8 enc;
+            readBinary(enc, manifest_buf);
+            entry.encoding = static_cast<SubColumnEncoding>(enc);
+        }
+        else
+        {
+            entry.encoding = SubColumnEncoding::Raw;
+        }
+        schema_entries.push_back(std::move(entry));
     }
 
     // Read sub-column data
@@ -194,8 +314,8 @@ std::optional<ShreddedJsonData> JsonShreddedStore::readSidecar(
 
     for (UInt32 col_idx = 0; col_idx < num_sub_columns; ++col_idx)
     {
-        const auto & [path, type] = schema_entries[col_idx];
-        String safe_path = sanitizePath(path);
+        const auto & entry = schema_entries[col_idx];
+        String safe_path = sanitizePath(entry.path);
         String col_file = dir + "/" + safe_path + ".bin";
 
         if (!Poco::File(col_file).exists())
@@ -214,53 +334,81 @@ std::optional<ShreddedJsonData> JsonShreddedStore::readSidecar(
 
         // Read data
         MutableColumnPtr inner;
-        switch (type)
+
+        if (entry.encoding == SubColumnEncoding::Dictionary)
         {
-        case JsonLeafType::Int64:
-        {
-            auto col = ColumnInt64::create(num_rows);
-            col_buf.readStrict(reinterpret_cast<char *>(col->getData().data()), num_rows * sizeof(Int64));
-            inner = std::move(col);
-            break;
-        }
-        case JsonLeafType::UInt64:
-        {
-            auto col = ColumnUInt64::create(num_rows);
-            col_buf.readStrict(reinterpret_cast<char *>(col->getData().data()), num_rows * sizeof(UInt64));
-            inner = std::move(col);
-            break;
-        }
-        case JsonLeafType::Float64:
-        {
-            auto col = ColumnFloat64::create(num_rows);
-            col_buf.readStrict(reinterpret_cast<char *>(col->getData().data()), num_rows * sizeof(Float64));
-            inner = std::move(col);
-            break;
-        }
-        case JsonLeafType::Bool:
-        {
-            auto col = ColumnUInt8::create(num_rows);
-            col_buf.readStrict(reinterpret_cast<char *>(col->getData().data()), num_rows * sizeof(UInt8));
-            inner = std::move(col);
-            break;
-        }
-        case JsonLeafType::String:
-        case JsonLeafType::Mixed:
-        case JsonLeafType::Null:
-        {
-            UInt64 num_offsets, num_chars;
-            readBinary(num_offsets, col_buf);
+            // Dictionary-encoded: read dictionary + IDs, reconstruct ColumnString
+            UInt32 cardinality;
+            readBinary(cardinality, col_buf);
+            std::vector<String> dictionary(cardinality);
+            for (UInt32 d = 0; d < cardinality; ++d)
+                readBinary(dictionary[d], col_buf);
+
+            // Read IDs
+            PaddedPODArray<UInt32> ids(num_rows);
+            col_buf.readStrict(reinterpret_cast<char *>(ids.data()), num_rows * sizeof(UInt32));
+
+            // Reconstruct ColumnString from dictionary + IDs
             auto col = ColumnString::create();
-            col->getOffsets().resize(num_offsets);
-            col_buf.readStrict(
-                reinterpret_cast<char *>(col->getOffsets().data()),
-                num_offsets * sizeof(ColumnString::Offset));
-            readBinary(num_chars, col_buf);
-            col->getChars().resize(num_chars);
-            col_buf.readStrict(reinterpret_cast<char *>(col->getChars().data()), num_chars);
+            col->reserve(num_rows);
+            for (size_t row = 0; row < num_rows; ++row)
+            {
+                const auto & val = dictionary[ids[row]];
+                col->insertData(val.data(), val.size());
+            }
             inner = std::move(col);
-            break;
         }
+        else
+        {
+            // Raw encoding
+            switch (entry.type)
+            {
+            case JsonLeafType::Int64:
+            {
+                auto col = ColumnInt64::create(num_rows);
+                col_buf.readStrict(reinterpret_cast<char *>(col->getData().data()), num_rows * sizeof(Int64));
+                inner = std::move(col);
+                break;
+            }
+            case JsonLeafType::UInt64:
+            {
+                auto col = ColumnUInt64::create(num_rows);
+                col_buf.readStrict(reinterpret_cast<char *>(col->getData().data()), num_rows * sizeof(UInt64));
+                inner = std::move(col);
+                break;
+            }
+            case JsonLeafType::Float64:
+            {
+                auto col = ColumnFloat64::create(num_rows);
+                col_buf.readStrict(reinterpret_cast<char *>(col->getData().data()), num_rows * sizeof(Float64));
+                inner = std::move(col);
+                break;
+            }
+            case JsonLeafType::Bool:
+            {
+                auto col = ColumnUInt8::create(num_rows);
+                col_buf.readStrict(reinterpret_cast<char *>(col->getData().data()), num_rows * sizeof(UInt8));
+                inner = std::move(col);
+                break;
+            }
+            case JsonLeafType::String:
+            case JsonLeafType::Mixed:
+            case JsonLeafType::Null:
+            {
+                UInt64 num_offsets, num_chars;
+                readBinary(num_offsets, col_buf);
+                auto col = ColumnString::create();
+                col->getOffsets().resize(num_offsets);
+                col_buf.readStrict(
+                    reinterpret_cast<char *>(col->getOffsets().data()),
+                    num_offsets * sizeof(ColumnString::Offset));
+                readBinary(num_chars, col_buf);
+                col->getChars().resize(num_chars);
+                col_buf.readStrict(reinterpret_cast<char *>(col->getChars().data()), num_chars);
+                inner = std::move(col);
+                break;
+            }
+            }
         }
 
         auto null_map_col = ColumnUInt8::create();
@@ -268,17 +416,23 @@ std::optional<ShreddedJsonData> JsonShreddedStore::readSidecar(
         auto nullable_col = ColumnNullable::create(std::move(inner), std::move(null_map_col));
 
         JsonSubColumn sub_col;
-        sub_col.path = path;
-        sub_col.type = type;
-        sub_col.is_array = is_array_entries[col_idx];
+        sub_col.path = entry.path;
+        sub_col.type = entry.type;
+        sub_col.is_array = entry.is_array;
         sub_col.data = std::move(nullable_col);
         result.sub_columns.push_back(std::move(sub_col));
 
-        result.schema.columns.push_back(JsonShreddedColumn{path, type, num_rows, is_array_entries[col_idx]});
+        result.schema.columns.push_back(JsonShreddedColumn{entry.path, entry.type, num_rows, entry.is_array});
     }
 
-    LOG_INFO(log(), "Read JSON shredding sidecar: dmfile={} col={} rows={} sub_columns={}",
-        dmfile_path, col_name, num_rows, num_sub_columns);
+    LOG_INFO(
+        log(),
+        "Read JSON shredding sidecar: dmfile={} col={} rows={} sub_columns={} version={}",
+        dmfile_path,
+        col_name,
+        num_rows,
+        num_sub_columns,
+        version);
 
     return result;
 }
