@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <Columns/ColumnDictionary.h>
 #include <Common/Exception.h>
 #include <Common/assert_cast.h>
+#include <DataTypes/DataTypeString.h>
 #include <IO/Buffer/ReadBufferFromFile.h>
 #include <IO/Buffer/WriteBufferFromFile.h>
 #include <IO/ReadHelpers.h>
@@ -337,26 +339,28 @@ std::optional<ShreddedJsonData> JsonShreddedStore::readSidecar(
 
         if (entry.encoding == SubColumnEncoding::Dictionary)
         {
-            // Dictionary-encoded: read dictionary + IDs, reconstruct ColumnString
+            // Dictionary-encoded: read dictionary + IDs, keep as ColumnDictionary
+            // so downstream operators (GROUP BY, filter) can work on IDs directly.
             UInt32 cardinality;
             readBinary(cardinality, col_buf);
-            std::vector<String> dictionary(cardinality);
+            std::vector<String> dictionary_strings(cardinality);
             for (UInt32 d = 0; d < cardinality; ++d)
-                readBinary(dictionary[d], col_buf);
+                readBinary(dictionary_strings[d], col_buf);
 
             // Read IDs
             PaddedPODArray<UInt32> ids(num_rows);
             col_buf.readStrict(reinterpret_cast<char *>(ids.data()), num_rows * sizeof(UInt32));
 
-            // Reconstruct ColumnString from dictionary + IDs
-            auto col = ColumnString::create();
-            col->reserve(num_rows);
-            for (size_t row = 0; row < num_rows; ++row)
-            {
-                const auto & val = dictionary[ids[row]];
-                col->insertData(val.data(), val.size());
-            }
-            inner = std::move(col);
+            // Create ColumnDictionary (keeps data encoded for downstream operations)
+            std::vector<Field> dict_fields;
+            dict_fields.reserve(cardinality);
+            for (const auto & s : dictionary_strings)
+                dict_fields.emplace_back(s);
+
+            inner = ColumnDictionary::createMutable(
+                std::move(dict_fields),
+                std::move(ids),
+                std::make_shared<DataTypeString>());
         }
         else
         {

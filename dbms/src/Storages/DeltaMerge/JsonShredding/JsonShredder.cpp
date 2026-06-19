@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <Columns/ColumnDictionary.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnsNumber.h>
@@ -324,7 +325,23 @@ ColumnPtr JsonSubColumnReader::readPath(const ShreddedJsonData & data, const Str
     for (const auto & sub_col : data.sub_columns)
     {
         if (sub_col.path == path)
-            return sub_col.data->getPtr();
+        {
+            auto col_ptr = sub_col.data->getPtr();
+            // If the nested column is dictionary-encoded, decode it for callers
+            // that expect a regular typed column (e.g., ColumnString).
+            const auto * nullable = typeid_cast<const ColumnNullable *>(col_ptr.get());
+            if (nullable)
+            {
+                const auto * dict_col = typeid_cast<const ColumnDictionary *>(&nullable->getNestedColumn());
+                if (dict_col)
+                {
+                    auto decoded = dict_col->decode();
+                    auto null_map = nullable->getNullMapColumnPtr();
+                    return ColumnNullable::create(decoded->assumeMutable(), null_map->assumeMutable());
+                }
+            }
+            return col_ptr;
+        }
     }
     return nullptr;
 }

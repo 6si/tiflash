@@ -78,6 +78,8 @@ public:
 
     const char * getFamilyName() const override { return "Dictionary"; }
 
+    bool canBeInsideNullable() const override { return true; }
+
     size_t size() const override { return ids.size(); }
 
     /// Access the raw dictionary ID array (for encoded operations)

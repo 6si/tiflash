@@ -13,6 +13,9 @@
 // limitations under the License.
 
 #include <Columns/ColumnDictionary.h>
+#include <Columns/ColumnNullable.h>
+#include <Columns/ColumnString.h>
+#include <Columns/ColumnsNumber.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <gtest/gtest.h>
@@ -257,6 +260,39 @@ TEST_F(ColumnDictionaryTest, NullDictEntryCloneResized)
     ASSERT_EQ(f.get<Int64>(), 99);
     resized->get(2, f);
     ASSERT_TRUE(f.isNull());
+}
+
+TEST_F(ColumnDictionaryTest, CanBeInsideNullable)
+{
+    std::vector<Field> dict = {Field(String("active")), Field(String("inactive"))};
+    PaddedPODArray<UInt32> ids = {0, 1, 0};
+    auto type = std::make_shared<DataTypeString>();
+
+    auto col = ColumnDictionary::createMutable(std::move(dict), std::move(ids), type);
+    ASSERT_TRUE(col->canBeInsideNullable());
+
+    // Wrap in ColumnNullable — this should not throw
+    auto null_map = ColumnUInt8::create(3, 0);
+    null_map->getData()[1] = 1; // second row is NULL
+    auto nullable = ColumnNullable::create(std::move(col), std::move(null_map));
+
+    ASSERT_EQ(nullable->size(), 3u);
+    ASSERT_FALSE(nullable->isNullAt(0));
+    ASSERT_TRUE(nullable->isNullAt(1));
+    ASSERT_FALSE(nullable->isNullAt(2));
+
+    // Decode the nested ColumnDictionary
+    const auto * dict_col = typeid_cast<const ColumnDictionary *>(&nullable->getNestedColumn());
+    ASSERT_NE(dict_col, nullptr);
+    auto decoded = dict_col->decode();
+    ASSERT_EQ(decoded->size(), 3u);
+
+    // Verify decoded values
+    const auto * str_col = typeid_cast<const ColumnString *>(decoded.get());
+    ASSERT_NE(str_col, nullptr);
+    EXPECT_EQ(str_col->getDataAt(0).toString(), "active");
+    EXPECT_EQ(str_col->getDataAt(1).toString(), "inactive");
+    EXPECT_EQ(str_col->getDataAt(2).toString(), "active");
 }
 
 } // namespace DB::tests

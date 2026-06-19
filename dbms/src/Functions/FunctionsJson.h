@@ -15,6 +15,7 @@
 #pragma once
 
 #include <Columns/ColumnConst.h>
+#include <Columns/ColumnDictionary.h>
 #include <Columns/ColumnFixedString.h>
 #include <Columns/ColumnString.h>
 #include <Columns/countBytesInFilter.h>
@@ -312,6 +313,15 @@ private:
             {
                 Float64 val = float_col->getData()[row];
                 JsonBinary::appendNumber(write_buffer, val);
+            }
+            else if (const auto * dict_col = typeid_cast<const ColumnDictionary *>(&nested))
+            {
+                // Dictionary-encoded string: look up the value by ID
+                const auto & dict = dict_col->getDictionary();
+                const auto & ids = dict_col->getDictionaryIds();
+                const auto & field = dict[ids[row]];
+                auto val = field.get<String>();
+                JsonBinary::appendStringRef(write_buffer, StringRef(val));
             }
             else
             {
