@@ -620,8 +620,8 @@ TEST_F(JsonSchemaEvolutionTest, BackwardCompat_NoSubColumns)
 
 TEST(JsonShreddingFlagTest, DefaultState)
 {
-    // Default: read uses blob (flag OFF), write always shreds
-    EXPECT_FALSE(JsonShreddingFlag::instance().useShredded());
+    // Default: both read and write shredding are ON
+    EXPECT_TRUE(JsonShreddingFlag::instance().useShredded());
     EXPECT_TRUE(JsonShreddingFlag::instance().writeShredded());
 }
 
