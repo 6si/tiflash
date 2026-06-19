@@ -381,7 +381,7 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
             const ShreddedJsonData * cached = JsonShreddedStore::getCached(dmfile_path, cd.name);
             if (cached)
             {
-                shred_ctx.setForCurrentBlock(cd.name, *cached, start_row_offset, read_rows);
+                shred_ctx.setForCurrentBlock(cd.name, cd.id, *cached, start_row_offset, read_rows);
                 // Diagnostic: log the first time we load shredded context
                 static std::atomic<int> reader_log_count{0};
                 if (reader_log_count.fetch_add(1) < 3)
@@ -409,7 +409,7 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
                     const ShreddedJsonData * newly_cached = JsonShreddedStore::getCached(dmfile_path, cd.name);
                     if (newly_cached)
                     {
-                        shred_ctx.setForCurrentBlock(cd.name, *newly_cached, start_row_offset, read_rows);
+                        shred_ctx.setForCurrentBlock(cd.name, cd.id, *newly_cached, start_row_offset, read_rows);
                         static std::atomic<int> reader_log_count2{0};
                         if (reader_log_count2.fetch_add(1) < 3)
                         {

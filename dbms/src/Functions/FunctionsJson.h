@@ -160,10 +160,15 @@ public:
                     if (dot_path.size() > 2 && dot_path[0] == '$' && dot_path[1] == '.')
                         dot_path = dot_path.substr(2);
 
-                    // Try thread-local context first (fastest: pre-computed sub-column)
-                    const auto & json_col_name = block.getByPosition(arguments[0]).name;
+                    // Try thread-local context first (fastest: pre-computed sub-column).
+                    // Use column_id for lookup since column names are renamed by the
+                    // table scan projection (e.g., "payload" → "table_scan_3") but
+                    // column_id is preserved through renames.
+                    const auto & json_col_ref = block.getByPosition(arguments[0]);
+                    const auto & json_col_name = json_col_ref.name;
+                    const auto json_col_id = json_col_ref.column_id;
                     auto & shred_ctx = DM::JsonShreddedBlockContext::instance();
-                    ColumnPtr sub_col = shred_ctx.getSubColumn(json_col_name, dot_path);
+                    ColumnPtr sub_col = shred_ctx.getSubColumn(json_col_name, json_col_id, dot_path);
 
                     // Diagnostic: log the first attempt to help debug name/path mismatches
                     static std::atomic<int> shred_log_count{0};
@@ -172,13 +177,14 @@ public:
                         static auto diag_log = Logger::get("JsonShredDiag");
                         LOG_INFO(
                             diag_log,
-                            "json_shred_read: col_name='{}' path='{}' dot_path='{}' sub_col={} "
-                            "ctx_has_col={} rows={}",
+                            "json_shred_read: col_name='{}' col_id={} path='{}' dot_path='{}' "
+                            "sub_col={} ctx_has_col={} rows={}",
                             json_col_name,
+                            json_col_id,
                             path_str,
                             dot_path,
                             sub_col ? fmt::format("size={}", sub_col->size()) : "null",
-                            shred_ctx.hasShredded(json_col_name),
+                            shred_ctx.hasShredded(json_col_name, json_col_id),
                             rows);
                     }
 

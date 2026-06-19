@@ -49,42 +49,82 @@ public:
 
     /// Set the shredded data for the current block being processed.
     /// col_name: the logical column name (e.g., "payload")
+    /// col_id: the column ID (stable across rename/projection)
     /// data: the shredded sub-columns for the ENTIRE DMFile
     /// row_offset: starting row within the DMFile for this pack batch
     /// row_count: number of rows in this pack batch
-    void setForCurrentBlock(const String & col_name, const ShreddedJsonData & data, size_t row_offset, size_t row_count)
+    void setForCurrentBlock(
+        const String & col_name,
+        Int64 col_id,
+        const ShreddedJsonData & data,
+        size_t row_offset,
+        size_t row_count)
     {
-        current_data_[col_name] = BlockShreddedRef{&data, row_offset, row_count};
+        BlockShreddedRef ref{&data, row_offset, row_count};
+        current_data_[col_name] = ref;
+        if (col_id != 0)
+            current_data_by_id_[col_id] = ref;
     }
 
     /// Get a specific sub-column for a path from the current block's shredded data.
+    /// Looks up by column_id first (survives column rename in projection), then by name.
     /// Returns a column sliced to the current pack's row range.
     /// Returns nullptr if not available or if the path doesn't exist in the sidecar.
-    ColumnPtr getSubColumn(const String & col_name, const String & path) const
+    ColumnPtr getSubColumn(const String & col_name, Int64 col_id, const String & path) const
     {
-        auto it = current_data_.find(col_name);
-        if (it == current_data_.end() || it->second.data == nullptr)
+        const BlockShreddedRef * ref_ptr = nullptr;
+        // Try column_id first (stable across rename/projection)
+        if (col_id != 0)
+        {
+            auto it = current_data_by_id_.find(col_id);
+            if (it != current_data_by_id_.end() && it->second.data != nullptr)
+                ref_ptr = &it->second;
+        }
+        // Fall back to name lookup
+        if (!ref_ptr)
+        {
+            auto it = current_data_.find(col_name);
+            if (it != current_data_.end() && it->second.data != nullptr)
+                ref_ptr = &it->second;
+        }
+        if (!ref_ptr)
             return nullptr;
-        auto full_col = JsonSubColumnReader::readPath(*it->second.data, path);
+
+        auto full_col = JsonSubColumnReader::readPath(*ref_ptr->data, path);
         if (!full_col)
             return nullptr;
-        const auto & ref = it->second;
-        if (full_col->size() == ref.row_count)
+        if (full_col->size() == ref_ptr->row_count)
             return full_col;
-        if (full_col->size() < ref.row_offset + ref.row_count)
+        if (full_col->size() < ref_ptr->row_offset + ref_ptr->row_count)
             return nullptr;
-        return full_col->cut(ref.row_offset, ref.row_count);
+        return full_col->cut(ref_ptr->row_offset, ref_ptr->row_count);
     }
 
-    /// Check if shredded data is available for a column.
-    bool hasShredded(const String & col_name) const
+    /// Backward-compatible overload (name-only, for unit tests).
+    ColumnPtr getSubColumn(const String & col_name, const String & path) const
     {
+        return getSubColumn(col_name, 0, path);
+    }
+
+    /// Check if shredded data is available for a column (by id or name).
+    bool hasShredded(const String & col_name, Int64 col_id = 0) const
+    {
+        if (col_id != 0)
+        {
+            auto it = current_data_by_id_.find(col_id);
+            if (it != current_data_by_id_.end() && it->second.data != nullptr)
+                return true;
+        }
         auto it = current_data_.find(col_name);
         return it != current_data_.end() && it->second.data != nullptr;
     }
 
     /// Clear the context after block processing.
-    void clear() { current_data_.clear(); }
+    void clear()
+    {
+        current_data_.clear();
+        current_data_by_id_.clear();
+    }
 
 private:
     JsonShreddedBlockContext() = default;
@@ -96,6 +136,7 @@ private:
         size_t row_count = 0;
     };
     std::unordered_map<String, BlockShreddedRef> current_data_;
+    std::unordered_map<Int64, BlockShreddedRef> current_data_by_id_;
 };
 
 /// Manages persistent storage of shredded JSON sub-columns alongside DMFiles.
