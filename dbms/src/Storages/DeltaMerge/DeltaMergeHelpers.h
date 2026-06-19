@@ -25,6 +25,7 @@
 #include <Storages/ColumnsDescription.h>
 #include <Storages/DeltaMerge/DeltaMergeDefines.h>
 
+#include <future>
 #include <utility>
 
 namespace DB
@@ -97,6 +98,71 @@ inline bool sortBlockByPk(const ColumnDefine & handle, Block & block, IColumn::P
         c.column = c.column->permute(perm, 0);
     }
     return true;
+}
+
+/// Threshold for parallel permutation: only parallelize columns whose byte size exceeds this.
+static constexpr size_t PARALLEL_PERMUTE_COLUMN_BYTES_THRESHOLD = 1 * 1024 * 1024; // 1 MB
+/// Minimum total "large column" bytes to justify spawning threads.
+static constexpr size_t PARALLEL_PERMUTE_TOTAL_BYTES_THRESHOLD = 4 * 1024 * 1024; // 4 MB
+
+/// Sort block by primary key with parallel column permutation.
+/// For blocks with large variable-length columns (e.g., JSON blobs), the column
+/// permutation step dominates sort time due to random-access memory copies.
+/// This function parallelizes the permutation of large columns across threads.
+inline void stableSortBlockParallel(Block & block, const SortDescription & description)
+{
+    if (!block)
+        return;
+
+    IColumn::Permutation perm;
+    stableGetPermutation(block, description, perm);
+
+    size_t columns = block.columns();
+
+    // Identify large columns that benefit from parallel permutation
+    std::vector<size_t> large_col_indices;
+    size_t total_large_bytes = 0;
+    for (size_t i = 0; i < columns; ++i)
+    {
+        size_t col_bytes = block.safeGetByPosition(i).column->byteSize();
+        if (col_bytes >= PARALLEL_PERMUTE_COLUMN_BYTES_THRESHOLD)
+        {
+            large_col_indices.push_back(i);
+            total_large_bytes += col_bytes;
+        }
+    }
+
+    // Only parallelize when there are 2+ large columns (single column doesn't benefit
+    // due to thread spawn overhead exceeding the parallel permutation savings).
+    if (large_col_indices.size() < 2 || total_large_bytes < PARALLEL_PERMUTE_TOTAL_BYTES_THRESHOLD)
+    {
+        for (size_t i = 0; i < columns; ++i)
+            block.safeGetByPosition(i).column = block.safeGetByPosition(i).column->permute(perm, 0);
+        return;
+    }
+
+    // Permute small columns sequentially (fast, < 1MB each)
+    for (size_t i = 0; i < columns; ++i)
+    {
+        size_t col_bytes = block.safeGetByPosition(i).column->byteSize();
+        if (col_bytes < PARALLEL_PERMUTE_COLUMN_BYTES_THRESHOLD)
+            block.safeGetByPosition(i).column = block.safeGetByPosition(i).column->permute(perm, 0);
+    }
+
+    // Permute large columns in parallel
+    std::vector<std::future<ColumnPtr>> futures;
+    futures.reserve(large_col_indices.size());
+    for (size_t idx : large_col_indices)
+    {
+        auto col = block.safeGetByPosition(idx).column;
+        futures.push_back(std::async(std::launch::async, [col, &perm]() { return col->permute(perm, 0); }));
+    }
+
+    // Collect results
+    for (size_t i = 0; i < large_col_indices.size(); ++i)
+    {
+        block.safeGetByPosition(large_col_indices[i]).column = futures[i].get();
+    }
 }
 
 template <typename T>
