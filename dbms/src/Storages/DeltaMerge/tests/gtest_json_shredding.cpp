@@ -620,7 +620,9 @@ TEST_F(JsonSchemaEvolutionTest, BackwardCompat_NoSubColumns)
 
 TEST(JsonShreddingFlagTest, DefaultState)
 {
-    // Default: both read and write shredding are ON
+    // Ensure defaults are restored (singleton may have been modified by prior tests)
+    JsonShreddingFlag::instance().setUseShredded(true);
+    JsonShreddingFlag::instance().setWriteShredded(true);
     EXPECT_TRUE(JsonShreddingFlag::instance().useShredded());
     EXPECT_TRUE(JsonShreddingFlag::instance().writeShredded());
 }
@@ -632,6 +634,9 @@ TEST(JsonShreddingFlagTest, ToggleReadFlag)
 
     JsonShreddingFlag::instance().setUseShredded(false);
     EXPECT_FALSE(JsonShreddingFlag::instance().useShredded());
+
+    // Restore default
+    JsonShreddingFlag::instance().setUseShredded(true);
 }
 
 TEST(JsonShreddingFlagTest, ToggleWriteFlag)
@@ -641,6 +646,9 @@ TEST(JsonShreddingFlagTest, ToggleWriteFlag)
 
     JsonShreddingFlag::instance().setWriteShredded(true);
     EXPECT_TRUE(JsonShreddingFlag::instance().writeShredded());
+
+    // Restore default
+    JsonShreddingFlag::instance().setWriteShredded(true);
 }
 
 // ============================================================================
@@ -682,7 +690,9 @@ TEST(JsonShreddingPerformanceTest, DualWriteEnablesBothPaths)
     // Both should return equivalent data
     // (The actual values come from the same source, just different read paths)
 
-    JsonShreddingFlag::instance().setUseShredded(false); // Reset
+    // Restore defaults
+    JsonShreddingFlag::instance().setUseShredded(true);
+    JsonShreddingFlag::instance().setWriteShredded(true);
 }
 
 // ============================================================================

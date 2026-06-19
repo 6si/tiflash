@@ -134,25 +134,21 @@ public:
         if (DM::JsonShreddingFlag::instance().useShredded() && arguments.size() == 2)
         {
             const auto & path_col = block.getByPosition(arguments[1]).column;
-            if (path_col->isColumnConst())
+            const auto * const_path = typeid_cast<const ColumnConst *>(path_col.get());
+            if (const_path)
             {
                 // Extract the constant path string (e.g., "$.event")
                 String path_str;
-                if (path_col->isColumnNullable())
+                // ColumnConst may wrap ColumnNullable — check for null before getValue
+                const auto & inner = const_path->getDataColumn();
+                if (const auto * inner_nullable = typeid_cast<const ColumnNullable *>(&inner))
                 {
-                    const auto & nullable = static_cast<const ColumnNullable &>(*path_col);
-                    if (!nullable.isNullAt(0))
-                    {
-                        const auto & nested = nullable.getNestedColumn();
-                        if (const auto * const_col = typeid_cast<const ColumnConst *>(&nested))
-                            path_str = const_col->getValue<String>();
-                        else
-                            path_str = nested.getDataAt(0).toString();
-                    }
+                    if (!inner_nullable->isNullAt(0))
+                        path_str = inner_nullable->getNestedColumn().getDataAt(0).toString();
                 }
-                else if (const auto * const_col = typeid_cast<const ColumnConst *>(path_col.get()))
+                else
                 {
-                    path_str = const_col->getValue<String>();
+                    path_str = const_path->getValue<String>();
                 }
 
                 if (!path_str.empty())
@@ -178,27 +174,9 @@ public:
                         if (res_col)
                             return;
                     }
-
-                    // Fall back to optimized per-row extraction using JsonBinaryNavigator
-                    // (faster than full JsonBinary::extract because it skips path expression parsing)
-                    const IColumn * raw_json = json_column;
-                    const NullMap * json_null_map = nullptr;
-                    if (json_column->isColumnNullable())
-                    {
-                        const auto & nullable = static_cast<const ColumnNullable &>(*json_column);
-                        raw_json = &nullable.getNestedColumn();
-                        json_null_map = &nullable.getNullMapData();
-                    }
-                    const auto * json_str_col = typeid_cast<const ColumnString *>(raw_json);
-                    if (json_str_col)
-                    {
-                        auto result_col = doShreddedExtract(*json_str_col, json_null_map, dot_path, rows);
-                        if (result_col)
-                        {
-                            res_col = std::move(result_col);
-                            return;
-                        }
-                    }
+                    // No pre-computed sub-column available — fall through to standard extraction.
+                    // doShreddedExtract is NOT used as a fallback here because its null handling
+                    // differs from the standard path in edge cases (e.g., missing paths, null JSON).
                 }
             }
         }
