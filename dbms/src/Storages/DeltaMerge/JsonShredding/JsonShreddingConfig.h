@@ -27,11 +27,12 @@ namespace DB::DM
 ///   - WRITE path: Always shreds (dual-write: blob + sub-columns) so data is available
 ///     for comparison regardless of flag state.
 ///   - READ path: Flag controls which representation is used for queries.
-///     - OFF (default): Read from original blob column (current behavior).
-///     - ON: Read from shredded sub-columns (new fast path).
+///     - ON (default): Read from shredded sub-columns (new fast path).
+///     - OFF: Read from original blob column (current behavior, for comparison).
 ///
-/// This allows instant A/B performance comparison on the same data without re-ingestion.
-/// Later, the write-side can also be made conditional to save storage when shredding is disabled.
+/// Controlled per-query via TiDB session variable @@tiflash_json_shredding which is
+/// propagated through gRPC metadata. This allows instant A/B performance comparison
+/// on the same data without re-ingestion.
 class JsonShreddingFlag
 {
 public:
@@ -55,7 +56,7 @@ public:
 
 private:
     JsonShreddingFlag()
-        : use_shredded_(false)
+        : use_shredded_(true) // Default ON; toggled per-query via @@tiflash_json_shredding
         , write_shredded_(true) // Always write shredded for now
     {}
 

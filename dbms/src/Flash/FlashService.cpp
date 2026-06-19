@@ -41,6 +41,7 @@
 #include <Interpreters/executeQuery.h>
 #include <Poco/Message.h>
 #include <Server/IServer.h>
+#include <Storages/DeltaMerge/JsonShredding/JsonShreddingConfig.h>
 #include <Storages/DeltaMerge/Remote/DisaggSnapshot.h>
 #include <Storages/DeltaMerge/Remote/WNDisaggSnapshotManager.h>
 #include <Storages/IManageableStorage.h>
@@ -164,6 +165,17 @@ void updateSettingsFromTiDB(const grpc::ServerContext * grpc_context, ContextPtr
             context->setSetting(names.second, value_from_tidb);
             LOG_DEBUG(log, "set context setting {} to {}", names.second, value_from_tidb);
         }
+    }
+
+    // Handle JSON shredding flag separately — it controls a per-query read path toggle
+    // rather than a Context setting. The flag determines whether TiFlash reads JSON data
+    // from shredded sub-columns (true) or the original blob (false).
+    String json_shredding = getClientMetaVarWithDefault(grpc_context, "tiflash_json_shredding", "");
+    if (!json_shredding.empty())
+    {
+        bool use_shredded = (json_shredding == "true" || json_shredding == "1");
+        DM::JsonShreddingFlag::instance().setUseShredded(use_shredded);
+        LOG_DEBUG(log, "set json shredding use_shredded to {}", use_shredded);
     }
 }
 
