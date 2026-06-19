@@ -16,6 +16,7 @@
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnsNumber.h>
 #include <Common/assert_cast.h>
+#include <Core/ColumnWithTypeAndName.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonPathOptimizer.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonSchemaTree.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonShredder.h>
@@ -24,6 +25,8 @@
 #include <fmt/format.h>
 #include <TiDB/Decode/JsonBinary.h>
 #include <gtest/gtest.h>
+
+#include <thread>
 
 namespace DB::DM::tests
 {
@@ -783,6 +786,209 @@ TEST(JsonShreddedBlockContextTest, BackwardCompatNameOnlyLookup)
     auto result2 = ctx.getSubColumn("payload", 0, "status");
     ASSERT_NE(result2, nullptr);
     EXPECT_EQ(result2->size(), 1u);
+
+    ctx.clear();
+}
+
+// ============================================================================
+// Thread-Safety Tests: ColumnShreddedAttachment survives thread handoff
+// ============================================================================
+
+TEST(JsonShreddedBlockContextTest, AttachmentSurvivesThreadHandoff)
+{
+    // This test verifies the CRITICAL fix: shredded data attached to a column
+    // is accessible from a DIFFERENT thread (simulating DMFileReader → MPP worker).
+    // The old thread-local approach failed because reader and eval run on
+    // different thread pools.
+    JsonShreddingConfig config;
+    config.min_rows_for_inference = 1;
+    config.max_children_per_node = 64;
+
+    auto json1 = buildBinaryJsonObject({{"event", "click"}}, {{"count", 42}});
+    auto json2 = buildBinaryJsonObject({{"event", "view"}}, {{"count", 7}});
+    auto json3 = buildBinaryJsonObject({{"event", "buy"}}, {{"count", 99}});
+    auto col = createJsonColumn({json1, json2, json3});
+    const auto & col_string = assert_cast<const ColumnString &>(*col);
+
+    JsonShredder shredder(config);
+    auto shredded = shredder.shred(col_string);
+
+    // Simulate DMFileReader (reader thread): attach shredded data to column
+    auto sidecar = std::make_shared<const ShreddedJsonData>(std::move(shredded));
+    auto attachment = std::make_shared<ColumnShreddedAttachment>();
+    attachment->data = sidecar;
+    attachment->row_offset = 0;
+    attachment->row_count = 3;
+
+    ColumnWithTypeAndName col_with_attach;
+    col_with_attach.column = std::move(col);
+    col_with_attach.name = "payload";
+    col_with_attach.column_id = 7;
+    col_with_attach.shredded_attachment = attachment;
+
+    // Simulate thread handoff: pass column to a different thread (MPP eval thread)
+    ColumnPtr result_from_other_thread;
+    std::thread eval_thread([&]() {
+        // This runs on a DIFFERENT thread — thread-local would be empty here.
+        // The attachment should still be accessible.
+        ASSERT_NE(col_with_attach.shredded_attachment, nullptr);
+        ASSERT_NE(col_with_attach.shredded_attachment->data, nullptr);
+        const auto & attach = *col_with_attach.shredded_attachment;
+        auto full_col = JsonSubColumnReader::readPath(*attach.data, "event");
+        ASSERT_NE(full_col, nullptr);
+        if (full_col->size() == attach.row_count)
+            result_from_other_thread = full_col;
+        else if (full_col->size() >= attach.row_offset + attach.row_count)
+            result_from_other_thread = full_col->cut(attach.row_offset, attach.row_count);
+        else
+            result_from_other_thread = nullptr;
+    });
+    eval_thread.join();
+
+    // Verify the eval thread successfully read the sub-column
+    ASSERT_NE(result_from_other_thread, nullptr);
+    EXPECT_EQ(result_from_other_thread->size(), 3u);
+}
+
+TEST(JsonShreddedBlockContextTest, AttachmentSurvivesColumnRenameAndThreadHandoff)
+{
+    // Full pipeline simulation:
+    // 1. Reader thread creates column with name="payload", attaches shredded data
+    // 2. PROJECT renames column to "table_scan_3" (simulating PhysicalTableScan)
+    // 3. Eval thread reads attachment from renamed column
+    JsonShreddingConfig config;
+    config.min_rows_for_inference = 1;
+    config.max_children_per_node = 64;
+
+    auto json1 = buildBinaryJsonObject({{"status", "ok"}}, {{"value", 10}});
+    auto json2 = buildBinaryJsonObject({{"status", "err"}}, {{"value", 20}});
+    auto col = createJsonColumn({json1, json2});
+    const auto & col_string = assert_cast<const ColumnString &>(*col);
+
+    JsonShredder shredder(config);
+    auto shredded = shredder.shred(col_string);
+
+    auto sidecar = std::make_shared<const ShreddedJsonData>(std::move(shredded));
+    auto attachment = std::make_shared<ColumnShreddedAttachment>();
+    attachment->data = sidecar;
+    attachment->row_offset = 0;
+    attachment->row_count = 2;
+
+    // Step 1: Reader thread creates column
+    ColumnWithTypeAndName original;
+    original.column = std::move(col);
+    original.name = "payload";
+    original.column_id = 5;
+    original.shredded_attachment = attachment;
+
+    // Step 2: PROJECT renames column (simulates ExpressionActions PROJECT)
+    ColumnWithTypeAndName renamed = original;  // copy — attachment is shared_ptr, survives
+    renamed.name = "table_scan_3";
+
+    // Verify attachment survived the rename
+    ASSERT_NE(renamed.shredded_attachment, nullptr);
+    EXPECT_EQ(renamed.shredded_attachment->data.get(), sidecar.get());
+
+    // Step 3: Eval thread reads from the renamed column
+    ColumnPtr result_from_eval;
+    std::thread eval_thread([&]() {
+        // Different thread, different name — but attachment is still there
+        ASSERT_NE(renamed.shredded_attachment, nullptr);
+        const auto & attach = *renamed.shredded_attachment;
+        auto full_col = JsonSubColumnReader::readPath(*attach.data, "status");
+        ASSERT_NE(full_col, nullptr);
+        if (full_col->size() == attach.row_count)
+            result_from_eval = full_col;
+        else if (full_col->size() >= attach.row_offset + attach.row_count)
+            result_from_eval = full_col->cut(attach.row_offset, attach.row_count);
+    });
+    eval_thread.join();
+
+    ASSERT_NE(result_from_eval, nullptr);
+    EXPECT_EQ(result_from_eval->size(), 2u);
+}
+
+TEST(JsonShreddedBlockContextTest, AttachmentWithRowSlicingAcrossThreads)
+{
+    // Simulate reading a pack (subset of rows) from a larger sidecar,
+    // with the lookup happening on a different thread.
+    JsonShreddingConfig config;
+    config.min_rows_for_inference = 1;
+    config.max_children_per_node = 64;
+
+    // Build 6 rows — sidecar covers all 6
+    std::vector<String> jsons;
+    for (int i = 0; i < 6; ++i)
+        jsons.push_back(buildBinaryJsonObject({{"key", fmt::format("v{}", i)}}, {}));
+    auto col = createJsonColumn(jsons);
+    const auto & col_string = assert_cast<const ColumnString &>(*col);
+
+    JsonShredder shredder(config);
+    auto shredded = shredder.shred(col_string);
+
+    auto sidecar = std::make_shared<const ShreddedJsonData>(std::move(shredded));
+
+    // Simulate reading pack at row_offset=2, row_count=3 (rows 2,3,4 out of 6)
+    auto attachment = std::make_shared<ColumnShreddedAttachment>();
+    attachment->data = sidecar;
+    attachment->row_offset = 2;
+    attachment->row_count = 3;
+
+    ColumnWithTypeAndName col_info;
+    col_info.column = std::move(col);
+    col_info.name = "data";
+    col_info.column_id = 10;
+    col_info.shredded_attachment = attachment;
+
+    ColumnPtr sliced_result;
+    std::thread eval_thread([&]() {
+        const auto & attach = *col_info.shredded_attachment;
+        auto full_col = JsonSubColumnReader::readPath(*attach.data, "key");
+        ASSERT_NE(full_col, nullptr);
+        EXPECT_EQ(full_col->size(), 6u);  // Full sidecar has all 6 rows
+        // Slice to current pack's range
+        if (full_col->size() >= attach.row_offset + attach.row_count)
+            sliced_result = full_col->cut(attach.row_offset, attach.row_count);
+    });
+    eval_thread.join();
+
+    ASSERT_NE(sliced_result, nullptr);
+    EXPECT_EQ(sliced_result->size(), 3u);  // Only rows 2,3,4
+}
+
+TEST(JsonShreddedBlockContextTest, ThreadLocalIsEmptyOnDifferentThread)
+{
+    // Proves the old approach FAILS: thread-local set on one thread is
+    // invisible on another thread.
+    JsonShreddingConfig config;
+    config.min_rows_for_inference = 1;
+    config.max_children_per_node = 64;
+
+    auto json1 = buildBinaryJsonObject({{"x", "y"}}, {});
+    auto col = createJsonColumn({json1});
+    const auto & col_string = assert_cast<const ColumnString &>(*col);
+
+    JsonShredder shredder(config);
+    auto shredded = shredder.shred(col_string);
+
+    // Set context on THIS thread (simulating reader thread)
+    auto & ctx = JsonShreddedBlockContext::instance();
+    ctx.clear();
+    ctx.setForCurrentBlock("payload", 1, shredded, 0, 1);
+
+    // Verify it works on THIS thread
+    ASSERT_NE(ctx.getSubColumn("payload", 1, "x"), nullptr);
+
+    // Verify it is EMPTY on a different thread (proving the bug)
+    bool found_on_other_thread = false;
+    std::thread other_thread([&]() {
+        auto & other_ctx = JsonShreddedBlockContext::instance();
+        found_on_other_thread = other_ctx.hasShredded("payload", 1);
+    });
+    other_thread.join();
+
+    // This MUST be false — thread-local is empty on other thread
+    EXPECT_FALSE(found_on_other_thread);
 
     ctx.clear();
 }

@@ -130,80 +130,70 @@ public:
             return;
         }
 
-        // JSON shredding fast path: when flag is ON and we have a single constant path,
-        // use pre-computed sub-columns or optimized binary navigation instead of full parsing.
-        if (DM::JsonShreddingFlag::instance().useShredded() && arguments.size() == 2)
+        // JSON shredding fast path: if the JSON column has a shredded attachment
+        // (set by DMFileReader), read pre-computed sub-columns directly.
+        // The attachment travels with the column through the pipeline, surviving
+        // thread handoffs (reader pool → MPP worker) and column renames (PROJECT).
+        if (arguments.size() == 2)
         {
-            const auto & path_col = block.getByPosition(arguments[1]).column;
-            const auto * const_path = typeid_cast<const ColumnConst *>(path_col.get());
-            if (const_path)
+            const auto & json_col_ref = block.getByPosition(arguments[0]);
+            if (json_col_ref.shredded_attachment && json_col_ref.shredded_attachment->data)
             {
-                // Extract the constant path string (e.g., "$.event")
-                String path_str;
-                // ColumnConst may wrap ColumnNullable — check for null before getValue
-                const auto & inner = const_path->getDataColumn();
-                if (const auto * inner_nullable = typeid_cast<const ColumnNullable *>(&inner))
+                const auto & path_col = block.getByPosition(arguments[1]).column;
+                const auto * const_path = typeid_cast<const ColumnConst *>(path_col.get());
+                if (const_path)
                 {
-                    if (!inner_nullable->isNullAt(0))
-                        path_str = inner_nullable->getNestedColumn().getDataAt(0).toString();
-                }
-                else
-                {
-                    path_str = const_path->getValue<String>();
-                }
-
-                if (!path_str.empty())
-                {
-                    // Convert TiDB path format "$.event" → dot-separated "event"
-                    // Strip leading "$." prefix
-                    String dot_path = path_str;
-                    if (dot_path.size() > 2 && dot_path[0] == '$' && dot_path[1] == '.')
-                        dot_path = dot_path.substr(2);
-
-                    // Try thread-local context first (fastest: pre-computed sub-column).
-                    // Use column_id for lookup since column names are renamed by the
-                    // table scan projection (e.g., "payload" → "table_scan_3") but
-                    // column_id is preserved through renames.
-                    const auto & json_col_ref = block.getByPosition(arguments[0]);
-                    const auto & json_col_name = json_col_ref.name;
-                    const auto json_col_id = json_col_ref.column_id;
-                    auto & shred_ctx = DM::JsonShreddedBlockContext::instance();
-                    ColumnPtr sub_col = shred_ctx.getSubColumn(json_col_name, json_col_id, dot_path);
-
-                    // Diagnostic: log the first attempt to help debug name/path mismatches
-                    static std::atomic<int> shred_log_count{0};
-                    if (shred_log_count.fetch_add(1) < 5)
+                    String path_str;
+                    const auto & inner = const_path->getDataColumn();
+                    if (const auto * inner_nullable = typeid_cast<const ColumnNullable *>(&inner))
                     {
-                        static auto diag_log = Logger::get("JsonShredDiag");
-                        LOG_INFO(
-                            diag_log,
-                            "json_shred_read: col_name='{}' col_id={} path='{}' dot_path='{}' "
-                            "sub_col={} ctx_has_col={} rows={}",
-                            json_col_name,
-                            json_col_id,
-                            path_str,
-                            dot_path,
-                            sub_col ? fmt::format("size={}", sub_col->size()) : "null",
-                            shred_ctx.hasShredded(json_col_name, json_col_id),
-                            rows);
+                        if (!inner_nullable->isNullAt(0))
+                            path_str = inner_nullable->getNestedColumn().getDataAt(0).toString();
+                    }
+                    else
+                    {
+                        path_str = const_path->getValue<String>();
                     }
 
-                    if (sub_col)
+                    if (!path_str.empty())
                     {
-                        res_col = convertShreddedToJsonBinary(sub_col, rows);
-                        if (res_col)
-                            return;
-                        // Log if conversion failed
-                        static std::atomic<int> conv_log_count{0};
-                        if (conv_log_count.fetch_add(1) < 3)
+                        String dot_path = path_str;
+                        if (dot_path.size() > 2 && dot_path[0] == '$' && dot_path[1] == '.')
+                            dot_path = dot_path.substr(2);
+
+                        const auto & attach = *json_col_ref.shredded_attachment;
+                        auto full_col = DM::JsonSubColumnReader::readPath(*attach.data, dot_path);
+                        ColumnPtr sub_col;
+                        if (full_col)
                         {
-                            static auto diag_log2 = Logger::get("JsonShredDiag");
+                            if (full_col->size() == attach.row_count)
+                                sub_col = full_col;
+                            else if (full_col->size() >= attach.row_offset + attach.row_count)
+                                sub_col = full_col->cut(attach.row_offset, attach.row_count);
+                        }
+
+                        static std::atomic<int> shred_log_count{0};
+                        if (shred_log_count.fetch_add(1) < 5)
+                        {
+                            static auto diag_log = Logger::get("JsonShredDiag");
                             LOG_INFO(
-                                diag_log2,
-                                "json_shred_read: convertShreddedToJsonBinary returned null! "
-                                "sub_col_size={} rows={}",
-                                sub_col->size(),
+                                diag_log,
+                                "json_shred_read(attachment): col='{}' path='{}' dot_path='{}' "
+                                "sub_col={} row_offset={} row_count={} rows={}",
+                                json_col_ref.name,
+                                path_str,
+                                dot_path,
+                                sub_col ? fmt::format("size={}", sub_col->size()) : "null",
+                                attach.row_offset,
+                                attach.row_count,
                                 rows);
+                        }
+
+                        if (sub_col)
+                        {
+                            res_col = convertShreddedToJsonBinary(sub_col, rows);
+                            if (res_col)
+                                return;
                         }
                     }
                 }

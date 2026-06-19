@@ -330,6 +330,10 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
     ColumnsWithTypeAndName columns;
     columns.reserve(read_columns.size());
 
+    // Determine if we should attach shredded data (check flag once per block read)
+    const bool attach_shredded = JsonShreddingFlag::instance().useShredded();
+    const String & dmfile_path = dmfile->path();
+
     for (const auto & cd : read_columns)
     {
         try
@@ -351,7 +355,66 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
                 col = readColumn(cd, start_pack_id, pack_count, read_rows);
                 break;
             }
-            columns.emplace_back(std::move(col), cd.type, cd.name, cd.id);
+            auto & inserted = columns.emplace_back(std::move(col), cd.type, cd.name, cd.id);
+
+            // JSON shredding: attach sidecar data directly to the column so it
+            // travels with the Block through the pipeline (survives thread handoffs
+            // between reader pool and MPP worker pool, and column renames).
+            if (attach_shredded)
+            {
+                std::shared_ptr<const ShreddedJsonData> sidecar_data;
+
+                // Check global cache first
+                const ShreddedJsonData * cached = JsonShreddedStore::getCached(dmfile_path, cd.name);
+                if (cached)
+                {
+                    // Wrap raw pointer in a shared_ptr that doesn't own (the cache owns it)
+                    sidecar_data = std::shared_ptr<const ShreddedJsonData>(
+                        cached,
+                        [](const ShreddedJsonData *) {}); // no-op deleter
+                }
+                else if (JsonShreddedStore::hasSidecar(dmfile_path, cd.name))
+                {
+                    // Load from disk into cache
+                    auto loaded = JsonShreddedStore::readSidecar(dmfile_path, cd.name);
+                    if (loaded.has_value())
+                    {
+                        JsonShreddedStore::putCache(dmfile_path, cd.name, std::move(loaded.value()));
+                        const ShreddedJsonData * newly_cached
+                            = JsonShreddedStore::getCached(dmfile_path, cd.name);
+                        if (newly_cached)
+                        {
+                            sidecar_data = std::shared_ptr<const ShreddedJsonData>(
+                                newly_cached,
+                                [](const ShreddedJsonData *) {});
+                        }
+                    }
+                }
+
+                if (sidecar_data)
+                {
+                    auto attachment = std::make_shared<DM::ColumnShreddedAttachment>();
+                    attachment->data = std::move(sidecar_data);
+                    attachment->row_offset = start_row_offset;
+                    attachment->row_count = read_rows;
+                    inserted.shredded_attachment = std::move(attachment);
+
+                    static std::atomic<int> attach_log_count{0};
+                    if (attach_log_count.fetch_add(1) < 3)
+                    {
+                        static auto attach_log = Logger::get("JsonShredDiag");
+                        LOG_INFO(
+                            attach_log,
+                            "DMFileReader ATTACHED shredded: col='{}' col_id={} dmfile='{}' "
+                            "row_offset={} read_rows={}",
+                            cd.name,
+                            cd.id,
+                            dmfile_path,
+                            start_row_offset,
+                            read_rows);
+                    }
+                }
+            }
         }
         catch (DB::Exception & e)
         {
@@ -364,71 +427,6 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
     Block res(std::move(columns));
     res.setStartOffset(start_row_offset);
     res.setRSResult(rs_result);
-
-    // JSON shredding read path: if shredded sub-columns exist for any column in this DMFile,
-    // load them into the thread-local context so FunctionJsonExtract can use them.
-    // The sidecar contains data for the ENTIRE DMFile; we pass the pack's row range
-    // so getSubColumn() can slice to the current block's rows.
-    if (JsonShreddingFlag::instance().useShredded())
-    {
-        const String & dmfile_path = dmfile->path();
-        auto & shred_ctx = JsonShreddedBlockContext::instance();
-        shred_ctx.clear();
-
-        for (const auto & cd : read_columns)
-        {
-            // Check global cache first, then disk
-            const ShreddedJsonData * cached = JsonShreddedStore::getCached(dmfile_path, cd.name);
-            if (cached)
-            {
-                shred_ctx.setForCurrentBlock(cd.name, cd.id, *cached, start_row_offset, read_rows);
-                // Diagnostic: log the first time we load shredded context
-                static std::atomic<int> reader_log_count{0};
-                if (reader_log_count.fetch_add(1) < 3)
-                {
-                    static auto reader_log = Logger::get("JsonShredDiag");
-                    LOG_INFO(
-                        reader_log,
-                        "DMFileReader shred_ctx SET: col='{}' dmfile='{}' row_offset={} read_rows={} "
-                        "sidecar_rows={}",
-                        cd.name,
-                        dmfile_path,
-                        start_row_offset,
-                        read_rows,
-                        cached->numRows());
-                }
-                continue;
-            }
-            // Try loading from disk sidecar
-            if (JsonShreddedStore::hasSidecar(dmfile_path, cd.name))
-            {
-                auto loaded = JsonShreddedStore::readSidecar(dmfile_path, cd.name);
-                if (loaded.has_value())
-                {
-                    JsonShreddedStore::putCache(dmfile_path, cd.name, std::move(loaded.value()));
-                    const ShreddedJsonData * newly_cached = JsonShreddedStore::getCached(dmfile_path, cd.name);
-                    if (newly_cached)
-                    {
-                        shred_ctx.setForCurrentBlock(cd.name, cd.id, *newly_cached, start_row_offset, read_rows);
-                        static std::atomic<int> reader_log_count2{0};
-                        if (reader_log_count2.fetch_add(1) < 3)
-                        {
-                            static auto reader_log2 = Logger::get("JsonShredDiag");
-                            LOG_INFO(
-                                reader_log2,
-                                "DMFileReader shred_ctx LOADED from disk: col='{}' dmfile='{}' "
-                                "row_offset={} read_rows={} sidecar_rows={}",
-                                cd.name,
-                                dmfile_path,
-                                start_row_offset,
-                                read_rows,
-                                newly_cached->numRows());
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     return res;
 }

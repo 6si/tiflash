@@ -19,6 +19,7 @@
 #pragma once
 
 #include <Columns/IColumn.h>
+#include <Core/ColumnShreddedAttachment.h>
 #include <DataTypes/IDataType.h>
 
 
@@ -41,6 +42,10 @@ struct ColumnWithTypeAndName
     /// TODO Handle column_id properly after we support DDL.
     Int64 column_id;
     Field default_value;
+
+    /// Optional: pre-computed shredded JSON sub-columns attached by DMFileReader.
+    /// Survives thread handoffs and column renames. Null for non-JSON columns.
+    DM::ColumnShreddedAttachmentPtr shredded_attachment;
 
     ColumnWithTypeAndName()
         : ColumnWithTypeAndName(nullptr, nullptr, "")
