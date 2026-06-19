@@ -30,6 +30,8 @@
 #include <common/logger_useful.h>
 #include <fmt/format.h>
 
+#include <atomic>
+
 
 namespace DB::ErrorCodes
 {
@@ -380,6 +382,21 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
             if (cached)
             {
                 shred_ctx.setForCurrentBlock(cd.name, *cached, start_row_offset, read_rows);
+                // Diagnostic: log the first time we load shredded context
+                static std::atomic<int> reader_log_count{0};
+                if (reader_log_count.fetch_add(1) < 3)
+                {
+                    static auto reader_log = Logger::get("JsonShredDiag");
+                    LOG_INFO(
+                        reader_log,
+                        "DMFileReader shred_ctx SET: col='{}' dmfile='{}' row_offset={} read_rows={} "
+                        "sidecar_rows={}",
+                        cd.name,
+                        dmfile_path,
+                        start_row_offset,
+                        read_rows,
+                        cached->numRows());
+                }
                 continue;
             }
             // Try loading from disk sidecar
@@ -391,7 +408,23 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
                     JsonShreddedStore::putCache(dmfile_path, cd.name, std::move(loaded.value()));
                     const ShreddedJsonData * newly_cached = JsonShreddedStore::getCached(dmfile_path, cd.name);
                     if (newly_cached)
+                    {
                         shred_ctx.setForCurrentBlock(cd.name, *newly_cached, start_row_offset, read_rows);
+                        static std::atomic<int> reader_log_count2{0};
+                        if (reader_log_count2.fetch_add(1) < 3)
+                        {
+                            static auto reader_log2 = Logger::get("JsonShredDiag");
+                            LOG_INFO(
+                                reader_log2,
+                                "DMFileReader shred_ctx LOADED from disk: col='{}' dmfile='{}' "
+                                "row_offset={} read_rows={} sidecar_rows={}",
+                                cd.name,
+                                dmfile_path,
+                                start_row_offset,
+                                read_rows,
+                                newly_cached->numRows());
+                        }
+                    }
                 }
             }
         }

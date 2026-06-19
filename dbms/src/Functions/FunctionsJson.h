@@ -45,6 +45,7 @@
 #include <tipb/expression.pb.h>
 
 #include <algorithm>
+#include <atomic>
 #include <ext/range.h>
 #include <limits>
 #include <magic_enum.hpp>
@@ -158,25 +159,47 @@ public:
                     String dot_path = path_str;
                     if (dot_path.size() > 2 && dot_path[0] == '$' && dot_path[1] == '.')
                         dot_path = dot_path.substr(2);
-                    // Convert remaining dots to the expected format (already dot-separated)
 
                     // Try thread-local context first (fastest: pre-computed sub-column)
                     const auto & json_col_name = block.getByPosition(arguments[0]).name;
                     auto & shred_ctx = DM::JsonShreddedBlockContext::instance();
                     ColumnPtr sub_col = shred_ctx.getSubColumn(json_col_name, dot_path);
 
+                    // Diagnostic: log the first attempt to help debug name/path mismatches
+                    static std::atomic<int> shred_log_count{0};
+                    if (shred_log_count.fetch_add(1) < 5)
+                    {
+                        static auto diag_log = Logger::get("JsonShredDiag");
+                        LOG_INFO(
+                            diag_log,
+                            "json_shred_read: col_name='{}' path='{}' dot_path='{}' sub_col={} "
+                            "ctx_has_col={} rows={}",
+                            json_col_name,
+                            path_str,
+                            dot_path,
+                            sub_col ? fmt::format("size={}", sub_col->size()) : "null",
+                            shred_ctx.hasShredded(json_col_name),
+                            rows);
+                    }
+
                     if (sub_col)
                     {
-                        // Have pre-computed sub-column! Convert to the expected output format.
-                        // json_extract returns Nullable(String) with binary JSON encoded values.
-                        // The sub-column is Nullable(typed). Convert typed values to binary JSON strings.
                         res_col = convertShreddedToJsonBinary(sub_col, rows);
                         if (res_col)
                             return;
+                        // Log if conversion failed
+                        static std::atomic<int> conv_log_count{0};
+                        if (conv_log_count.fetch_add(1) < 3)
+                        {
+                            static auto diag_log2 = Logger::get("JsonShredDiag");
+                            LOG_INFO(
+                                diag_log2,
+                                "json_shred_read: convertShreddedToJsonBinary returned null! "
+                                "sub_col_size={} rows={}",
+                                sub_col->size(),
+                                rows);
+                        }
                     }
-                    // No pre-computed sub-column available — fall through to standard extraction.
-                    // doShreddedExtract is NOT used as a fallback here because its null handling
-                    // differs from the standard path in edge cases (e.g., missing paths, null JSON).
                 }
             }
         }
