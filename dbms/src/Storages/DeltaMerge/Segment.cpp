@@ -58,6 +58,7 @@
 #include <Storages/DeltaMerge/StoragePool/StoragePool.h>
 #include <Storages/DeltaMerge/VersionChain/MVCCBitmapFilter.h>
 #include <Storages/DeltaMerge/WriteBatchesImpl.h>
+#include <Storages/DeltaMerge/JsonShredding/JsonSegmentMerger.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonShredder.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonShreddedStore.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonShreddingConfig.h>
@@ -187,15 +188,17 @@ DMFilePtr writeIntoNewDMFile(
     const auto * mvcc_stream
         = typeid_cast<const DMVersionFilterBlockInputStream<DMVersionFilterMode::COMPACT> *>(input_stream.get());
 
-    // JSON shredding: accumulate JSON column data across blocks for shredding at the end.
-    // We collect all rows for each JSON column, shred once, then write sidecar files.
+    // JSON shredding: shred each block's JSON columns individually to avoid OOM.
+    // Each block is shredded independently (JsonShredder::shred does schema inference internally),
+    // then merged at the end via JsonSegmentMerger.
     const bool write_shredded = JsonShreddingFlag::instance().writeShredded();
-    struct JsonColumnAccumulator
+    struct JsonColumnShredState
     {
         String col_name;
-        MutableColumnPtr accumulated_data; // ColumnString accumulating all blocks
+        std::vector<ShreddedJsonData> block_results;
+        size_t total_rows = 0;
     };
-    std::vector<JsonColumnAccumulator> json_accumulators;
+    std::vector<JsonColumnShredState> json_shred_states;
 
     input_stream->readPrefix();
     output_stream->writePrefix();
@@ -216,42 +219,38 @@ DMFilePtr writeIntoNewDMFile(
         if (!block.rows())
             continue;
 
-        // JSON shredding write path: detect and accumulate JSON columns
+        // JSON shredding write path: shred per-block (no accumulation of raw blobs)
         if (write_shredded)
         {
             for (size_t col_idx = 0; col_idx < block.columns(); ++col_idx)
             {
                 const auto & col_with_name = block.getByPosition(col_idx);
                 const auto * col_string = typeid_cast<const ColumnString *>(col_with_name.column.get());
-                if (!col_string)
+                if (!col_string || !isBinaryJsonColumn(*col_string))
                     continue;
 
-                // Check if this column contains binary JSON data
-                if (!isBinaryJsonColumn(*col_string))
-                    continue;
-
-                // Find or create accumulator for this column
-                bool found = false;
-                for (auto & acc : json_accumulators)
+                // Find or create shred state for this column
+                JsonColumnShredState * state = nullptr;
+                for (auto & s : json_shred_states)
                 {
-                    if (acc.col_name == col_with_name.name)
+                    if (s.col_name == col_with_name.name)
                     {
-                        // Append this block's data to the accumulator
-                        auto & acc_col = assert_cast<ColumnString &>(*acc.accumulated_data);
-                        for (size_t row = 0; row < col_string->size(); ++row)
-                            acc_col.insertFrom(*col_string, row);
-                        found = true;
+                        state = &s;
                         break;
                     }
                 }
-                if (!found)
+                if (!state)
                 {
-                    // First time seeing this JSON column — initialize accumulator
-                    auto new_col = ColumnString::create();
-                    for (size_t row = 0; row < col_string->size(); ++row)
-                        new_col->insertFrom(*col_string, row);
-                    json_accumulators.push_back({col_with_name.name, std::move(new_col)});
+                    json_shred_states.push_back({col_with_name.name, {}, 0});
+                    state = &json_shred_states.back();
                 }
+
+                // Shred this block's data immediately (no copy/accumulation of raw blobs)
+                JsonShredder shredder;
+                ShreddedJsonData block_shredded = shredder.shred(*col_string);
+                state->total_rows += col_string->size();
+                if (!block_shredded.sub_columns.empty())
+                    state->block_results.push_back(std::move(block_shredded));
             }
         }
 
@@ -281,28 +280,35 @@ DMFilePtr writeIntoNewDMFile(
     input_stream->readSuffix();
     output_stream->writeSuffix();
 
-    // JSON shredding: shred accumulated JSON columns and write sidecar files
-    if (write_shredded && !json_accumulators.empty())
+    // JSON shredding: merge per-block shredded results and write sidecar files.
+    // Memory-efficient: only the typed sub-columns are in memory, not raw JSON blobs.
+    if (write_shredded && !json_shred_states.empty())
     {
         const String dmfile_path = dmfile->path();
-        for (auto & acc : json_accumulators)
+        for (auto & state : json_shred_states)
         {
-            const auto & col_string = assert_cast<const ColumnString &>(*acc.accumulated_data);
-            if (col_string.size() == 0)
+            if (state.block_results.empty())
                 continue;
 
-            // Shred the accumulated JSON data
-            JsonShredder shredder;
-            ShreddedJsonData shredded = shredder.shred(col_string);
+            // Merge all per-block shredded data by pairwise concatenation
+            ShreddedJsonData merged;
+            if (state.block_results.size() == 1)
+            {
+                merged = std::move(state.block_results[0]);
+            }
+            else
+            {
+                JsonSegmentMerger merger;
+                merged = std::move(state.block_results[0]);
+                for (size_t i = 1; i < state.block_results.size(); ++i)
+                    merged = merger.mergeSegments(merged, state.block_results[i]);
+            }
 
-            if (shredded.sub_columns.empty())
+            if (merged.sub_columns.empty())
                 continue;
 
-            // Persist to sidecar files alongside the DMFile
-            JsonShreddedStore::writeSidecar(dmfile_path, acc.col_name, shredded);
-
-            // Also cache in memory for immediate read access
-            JsonShreddedStore::putCache(dmfile_path, acc.col_name, std::move(shredded));
+            JsonShreddedStore::writeSidecar(dmfile_path, state.col_name, merged);
+            JsonShreddedStore::putCache(dmfile_path, state.col_name, std::move(merged));
         }
     }
 
