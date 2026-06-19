@@ -29,6 +29,7 @@
 #include <Storages/KVStore/StorageEngineType.h>
 
 #include <magic_enum.hpp>
+#include <string_view>
 
 namespace TiDB
 {
@@ -153,6 +154,7 @@ public:
 
 public: // Region Management
     void restore(PathPool & path_pool, const TiFlashRaftProxyHelper *);
+    void restoreProxyHelper(const TiFlashRaftProxyHelper * helper) { proxy_helper = helper; }
     void gcPersistedRegion(Seconds gc_persist_period = Seconds(60 * 5));
     RegionMap getRegionsByRangeOverlap(const RegionRange & range) const;
     void traverseRegions(std::function<void(RegionID, const RegionPtr &)> && callback) const;
@@ -372,13 +374,14 @@ private:
         TMTContext & tmt,
         const RegionTaskLock & region_task_lock,
         UInt64 index,
-        UInt64 term) const;
+        UInt64 term,
+        std::string_view persist_extra_msg) const;
 
     void persistRegion(
         const Region & region,
         const RegionTaskLock & region_task_lock,
         PersistRegionReason reason,
-        const char * extra_msg) const;
+        std::string_view extra_msg) const;
 
     bool tryRegisterEagerRaftLogGCTask(const RegionPtr & region, RegionTaskLock &);
 

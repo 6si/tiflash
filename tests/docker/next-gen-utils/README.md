@@ -1,5 +1,15 @@
 # next-gen binaries download script
 
+Note that the images under `us-docker.pkg.dev` are private. You need to acquire the access token and login before using this script.
+
+```bash
+gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin us-docker.pkg.dev
+# or using podman instead of docker
+# gcloud auth print-access-token | podman login -u oauth2accesstoken --password-stdin us-docker.pkg.dev
+```
+
+Download the binaries and start a tiup cluster.
+
 ```bash
 # copy the binaries from tikv/tidb/pd/tiflash images to local
 make download

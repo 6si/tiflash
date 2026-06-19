@@ -49,6 +49,7 @@
 #include <ext/range.h>
 #include <limits>
 #include <magic_enum.hpp>
+#include <optional>
 #include <string_view>
 #include <type_traits>
 
@@ -631,7 +632,7 @@ public:
 
     bool useDefaultImplementationForConstants() const override { return true; }
 
-    void setOutputTiDBFieldType(const tipb::FieldType & tidb_tp_) { tidb_tp = &tidb_tp_; }
+    void setOutputTiDBFieldType(const tipb::FieldType & tidb_tp_) { tidb_tp = tidb_tp_; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
@@ -659,7 +660,7 @@ public:
             ColumnUInt8::MutablePtr col_null_map = ColumnUInt8::create(rows, 0);
             ColumnUInt8::Container & vec_null_map = col_null_map->getData();
             JsonBinary::JsonBinaryWriteBuffer write_buffer(data_to);
-            if likely (tidb_tp->flen() < 0)
+            if likely (!tidb_tp.has_value() || tidb_tp->flen() < 0)
             {
                 size_t current_offset = 0;
                 for (size_t i = 0; i < block.rows(); ++i)
@@ -722,7 +723,7 @@ public:
     }
 
 private:
-    const tipb::FieldType * tidb_tp = nullptr;
+    std::optional<tipb::FieldType> tidb_tp;
     const Context & context;
 };
 
@@ -1560,7 +1561,7 @@ public:
     bool useDefaultImplementationForNulls() const override { return true; }
     bool useDefaultImplementationForConstants() const override { return true; }
 
-    void setInputTiDBFieldType(const tipb::FieldType & tidb_tp_) { input_tidb_tp = &tidb_tp_; }
+    void setInputTiDBFieldType(const tipb::FieldType & tidb_tp_) { input_tidb_tp = tidb_tp_; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
@@ -1586,7 +1587,7 @@ public:
             using IntFieldType = typename IntType::FieldType;
             const auto & from = block.getByPosition(arguments[0]);
             // In raw function test, input_tidb_tp is nullptr.
-            if (unlikely(input_tidb_tp == nullptr) || !hasIsBooleanFlag(*input_tidb_tp))
+            if (unlikely(!input_tidb_tp.has_value()) || !hasIsBooleanFlag(*input_tidb_tp))
             {
                 if constexpr (std::is_unsigned_v<IntFieldType>)
                     doExecute<IntFieldType, UInt64>(data_to, offsets_to, from.column);
@@ -1650,7 +1651,7 @@ private:
     }
 
 private:
-    const tipb::FieldType * input_tidb_tp = nullptr;
+    std::optional<tipb::FieldType> input_tidb_tp;
 };
 
 class FunctionCastStringAsJson : public IFunction
@@ -1666,8 +1667,8 @@ public:
     bool useDefaultImplementationForNulls() const override { return false; }
     bool useDefaultImplementationForConstants() const override { return true; }
 
-    void setInputTiDBFieldType(const tipb::FieldType & tidb_tp_) { input_tidb_tp = &tidb_tp_; }
-    void setOutputTiDBFieldType(const tipb::FieldType & tidb_tp_) { output_tidb_tp = &tidb_tp_; }
+    void setInputTiDBFieldType(const tipb::FieldType & tidb_tp_) { input_tidb_tp = tidb_tp_; }
+    void setOutputTiDBFieldType(const tipb::FieldType & tidb_tp_) { output_tidb_tp = tidb_tp_; }
     void setCollator(const TiDB::TiDBCollatorPtr & collator_) override { collator = collator_; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
@@ -1708,7 +1709,7 @@ public:
         // In raw function test, input_tidb_tp/output_tidb_tp is nullptr.
         if (collator && collator->isBinary())
         {
-            if (unlikely(input_tidb_tp == nullptr))
+            if (unlikely(!input_tidb_tp.has_value()))
             {
                 doExecuteForBinary<false, false>(
                     data_to,
@@ -1757,7 +1758,7 @@ public:
                     block.rows());
             }
         }
-        else if ((unlikely(output_tidb_tp == nullptr)) || hasParseToJSONFlag(*output_tidb_tp))
+        else if (unlikely(!output_tidb_tp.has_value()) || hasParseToJSONFlag(*output_tidb_tp))
         {
             if (from.column->isColumnNullable())
             {
@@ -1950,8 +1951,8 @@ private:
     }
 
 private:
-    const tipb::FieldType * input_tidb_tp = nullptr;
-    const tipb::FieldType * output_tidb_tp = nullptr;
+    std::optional<tipb::FieldType> input_tidb_tp;
+    std::optional<tipb::FieldType> output_tidb_tp;
     TiDB::TiDBCollatorPtr collator = nullptr;
 };
 
@@ -1968,7 +1969,7 @@ public:
     bool useDefaultImplementationForNulls() const override { return true; }
     bool useDefaultImplementationForConstants() const override { return true; }
 
-    void setInputTiDBFieldType(const tipb::FieldType & tidb_tp_) { input_tidb_tp = &tidb_tp_; }
+    void setInputTiDBFieldType(const tipb::FieldType & tidb_tp_) { input_tidb_tp = tidb_tp_; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
@@ -1991,7 +1992,7 @@ public:
         if (checkDataType<DataTypeMyDateTime>(from.type.get()))
         {
             // In raw function test, input_tidb_tp is nullptr.
-            bool is_timestamp = (unlikely(input_tidb_tp == nullptr)) || input_tidb_tp->tp() == TiDB::TypeTimestamp;
+            bool is_timestamp = unlikely(!input_tidb_tp.has_value()) || input_tidb_tp->tp() == TiDB::TypeTimestamp;
             if (is_timestamp)
                 doExecute<DataTypeMyDateTime, true>(data_to, offsets_to, from.column);
             else
@@ -2041,7 +2042,7 @@ private:
     }
 
 private:
-    const tipb::FieldType * input_tidb_tp = nullptr;
+    std::optional<tipb::FieldType> input_tidb_tp;
 };
 
 class FunctionCastDurationAsJson : public IFunction
