@@ -32,6 +32,9 @@
 #include <Functions/IFunction.h>
 #include <Functions/castTypeToEither.h>
 #include <Interpreters/Context.h>
+#include <Storages/DeltaMerge/JsonShredding/JsonShreddedStore.h>
+#include <Storages/DeltaMerge/JsonShredding/JsonShredder.h>
+#include <Storages/DeltaMerge/JsonShredding/JsonShreddingConfig.h>
 #include <TiDB/Decode/JsonBinary.h>
 #include <TiDB/Decode/JsonPathExprRef.h>
 #include <TiDB/Decode/JsonScanner.h>
@@ -126,6 +129,81 @@ public:
             return;
         }
 
+        // JSON shredding fast path: when flag is ON and we have a single constant path,
+        // use pre-computed sub-columns or optimized binary navigation instead of full parsing.
+        if (DM::JsonShreddingFlag::instance().useShredded() && arguments.size() == 2)
+        {
+            const auto & path_col = block.getByPosition(arguments[1]).column;
+            if (path_col->isColumnConst())
+            {
+                // Extract the constant path string (e.g., "$.event")
+                String path_str;
+                if (path_col->isColumnNullable())
+                {
+                    const auto & nullable = static_cast<const ColumnNullable &>(*path_col);
+                    if (!nullable.isNullAt(0))
+                    {
+                        const auto & nested = nullable.getNestedColumn();
+                        if (const auto * const_col = typeid_cast<const ColumnConst *>(&nested))
+                            path_str = const_col->getValue<String>();
+                        else
+                            path_str = nested.getDataAt(0).toString();
+                    }
+                }
+                else if (const auto * const_col = typeid_cast<const ColumnConst *>(path_col.get()))
+                {
+                    path_str = const_col->getValue<String>();
+                }
+
+                if (!path_str.empty())
+                {
+                    // Convert TiDB path format "$.event" → dot-separated "event"
+                    // Strip leading "$." prefix
+                    String dot_path = path_str;
+                    if (dot_path.size() > 2 && dot_path[0] == '$' && dot_path[1] == '.')
+                        dot_path = dot_path.substr(2);
+                    // Convert remaining dots to the expected format (already dot-separated)
+
+                    // Try thread-local context first (fastest: pre-computed sub-column)
+                    const auto & json_col_name = block.getByPosition(arguments[0]).name;
+                    auto & shred_ctx = DM::JsonShreddedBlockContext::instance();
+                    ColumnPtr sub_col = shred_ctx.getSubColumn(json_col_name, dot_path);
+
+                    if (sub_col)
+                    {
+                        // Have pre-computed sub-column! Convert to the expected output format.
+                        // json_extract returns Nullable(String) with binary JSON encoded values.
+                        // The sub-column is Nullable(typed). Convert typed values to binary JSON strings.
+                        res_col = convertShreddedToJsonBinary(sub_col, rows);
+                        if (res_col)
+                            return;
+                    }
+
+                    // Fall back to optimized per-row extraction using JsonBinaryNavigator
+                    // (faster than full JsonBinary::extract because it skips path expression parsing)
+                    const IColumn * raw_json = json_column;
+                    const NullMap * json_null_map = nullptr;
+                    if (json_column->isColumnNullable())
+                    {
+                        const auto & nullable = static_cast<const ColumnNullable &>(*json_column);
+                        raw_json = &nullable.getNestedColumn();
+                        json_null_map = &nullable.getNullMapData();
+                    }
+                    const auto * json_str_col = typeid_cast<const ColumnString *>(raw_json);
+                    if (json_str_col)
+                    {
+                        auto result_col = doShreddedExtract(*json_str_col, json_null_map, dot_path, rows);
+                        if (result_col)
+                        {
+                            res_col = std::move(result_col);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Standard extraction path (flag OFF or fallback)
         auto nested_block = createBlockWithNestedColumns(block, arguments);
         auto json_source = createDynamicStringSource(*nested_block.getByPosition(arguments[0]).column);
 
@@ -185,6 +263,127 @@ public:
     }
 
 private:
+    /// Convert a shredded sub-column (Nullable typed values) to the binary JSON string format
+    /// that json_extract normally returns.
+    ColumnPtr convertShreddedToJsonBinary(const ColumnPtr & sub_col, size_t rows) const
+    {
+        if (!sub_col || sub_col->size() != rows)
+            return nullptr;
+
+        const auto * nullable = typeid_cast<const ColumnNullable *>(sub_col.get());
+        if (!nullable)
+            return nullptr;
+
+        auto col_to = ColumnString::create();
+        ColumnString::Chars_t & data_to = col_to->getChars();
+        ColumnString::Offsets & offsets_to = col_to->getOffsets();
+        offsets_to.resize(rows);
+        ColumnUInt8::MutablePtr col_null_map = ColumnUInt8::create(rows, 0);
+        ColumnUInt8::Container & null_map_to = col_null_map->getData();
+        JsonBinary::JsonBinaryWriteBuffer write_buffer(data_to, rows);
+
+        const auto & null_map = nullable->getNullMapData();
+        const auto & nested = nullable->getNestedColumn();
+
+        for (size_t row = 0; row < rows; ++row)
+        {
+            if (null_map[row])
+            {
+                null_map_to[row] = 1;
+                writeChar(0, write_buffer);
+                offsets_to[row] = write_buffer.count();
+                continue;
+            }
+
+            // Get the value from the nested column and encode as binary JSON
+            if (const auto * str_col = typeid_cast<const ColumnString *>(&nested))
+            {
+                StringRef val = str_col->getDataAt(row);
+                JsonBinary::appendStringRef(write_buffer, val);
+            }
+            else if (const auto * int_col = typeid_cast<const ColumnInt64 *>(&nested))
+            {
+                Int64 val = int_col->getData()[row];
+                JsonBinary::appendNumber(write_buffer, val);
+            }
+            else if (const auto * uint_col = typeid_cast<const ColumnUInt64 *>(&nested))
+            {
+                UInt64 val = uint_col->getData()[row];
+                JsonBinary::appendNumber(write_buffer, val);
+            }
+            else if (const auto * float_col = typeid_cast<const ColumnFloat64 *>(&nested))
+            {
+                Float64 val = float_col->getData()[row];
+                JsonBinary::appendNumber(write_buffer, val);
+            }
+            else
+            {
+                // Unknown type — fall back to null
+                null_map_to[row] = 1;
+            }
+            writeChar(0, write_buffer);
+            offsets_to[row] = write_buffer.count();
+        }
+        return ColumnNullable::create(std::move(col_to), std::move(col_null_map));
+    }
+
+    /// Optimized per-row extraction using JsonBinaryNavigator (faster than full JsonBinary::extract).
+    /// Navigates directly to the requested path without path expression parsing overhead.
+    MutableColumnPtr doShreddedExtract(
+        const ColumnString & json_col,
+        const NullMap * json_null_map,
+        const String & dot_path,
+        size_t rows) const
+    {
+        auto col_to = ColumnString::create();
+        ColumnString::Chars_t & data_to = col_to->getChars();
+        ColumnString::Offsets & offsets_to = col_to->getOffsets();
+        offsets_to.resize(rows);
+        ColumnUInt8::MutablePtr col_null_map = ColumnUInt8::create(rows, 0);
+        ColumnUInt8::Container & null_map_to = col_null_map->getData();
+        JsonBinary::JsonBinaryWriteBuffer write_buffer(data_to, rows);
+
+        for (size_t row = 0; row < rows; ++row)
+        {
+            if (json_null_map && (*json_null_map)[row])
+            {
+                null_map_to[row] = 1;
+                writeChar(0, write_buffer);
+                offsets_to[row] = write_buffer.count();
+                continue;
+            }
+
+            StringRef data = json_col.getDataAt(row);
+            if (data.size == 0)
+            {
+                null_map_to[row] = 1;
+                writeChar(0, write_buffer);
+                offsets_to[row] = write_buffer.count();
+                continue;
+            }
+
+            auto type_code = static_cast<JsonBinary::JsonType>(data.data[0]);
+            StringRef val_data(data.data + 1, data.size - 1);
+
+            auto nav_result = DM::JsonBinaryNavigator::navigatePath(type_code, val_data, dot_path);
+            if (!nav_result.has_value())
+            {
+                null_map_to[row] = 1;
+                writeChar(0, write_buffer);
+                offsets_to[row] = write_buffer.count();
+                continue;
+            }
+
+            // Write the found value as binary JSON into the output buffer
+            const auto & value = nav_result.value();
+            write_buffer.write(reinterpret_cast<const char *>(&value.type), 1);
+            write_buffer.write(value.data.data, value.data.size);
+            writeChar(0, write_buffer);
+            offsets_to[row] = write_buffer.count();
+        }
+        return ColumnNullable::create(std::move(col_to), std::move(col_null_map));
+    }
+
     template <bool is_json_nullable>
     MutableColumnPtr doExecuteForConstPaths(
         const std::unique_ptr<IStringSource> & json_source,

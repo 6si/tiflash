@@ -22,6 +22,8 @@
 #include <Storages/DeltaMerge/DeltaMergeDefines.h>
 #include <Storages/DeltaMerge/File/ColumnCacheLongTerm.h>
 #include <Storages/DeltaMerge/File/DMFileReader.h>
+#include <Storages/DeltaMerge/JsonShredding/JsonShreddedStore.h>
+#include <Storages/DeltaMerge/JsonShredding/JsonShreddingConfig.h>
 #include <Storages/DeltaMerge/ScanContext.h>
 #include <Storages/DeltaMerge/convertColumnTypeHelpers.h>
 #include <Storages/KVStore/Types.h>
@@ -360,6 +362,39 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
     Block res(std::move(columns));
     res.setStartOffset(start_row_offset);
     res.setRSResult(rs_result);
+
+    // JSON shredding read path: if shredded sub-columns exist for any column in this DMFile,
+    // load them into the thread-local context so FunctionJsonExtract can use them.
+    if (JsonShreddingFlag::instance().useShredded())
+    {
+        const String & dmfile_path = dmfile->path();
+        auto & shred_ctx = JsonShreddedBlockContext::instance();
+        shred_ctx.clear();
+
+        for (const auto & cd : read_columns)
+        {
+            // Check global cache first, then disk
+            const ShreddedJsonData * cached = JsonShreddedStore::getCached(dmfile_path, cd.name);
+            if (cached)
+            {
+                shred_ctx.setForCurrentBlock(cd.name, *cached);
+                continue;
+            }
+            // Try loading from disk sidecar
+            if (JsonShreddedStore::hasSidecar(dmfile_path, cd.name))
+            {
+                auto loaded = JsonShreddedStore::readSidecar(dmfile_path, cd.name);
+                if (loaded.has_value())
+                {
+                    JsonShreddedStore::putCache(dmfile_path, cd.name, std::move(loaded.value()));
+                    const ShreddedJsonData * newly_cached = JsonShreddedStore::getCached(dmfile_path, cd.name);
+                    if (newly_cached)
+                        shred_ctx.setForCurrentBlock(cd.name, *newly_cached);
+                }
+            }
+        }
+    }
+
     return res;
 }
 
