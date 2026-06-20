@@ -43,6 +43,7 @@
 #include <Operators/UnorderedSourceOp.h>
 #include <Parsers/makeDummyQuery.h>
 #include <Storages/DeltaMerge/Index/VectorIndex/Stream/Ctx.h>
+#include <Storages/DeltaMerge/JsonShredding/JsonShreddingConfig.h>
 #include <Storages/DeltaMerge/Remote/DisaggSnapshot.h>
 #include <Storages/DeltaMerge/Remote/WNDisaggSnapshotManager.h>
 #include <Storages/DeltaMerge/ScanContext.h>
@@ -618,6 +619,10 @@ void DAGStorageInterpreter::prepare()
     DAGContext & dag_context = *context.getDAGContext();
     auto scan_context
         = std::make_shared<DM::ScanContext>(dag_context.getKeyspaceID(), dag_context.getResourceGroupName());
+    // Capture per-query JSON shredding flag from the global singleton (set by FlashService
+    // on this gRPC thread). This eliminates the race where concurrent queries with different
+    // settings overwrite each other's global flag.
+    scan_context->use_json_shredding = DM::JsonShreddingFlag::instance().useShredded();
     dag_context.scan_context_map[table_scan.getTableScanExecutorID()] = scan_context;
     mvcc_query_info->scan_context = scan_context;
 

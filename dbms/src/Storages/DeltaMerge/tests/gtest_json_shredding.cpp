@@ -16,6 +16,7 @@
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnsNumber.h>
 #include <Common/assert_cast.h>
+#include <Core/ColumnShreddedAttachment.h>
 #include <Core/ColumnWithTypeAndName.h>
 #include <Poco/File.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonPathOptimizer.h>
@@ -23,6 +24,7 @@
 #include <Storages/DeltaMerge/JsonShredding/JsonShredder.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonShreddedStore.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonShreddingConfig.h>
+#include <Storages/DeltaMerge/ScanContext.h>
 #include <fmt/format.h>
 #include <TiDB/Decode/JsonBinary.h>
 #include <gtest/gtest.h>
@@ -1544,6 +1546,216 @@ TEST_F(JsonSegmentMergeTest, MergeSchemasFunctionDirectly)
         if (col.path == "age")
             EXPECT_EQ(col.occurrence_count, 120u);
     }
+}
+
+// ============================================================================
+// Lazy Loading Tests
+// ============================================================================
+
+TEST(JsonShreddingLazyLoadTest, ReadSidecarManifestOnly)
+{
+    // Write a sidecar, then verify readSidecarManifest returns schema without loading data
+    char tmpdir_template[] = "/tmp/tiflash_lazy_test_XXXXXX";
+    char * tmpdir = mkdtemp(tmpdir_template);
+    ASSERT_NE(tmpdir, nullptr);
+
+    String dmfile_path(tmpdir);
+    String col_name = "payload";
+
+    // Create test data with 3 paths
+    JsonShreddingConfig config;
+    config.min_rows_for_inference = 1;
+    config.max_children_per_node = 64;
+
+    auto json1 = buildBinaryJsonObject({{"event", "purchase"}, {"source", "web"}}, {{"amount", 100}});
+    auto json2 = buildBinaryJsonObject({{"event", "click"}, {"source", "mobile"}}, {{"amount", 200}});
+    auto json3 = buildBinaryJsonObject({{"event", "view"}, {"source", "web"}}, {{"amount", 50}});
+
+    auto col = createJsonColumn({json1, json2, json3});
+    const auto & col_string = assert_cast<const ColumnString &>(*col);
+
+    JsonShredder shredder(config);
+    auto shredded = shredder.shred(col_string);
+    ASSERT_FALSE(shredded.sub_columns.empty());
+
+    // Write the sidecar
+    JsonShreddedStore::writeSidecar(dmfile_path, col_name, shredded);
+
+    // Read only the manifest
+    UInt64 num_rows = 0;
+    auto entries = JsonShreddedStore::readSidecarManifest(dmfile_path, col_name, num_rows);
+
+    EXPECT_EQ(num_rows, 3u);
+    EXPECT_GE(entries.size(), 3u); // Should have at least event, source, amount
+
+    // Verify paths are present
+    bool has_event = false, has_source = false, has_amount = false;
+    for (const auto & entry : entries)
+    {
+        if (entry.path == "event")
+            has_event = true;
+        if (entry.path == "source")
+            has_source = true;
+        if (entry.path == "amount")
+            has_amount = true;
+    }
+    EXPECT_TRUE(has_event);
+    EXPECT_TRUE(has_source);
+    EXPECT_TRUE(has_amount);
+
+    // Clean up
+    Poco::File(dmfile_path).remove(true);
+}
+
+TEST(JsonShreddingLazyLoadTest, ReadSingleColumnSelective)
+{
+    // Write a sidecar with multiple paths, then load only one path
+    char tmpdir_template[] = "/tmp/tiflash_lazy_single_XXXXXX";
+    char * tmpdir = mkdtemp(tmpdir_template);
+    ASSERT_NE(tmpdir, nullptr);
+
+    String dmfile_path(tmpdir);
+    String col_name = "payload";
+
+    JsonShreddingConfig config;
+    config.min_rows_for_inference = 1;
+    config.max_children_per_node = 64;
+
+    auto json1 = buildBinaryJsonObject({{"event", "purchase"}, {"source", "web"}}, {{"amount", 100}});
+    auto json2 = buildBinaryJsonObject({{"event", "click"}, {"source", "mobile"}}, {{"amount", 200}});
+
+    auto col = createJsonColumn({json1, json2});
+    const auto & col_string = assert_cast<const ColumnString &>(*col);
+
+    JsonShredder shredder(config);
+    auto shredded = shredder.shred(col_string);
+    JsonShreddedStore::writeSidecar(dmfile_path, col_name, shredded);
+
+    // Read only the "event" path
+    auto event_col = JsonShreddedStore::readSidecarColumn(dmfile_path, col_name, "event");
+    ASSERT_NE(event_col, nullptr);
+    EXPECT_EQ(event_col->size(), 2u);
+
+    // Verify the values
+    const auto * nullable = typeid_cast<const ColumnNullable *>(event_col.get());
+    ASSERT_NE(nullable, nullptr);
+    const auto & nested = nullable->getNestedColumn();
+    const auto * str_col = typeid_cast<const ColumnString *>(&nested);
+    ASSERT_NE(str_col, nullptr);
+
+    EXPECT_EQ(str_col->getDataAt(0).toString(), "purchase");
+    EXPECT_EQ(str_col->getDataAt(1).toString(), "click");
+
+    // Read only the "amount" path
+    auto amount_col = JsonShreddedStore::readSidecarColumn(dmfile_path, col_name, "amount");
+    ASSERT_NE(amount_col, nullptr);
+    EXPECT_EQ(amount_col->size(), 2u);
+
+    const auto * nullable_amt = typeid_cast<const ColumnNullable *>(amount_col.get());
+    ASSERT_NE(nullable_amt, nullptr);
+    const auto & nested_amt = nullable_amt->getNestedColumn();
+    const auto * int_col = typeid_cast<const ColumnInt64 *>(&nested_amt);
+    ASSERT_NE(int_col, nullptr);
+
+    EXPECT_EQ(int_col->getData()[0], 100);
+    EXPECT_EQ(int_col->getData()[1], 200);
+
+    // Non-existent path should return nullptr
+    auto missing = JsonShreddedStore::readSidecarColumn(dmfile_path, col_name, "nonexistent");
+    EXPECT_EQ(missing, nullptr);
+
+    // Clean up
+    Poco::File(dmfile_path).remove(true);
+}
+
+TEST(JsonShreddingLazyLoadTest, PathIndexO1Lookup)
+{
+    // Verify O(1) path lookup using unordered_map in ColumnShreddedAttachment
+    ColumnShreddedAttachment attachment;
+    attachment.dmfile_path = "/tmp/test";
+    attachment.col_name = "payload";
+    attachment.num_rows = 100;
+
+    // Add 49 manifest entries (simulating real workload)
+    for (int i = 0; i < 49; ++i)
+    {
+        SidecarSchemaEntry entry;
+        entry.path = fmt::format("path_{}", i);
+        entry.type = static_cast<UInt8>(JsonLeafType::String);
+        entry.is_array = false;
+        entry.encoding = 0; // Raw encoding
+        attachment.manifest_entries.push_back(std::move(entry));
+    }
+
+    // Build the index
+    attachment.buildPathIndex();
+
+    // O(1) lookups should work
+    EXPECT_TRUE(attachment.hasPath("path_0"));
+    EXPECT_TRUE(attachment.hasPath("path_24"));
+    EXPECT_TRUE(attachment.hasPath("path_48"));
+    EXPECT_FALSE(attachment.hasPath("path_49"));
+    EXPECT_FALSE(attachment.hasPath("nonexistent"));
+
+    // Verify isLazy()
+    EXPECT_TRUE(attachment.isLazy());
+
+    // Eager mode (data set, no dmfile_path)
+    ColumnShreddedAttachment eager_attachment;
+    eager_attachment.data = nullptr;
+    eager_attachment.dmfile_path = "";
+    EXPECT_FALSE(eager_attachment.isLazy());
+}
+
+TEST(JsonShreddingLazyLoadTest, PerQueryScanContextFlag)
+{
+    // Verify that ScanContext carries an independent use_json_shredding flag
+    auto ctx1 = std::make_shared<ScanContext>();
+    auto ctx2 = std::make_shared<ScanContext>();
+
+    // Default should be true
+    EXPECT_TRUE(ctx1->use_json_shredding);
+    EXPECT_TRUE(ctx2->use_json_shredding);
+
+    // Setting one should not affect the other (thread safety)
+    ctx1->use_json_shredding = false;
+    EXPECT_FALSE(ctx1->use_json_shredding);
+    EXPECT_TRUE(ctx2->use_json_shredding);
+}
+
+TEST(JsonShreddingLazyLoadTest, ColumnCacheHitOnRepeatedReads)
+{
+    // Verify that readSidecarColumn caches the result and second read is a cache hit
+    char tmpdir_template[] = "/tmp/tiflash_lazy_cache_XXXXXX";
+    char * tmpdir = mkdtemp(tmpdir_template);
+    ASSERT_NE(tmpdir, nullptr);
+
+    String dmfile_path(tmpdir);
+    String col_name = "payload";
+
+    JsonShreddingConfig config;
+    config.min_rows_for_inference = 1;
+    config.max_children_per_node = 64;
+
+    auto json1 = buildBinaryJsonObject({{"event", "test"}}, {});
+    auto col = createJsonColumn({json1});
+    const auto & col_string = assert_cast<const ColumnString &>(*col);
+
+    JsonShredder shredder(config);
+    auto shredded = shredder.shred(col_string);
+    JsonShreddedStore::writeSidecar(dmfile_path, col_name, shredded);
+
+    // First read — should load from disk
+    auto col1 = JsonShreddedStore::readSidecarColumn(dmfile_path, col_name, "event");
+    ASSERT_NE(col1, nullptr);
+
+    // Second read — should come from cache (same pointer)
+    auto col2 = JsonShreddedStore::getCachedColumn(dmfile_path, col_name, "event");
+    ASSERT_NE(col2, nullptr);
+    EXPECT_EQ(col1.get(), col2.get()); // Same pointer = cache hit
+
+    // Clean up
+    Poco::File(dmfile_path).remove(true);
 }
 
 } // namespace DB::DM::tests

@@ -27,24 +27,62 @@ namespace DB::DM
 
 struct ShreddedJsonData;
 
+/// Schema entry from the sidecar manifest (path + type + encoding info).
+/// Used by lazy loading to know what paths are available without reading column data.
+struct SidecarSchemaEntry
+{
+    String path;
+    UInt8 type;
+    bool is_array;
+    UInt8 encoding;
+};
+
 /// Lightweight attachment that carries shredded JSON sub-column data with a column
 /// through the pipeline. This survives thread handoffs (reader pool → MPP worker pool)
 /// and column renames (PROJECT actions).
 ///
+/// Supports two modes:
+///   - Eager (legacy): `data` is populated with all sub-columns pre-loaded.
+///   - Lazy (preferred): `data` is null, but `dmfile_path`/`col_name`/`manifest_entries`
+///     are set. Individual paths are loaded on-demand via `loadColumn()`.
+///
 /// Lifecycle:
-///   1. DMFileReader loads sidecar data and attaches to the JSON column
+///   1. DMFileReader reads sidecar manifest and attaches to the JSON column
 ///   2. Column flows through pipeline (PROJECT renames, filter, etc.)
-///   3. FunctionJsonExtract checks attachment for pre-computed sub-columns
+///   3. FunctionJsonExtract calls `loadColumn(path)` to read just the needed sub-column
 ///   4. Attachment is reference-counted (shared_ptr) — zero cost when null
 struct ColumnShreddedAttachment
 {
     /// Shared reference to the full sidecar data (cached, covers entire DMFile).
     /// Multiple packs from the same DMFile share this via shared_ptr.
+    /// In lazy mode, this is null — use loadColumn() instead.
     std::shared_ptr<const ShreddedJsonData> data;
 
     /// Row range within the sidecar that corresponds to this block/pack.
     size_t row_offset = 0;
     size_t row_count = 0;
+
+    /// Lazy loading fields: set when data is null (manifest-only mode).
+    String dmfile_path;
+    String col_name;
+    UInt64 num_rows = 0;
+    std::vector<SidecarSchemaEntry> manifest_entries;
+    /// O(1) path lookup index (built from manifest_entries).
+    std::unordered_map<String, size_t> path_index;
+
+    /// Build the O(1) path index from manifest_entries. Call after populating manifest_entries.
+    void buildPathIndex()
+    {
+        path_index.reserve(manifest_entries.size());
+        for (size_t i = 0; i < manifest_entries.size(); ++i)
+            path_index[manifest_entries[i].path] = i;
+    }
+
+    /// O(1) check if a specific path is available in this sidecar.
+    bool hasPath(const String & path) const { return path_index.count(path) > 0; }
+
+    /// Whether this attachment is in lazy mode (manifest loaded, data not loaded).
+    bool isLazy() const { return !data && !dmfile_path.empty(); }
 };
 
 using ColumnShreddedAttachmentPtr = std::shared_ptr<const ColumnShreddedAttachment>;

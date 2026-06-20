@@ -159,6 +159,11 @@ public:
     const String resource_group_name;
     PushDownExecutorPtr pushdown_executor;
 
+    /// Per-query JSON shredding flag. Controls whether this scan uses shredded
+    /// sub-columns (true) or the original blob (false). Thread-safe: each query
+    /// gets its own ScanContext, eliminating the global singleton race condition.
+    bool use_json_shredding = true;
+
     explicit ScanContext(const KeyspaceID & keyspace_id_ = NullspaceID, const String & name = "")
         : keyspace_id(keyspace_id_)
         , resource_group_name(name)

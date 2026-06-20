@@ -452,4 +452,235 @@ void JsonShreddedStore::putCache(const String & dmfile_path, const String & col_
     cache()[cacheKey(dmfile_path, col_name)] = std::move(data);
 }
 
+ColumnPtr JsonShreddedStore::getCachedColumn(const String & dmfile_path, const String & col_name, const String & path)
+{
+    std::lock_guard lock(cacheMutex());
+    auto it = columnCache().find(columnCacheKey(dmfile_path, col_name, path));
+    if (it != columnCache().end())
+        return it->second;
+    return nullptr;
+}
+
+void JsonShreddedStore::putCachedColumn(
+    const String & dmfile_path,
+    const String & col_name,
+    const String & path,
+    ColumnPtr col)
+{
+    std::lock_guard lock(cacheMutex());
+    columnCache()[columnCacheKey(dmfile_path, col_name, path)] = std::move(col);
+}
+
+std::vector<SidecarSchemaEntry> JsonShreddedStore::readSidecarManifest(
+    const String & dmfile_path,
+    const String & col_name,
+    UInt64 & out_num_rows)
+{
+    String dir = sidecarPath(dmfile_path, col_name);
+    String manifest_path = dir + "/manifest.bin";
+
+    if (!Poco::File(manifest_path).exists())
+        return {};
+
+    ReadBufferFromFile manifest_buf(manifest_path);
+    UInt32 magic, version;
+    UInt64 num_rows;
+    UInt32 num_sub_columns;
+
+    readBinary(magic, manifest_buf);
+    readBinary(version, manifest_buf);
+    if (magic != SIDECAR_MAGIC || (version != SIDECAR_VERSION && version != SIDECAR_VERSION_V1))
+        return {};
+
+    readBinary(num_rows, manifest_buf);
+    readBinary(num_sub_columns, manifest_buf);
+    out_num_rows = num_rows;
+
+    std::vector<SidecarSchemaEntry> entries;
+    entries.reserve(num_sub_columns);
+
+    for (UInt32 i = 0; i < num_sub_columns; ++i)
+    {
+        SidecarSchemaEntry entry;
+        UInt8 type_val, is_arr;
+        readBinary(entry.path, manifest_buf);
+        readBinary(type_val, manifest_buf);
+        readBinary(is_arr, manifest_buf);
+        entry.type = type_val;
+        entry.is_array = (is_arr != 0);
+
+        if (version >= SIDECAR_VERSION)
+        {
+            UInt8 enc;
+            readBinary(enc, manifest_buf);
+            entry.encoding = enc;
+        }
+        else
+        {
+            entry.encoding = static_cast<UInt8>(SubColumnEncoding::Raw);
+        }
+        entries.push_back(std::move(entry));
+    }
+
+    return entries;
+}
+
+ColumnPtr JsonShreddedStore::readColumnFile(
+    const String & dir,
+    const String & path,
+    UInt8 type,
+    UInt8 encoding,
+    UInt64 num_rows)
+{
+    String safe_path = sanitizePath(path);
+    String col_file = dir + "/" + safe_path + ".bin";
+
+    if (!Poco::File(col_file).exists())
+        return nullptr;
+
+    ReadBufferFromFile col_buf(col_file);
+
+    UInt64 file_num_rows;
+    readBinary(file_num_rows, col_buf);
+    if (file_num_rows != num_rows)
+        return nullptr;
+
+    // Read null bitmap
+    ColumnUInt8::Container null_map(num_rows);
+    col_buf.readStrict(reinterpret_cast<char *>(null_map.data()), num_rows);
+
+    // Read data based on type + encoding
+    MutableColumnPtr inner;
+    auto leaf_type = static_cast<JsonLeafType>(type);
+    auto col_encoding = static_cast<SubColumnEncoding>(encoding);
+
+    if (col_encoding == SubColumnEncoding::Dictionary)
+    {
+        UInt32 cardinality;
+        readBinary(cardinality, col_buf);
+        std::vector<String> dictionary(cardinality);
+        for (UInt32 d = 0; d < cardinality; ++d)
+            readBinary(dictionary[d], col_buf);
+
+        PaddedPODArray<UInt32> ids(num_rows);
+        col_buf.readStrict(reinterpret_cast<char *>(ids.data()), num_rows * sizeof(UInt32));
+
+        auto col = ColumnString::create();
+        col->reserve(num_rows);
+        for (size_t row = 0; row < num_rows; ++row)
+        {
+            const auto & val = dictionary[ids[row]];
+            col->insertData(val.data(), val.size());
+        }
+        inner = std::move(col);
+    }
+    else
+    {
+        switch (leaf_type)
+        {
+        case JsonLeafType::Int64:
+        {
+            auto col = ColumnInt64::create(num_rows);
+            col_buf.readStrict(reinterpret_cast<char *>(col->getData().data()), num_rows * sizeof(Int64));
+            inner = std::move(col);
+            break;
+        }
+        case JsonLeafType::UInt64:
+        {
+            auto col = ColumnUInt64::create(num_rows);
+            col_buf.readStrict(reinterpret_cast<char *>(col->getData().data()), num_rows * sizeof(UInt64));
+            inner = std::move(col);
+            break;
+        }
+        case JsonLeafType::Float64:
+        {
+            auto col = ColumnFloat64::create(num_rows);
+            col_buf.readStrict(reinterpret_cast<char *>(col->getData().data()), num_rows * sizeof(Float64));
+            inner = std::move(col);
+            break;
+        }
+        case JsonLeafType::Bool:
+        {
+            auto col = ColumnUInt8::create(num_rows);
+            col_buf.readStrict(reinterpret_cast<char *>(col->getData().data()), num_rows * sizeof(UInt8));
+            inner = std::move(col);
+            break;
+        }
+        case JsonLeafType::String:
+        case JsonLeafType::Mixed:
+        case JsonLeafType::Null:
+        {
+            UInt64 num_offsets, num_chars;
+            readBinary(num_offsets, col_buf);
+            auto col = ColumnString::create();
+            col->getOffsets().resize(num_offsets);
+            col_buf.readStrict(
+                reinterpret_cast<char *>(col->getOffsets().data()),
+                num_offsets * sizeof(ColumnString::Offset));
+            readBinary(num_chars, col_buf);
+            col->getChars().resize(num_chars);
+            col_buf.readStrict(reinterpret_cast<char *>(col->getChars().data()), num_chars);
+            inner = std::move(col);
+            break;
+        }
+        }
+    }
+
+    auto null_map_col = ColumnUInt8::create();
+    null_map_col->getData() = std::move(null_map);
+    return ColumnNullable::create(std::move(inner), std::move(null_map_col));
+}
+
+ColumnPtr JsonShreddedStore::readSidecarColumn(
+    const String & dmfile_path,
+    const String & col_name,
+    const String & path)
+{
+    // Check per-column cache first
+    ColumnPtr cached = getCachedColumn(dmfile_path, col_name, path);
+    if (cached)
+        return cached;
+
+    // Read manifest to find the path's type and encoding
+    UInt64 num_rows = 0;
+    auto entries = readSidecarManifest(dmfile_path, col_name, num_rows);
+    if (entries.empty())
+        return nullptr;
+
+    // Find the entry for the requested path
+    const SidecarSchemaEntry * target = nullptr;
+    for (const auto & entry : entries)
+    {
+        if (entry.path == path)
+        {
+            target = &entry;
+            break;
+        }
+    }
+    if (!target)
+        return nullptr;
+
+    String dir = sidecarPath(dmfile_path, col_name);
+    ColumnPtr result = readColumnFile(dir, path, target->type, target->encoding, num_rows);
+
+    if (result)
+    {
+        putCachedColumn(dmfile_path, col_name, path, result);
+
+        static std::atomic<int> lazy_load_log_count{0};
+        if (lazy_load_log_count.fetch_add(1) < 5)
+        {
+            LOG_INFO(
+                log(),
+                "Lazy-loaded single sidecar column: dmfile={} col={} path={} rows={}",
+                dmfile_path,
+                col_name,
+                path,
+                num_rows);
+        }
+    }
+
+    return result;
+}
+
 } // namespace DB::DM

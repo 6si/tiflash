@@ -17,6 +17,7 @@
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnsNumber.h>
+#include <Core/ColumnShreddedAttachment.h>
 #include <Core/Types.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonSchemaTree.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonShredder.h>
@@ -143,8 +144,7 @@ private:
 ///
 /// Sidecar layout on disk:
 ///   {dmfile_path}/.json_shredded/{col_name}/manifest.bin
-///   {dmfile_path}/.json_shredded/{col_name}/{path_name}.null.bin  (null bitmap)
-///   {dmfile_path}/.json_shredded/{col_name}/{path_name}.data.bin  (column data)
+///   {dmfile_path}/.json_shredded/{col_name}/{path_name}.bin  (null bitmap + column data)
 ///
 /// The manifest contains: schema (paths + types), total rows, and pack offsets.
 class JsonShreddedStore
@@ -157,11 +157,27 @@ public:
         const String & col_name,
         const ShreddedJsonData & data);
 
-    /// Read shredded sub-columns from sidecar files.
+    /// Read ALL shredded sub-columns from sidecar files (legacy, used by segment merge).
     /// Returns nullopt if no sidecar exists for this DMFile/column.
     static std::optional<ShreddedJsonData> readSidecar(
         const String & dmfile_path,
         const String & col_name);
+
+    /// Read the manifest only (paths, types, encodings, num_rows) without loading column data.
+    /// Used by DMFileReader to create a lazy attachment that loads columns on demand.
+    /// Returns manifest entries and num_rows. Empty vector if no sidecar exists.
+    static std::vector<SidecarSchemaEntry> readSidecarManifest(
+        const String & dmfile_path,
+        const String & col_name,
+        UInt64 & out_num_rows);
+
+    /// Read a SINGLE sub-column from the sidecar by path name.
+    /// Returns the typed Nullable column for that path, or nullptr if not found.
+    /// This is the key optimization: reads only one .bin file (~1-2MB) instead of all 49 (~89MB).
+    static ColumnPtr readSidecarColumn(
+        const String & dmfile_path,
+        const String & col_name,
+        const String & path);
 
     /// Check if a sidecar exists for a given DMFile and column.
     static bool hasSidecar(const String & dmfile_path, const String & col_name);
@@ -176,6 +192,11 @@ public:
     /// Store data in cache (called after write or first read).
     static void putCache(const String & dmfile_path, const String & col_name, ShreddedJsonData && data);
 
+    /// Per-column cache: caches individual sub-columns loaded on demand.
+    /// Keyed by "{dmfile_path}/{col_name}/{path}".
+    static ColumnPtr getCachedColumn(const String & dmfile_path, const String & col_name, const String & path);
+    static void putCachedColumn(const String & dmfile_path, const String & col_name, const String & path, ColumnPtr col);
+
 private:
     static std::mutex & cacheMutex()
     {
@@ -189,10 +210,29 @@ private:
         return c;
     }
 
+    static std::unordered_map<String, ColumnPtr> & columnCache()
+    {
+        static std::unordered_map<String, ColumnPtr> c;
+        return c;
+    }
+
     static String cacheKey(const String & dmfile_path, const String & col_name)
     {
         return dmfile_path + "/" + col_name;
     }
+
+    static String columnCacheKey(const String & dmfile_path, const String & col_name, const String & path)
+    {
+        return dmfile_path + "/" + col_name + "/" + path;
+    }
+
+    /// Internal: read a single .bin file given the manifest entry.
+    static ColumnPtr readColumnFile(
+        const String & dir,
+        const String & path,
+        UInt8 type,
+        UInt8 encoding,
+        UInt64 num_rows);
 
     static LoggerPtr log()
     {

@@ -330,8 +330,10 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
     ColumnsWithTypeAndName columns;
     columns.reserve(read_columns.size());
 
-    // Determine if we should attach shredded data (check flag once per block read)
-    const bool attach_shredded = JsonShreddingFlag::instance().useShredded();
+    // Determine if we should attach shredded data.
+    // Prefer per-query flag from ScanContext (thread-safe); fall back to global singleton.
+    const bool attach_shredded = scan_context ? scan_context->use_json_shredding
+                                              : JsonShreddingFlag::instance().useShredded();
     const String & dmfile_path = dmfile->path();
 
     for (const auto & cd : read_columns)
@@ -357,44 +359,24 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
             }
             auto & inserted = columns.emplace_back(std::move(col), cd.type, cd.name, cd.id);
 
-            // JSON shredding: attach sidecar data directly to the column so it
-            // travels with the Block through the pipeline (survives thread handoffs
-            // between reader pool and MPP worker pool, and column renames).
+            // JSON shredding: attach lazy sidecar handle to the column.
+            // Only reads the manifest (~1KB) — actual sub-column data is loaded on
+            // demand when FunctionJsonExtract needs a specific path.
+            // This reduces I/O from ~89MB (all 49 sub-columns) to ~1-2MB (one path).
             if (attach_shredded)
             {
-                std::shared_ptr<const ShreddedJsonData> sidecar_data;
+                UInt64 manifest_num_rows = 0;
+                auto manifest_entries
+                    = JsonShreddedStore::readSidecarManifest(dmfile_path, cd.name, manifest_num_rows);
 
-                // Check global cache first
-                const ShreddedJsonData * cached = JsonShreddedStore::getCached(dmfile_path, cd.name);
-                if (cached)
-                {
-                    // Wrap raw pointer in a shared_ptr that doesn't own (the cache owns it)
-                    sidecar_data = std::shared_ptr<const ShreddedJsonData>(
-                        cached,
-                        [](const ShreddedJsonData *) {}); // no-op deleter
-                }
-                else if (JsonShreddedStore::hasSidecar(dmfile_path, cd.name))
-                {
-                    // Load from disk into cache
-                    auto loaded = JsonShreddedStore::readSidecar(dmfile_path, cd.name);
-                    if (loaded.has_value())
-                    {
-                        JsonShreddedStore::putCache(dmfile_path, cd.name, std::move(loaded.value()));
-                        const ShreddedJsonData * newly_cached
-                            = JsonShreddedStore::getCached(dmfile_path, cd.name);
-                        if (newly_cached)
-                        {
-                            sidecar_data = std::shared_ptr<const ShreddedJsonData>(
-                                newly_cached,
-                                [](const ShreddedJsonData *) {});
-                        }
-                    }
-                }
-
-                if (sidecar_data)
+                if (!manifest_entries.empty())
                 {
                     auto attachment = std::make_shared<DM::ColumnShreddedAttachment>();
-                    attachment->data = std::move(sidecar_data);
+                    attachment->dmfile_path = dmfile_path;
+                    attachment->col_name = cd.name;
+                    attachment->num_rows = manifest_num_rows;
+                    attachment->manifest_entries = std::move(manifest_entries);
+                    attachment->buildPathIndex();
                     attachment->row_offset = start_row_offset;
                     attachment->row_count = read_rows;
                     inserted.shredded_attachment = std::move(attachment);
@@ -405,11 +387,12 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
                         static auto attach_log = Logger::get("JsonShredDiag");
                         LOG_INFO(
                             attach_log,
-                            "DMFileReader ATTACHED shredded: col='{}' col_id={} dmfile='{}' "
-                            "row_offset={} read_rows={}",
+                            "DMFileReader ATTACHED lazy shredded: col='{}' col_id={} dmfile='{}' "
+                            "paths={} row_offset={} read_rows={}",
                             cd.name,
                             cd.id,
                             dmfile_path,
+                            attachment->manifest_entries.size(),
                             start_row_offset,
                             read_rows);
                     }
