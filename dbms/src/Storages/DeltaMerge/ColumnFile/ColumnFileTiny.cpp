@@ -22,6 +22,7 @@
 #include <Storages/DeltaMerge/WriteBatchesImpl.h>
 #include <Storages/Page/V3/Universal/UniversalPageStorage.h>
 
+#include <future>
 #include <memory>
 #include <vector>
 
@@ -338,6 +339,11 @@ ColumnFileTinyPtr ColumnFileTiny::writeColumnFile(
     return std::make_shared<ColumnFileTiny>(schema, limit, bytes, page_id, dm_context);
 }
 
+/// Threshold for parallel column serialization: only parallelize when total block
+/// data exceeds this size AND there are multiple columns to serialize.
+static constexpr size_t PARALLEL_SERIALIZE_BYTES_THRESHOLD = 4 * 1024 * 1024; // 4 MB
+static constexpr size_t PARALLEL_SERIALIZE_MIN_COLUMNS = 3;
+
 PageIdU64 ColumnFileTiny::writeColumnFileData(
     const DMContext & dm_context,
     const Block & block,
@@ -346,28 +352,88 @@ PageIdU64 ColumnFileTiny::writeColumnFileData(
     WriteBatches & wbs)
 {
     auto page_id = dm_context.storage_pool->newLogPageId();
+    auto compression_method = dm_context.global_context.getSettingsRef().dt_compression_method;
+    auto compression_level = dm_context.global_context.getSettingsRef().dt_compression_level;
+    size_t num_columns = block.columns();
+    size_t block_bytes = block.bytes(offset, limit);
 
     MemoryWriteBuffer write_buf;
     PageFieldSizes col_data_sizes;
-    for (const auto & col : block)
+
+    bool use_parallel = num_columns >= PARALLEL_SERIALIZE_MIN_COLUMNS
+        && block_bytes >= PARALLEL_SERIALIZE_BYTES_THRESHOLD;
+
+    if (use_parallel)
     {
-        auto last_buf_size = write_buf.count();
-        serializeColumn(
-            write_buf,
-            *col.column,
-            col.type,
-            offset,
-            limit,
-            dm_context.global_context.getSettingsRef().dt_compression_method,
-            dm_context.global_context.getSettingsRef().dt_compression_level);
-        size_t serialized_size = write_buf.count() - last_buf_size;
-        RUNTIME_CHECK_MSG(
-            serialized_size != 0,
-            "try to persist a block with empty column, colname={} colid={} block={}",
-            col.name,
-            col.column_id,
-            block.dumpJsonStructure());
-        col_data_sizes.push_back(serialized_size);
+        // Parallel serialization: each column gets its own buffer + compression
+        struct ColData
+        {
+            String data;
+            size_t col_idx;
+        };
+
+        std::vector<std::future<ColData>> futures;
+        futures.reserve(num_columns);
+
+        for (size_t i = 0; i < num_columns; ++i)
+        {
+            const auto & col = block.getByPosition(i);
+            futures.push_back(std::async(
+                std::launch::async,
+                [&col, offset, limit, compression_method, compression_level, i]() -> ColData {
+                    MemoryWriteBuffer col_buf;
+                    serializeColumn(
+                        col_buf,
+                        *col.column,
+                        col.type,
+                        offset,
+                        limit,
+                        compression_method,
+                        compression_level);
+                    auto read_buf = col_buf.tryGetReadBuffer();
+                    String result(col_buf.count(), '\0');
+                    read_buf->readStrict(result.data(), result.size());
+                    return ColData{std::move(result), i};
+                }));
+        }
+
+        // Collect results in order and assemble into final buffer
+        for (size_t i = 0; i < num_columns; ++i)
+        {
+            auto col_data = futures[i].get();
+            RUNTIME_CHECK_MSG(
+                !col_data.data.empty(),
+                "try to persist a block with empty column, colname={} colid={} block={}",
+                block.getByPosition(i).name,
+                block.getByPosition(i).column_id,
+                block.dumpJsonStructure());
+            write_buf.write(col_data.data.data(), col_data.data.size());
+            col_data_sizes.push_back(col_data.data.size());
+        }
+    }
+    else
+    {
+        // Sequential serialization (original path for small blocks)
+        for (const auto & col : block)
+        {
+            auto last_buf_size = write_buf.count();
+            serializeColumn(
+                write_buf,
+                *col.column,
+                col.type,
+                offset,
+                limit,
+                compression_method,
+                compression_level);
+            size_t serialized_size = write_buf.count() - last_buf_size;
+            RUNTIME_CHECK_MSG(
+                serialized_size != 0,
+                "try to persist a block with empty column, colname={} colid={} block={}",
+                col.name,
+                col.column_id,
+                block.dumpJsonStructure());
+            col_data_sizes.push_back(serialized_size);
+        }
     }
 
     auto data_size = write_buf.count();
