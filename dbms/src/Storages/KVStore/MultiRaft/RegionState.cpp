@@ -132,6 +132,12 @@ bool computeMappedTableID(const DecodedTiKVKey & key, TableID & table_id)
         table_id = RecordKVFormat::getTableId(k);
         return true;
     }
+    // t table_id  (sentinel/boundary region key without _r suffix)
+    if (k.size() >= (1 + 8) && k[0] == RecordKVFormat::TABLE_PREFIX)
+    {
+        table_id = RecordKVFormat::getTableId(k);
+        return true;
+    }
 
     return false;
 }
