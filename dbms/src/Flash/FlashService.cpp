@@ -507,14 +507,11 @@ grpc::Status FlashService::DispatchMPPTask(
     const auto & resource_group = task_meta.resource_group_name();
     LOG_INFO(
         log,
-        "Handling mpp dispatch request, task: {}, resource_group: {}, conn_id: {}, conn_alias: {}, "
-        "sql_digest: {}, plan_digest: {}",
+        "Handling mpp dispatch request, task: {}, resource_group: {}, conn_id: {}, conn_alias: {}",
         MPPTaskId(task_meta).toString(),
         resource_group,
         task_meta.connection_id(),
-        task_meta.connection_alias(),
-        task_meta.sql_digest(),
-        task_meta.plan_digest());
+        task_meta.connection_alias());
     auto check_result = checkGrpcContext(grpc_context);
     if (!check_result.ok())
         return check_result;
