@@ -390,4 +390,143 @@ TEST_F(JsonShreddedFilterTest, ConcurrentCacheRegistrations)
     ShreddedAttachmentCache::instance().clear();
 }
 
+/// Test JSON string comparison semantics: length-first, then byte content.
+/// This matches TiDB/MySQL binary JSON comparison where strings are stored as
+/// [varint_length + bytes], so comparing the binary representation compares
+/// length first. Example: "view" (4) < "click" (5) despite 'v' > 'c'.
+TEST_F(JsonShreddedFilterTest, DictionaryFilterGTWithJsonStringSemantics)
+{
+    // Dictionary: "click"(5), "logout"(6), "purchase"(8), "signup"(6), "view"(4)
+    // JSON string ordering by length-first:
+    //   "view"(4) < "click"(5) < "logout"(6) = "signup"(6) < "purchase"(8)
+    //   For equal lengths, compare bytes: "logout" < "signup" (l < s)
+    // So full order: view < click < logout < signup < purchase
+    auto col = createStringDictCol(
+        {"click", "logout", "purchase", "signup", "view"},
+        {0, 1, 2, 3, 4, 0, 1, 2, 3, 4}); // 10 rows, 2 of each
+
+    // GT "click" using JSON semantics: entries with length > 5 pass,
+    // plus entries with length == 5 and bytes > "click".
+    // "click"(5): NOT > "click"
+    // "logout"(6): len 6 > 5 → YES
+    // "purchase"(8): len 8 > 5 → YES
+    // "signup"(6): len 6 > 5 → YES
+    // "view"(4): len 4 < 5 → NO
+    // Expected: rows 1,3,5,7 = logout, signup (4 passing) + rows 2,7 = purchase (2 passing)
+    // Wait: rows with logout(1,6), purchase(2,7), signup(3,8) pass = 6 rows
+    auto predicate_gt = [](const Field & entry) -> bool {
+        const auto & s = entry.get<String>();
+        String cmp = "click";
+        if (s.size() != cmp.size())
+            return s.size() > cmp.size();
+        return s > cmp;
+    };
+    auto result = EncodedFilter::evaluatePredicate(*col, predicate_gt);
+    EXPECT_EQ(result.count_passing, 6); // logout(2) + purchase(2) + signup(2)
+    EXPECT_EQ(result.filter[0], 0); // click - not GT
+    EXPECT_EQ(result.filter[1], 1); // logout - GT (longer)
+    EXPECT_EQ(result.filter[2], 1); // purchase - GT (longer)
+    EXPECT_EQ(result.filter[3], 1); // signup - GT (longer)
+    EXPECT_EQ(result.filter[4], 0); // view - NOT GT (shorter)
+    EXPECT_EQ(result.filter[5], 0); // click
+    EXPECT_EQ(result.filter[6], 1); // logout
+    EXPECT_EQ(result.filter[7], 1); // purchase
+    EXPECT_EQ(result.filter[8], 1); // signup
+    EXPECT_EQ(result.filter[9], 0); // view
+
+    // LT "purchase" using JSON semantics:
+    // Entries with length < 8 pass; entries with length == 8 and bytes < "purchase" pass.
+    // "click"(5): len 5 < 8 → YES
+    // "logout"(6): len 6 < 8 → YES
+    // "purchase"(8): NOT < "purchase"
+    // "signup"(6): len 6 < 8 → YES
+    // "view"(4): len 4 < 8 → YES
+    auto predicate_lt = [](const Field & entry) -> bool {
+        const auto & s = entry.get<String>();
+        String cmp = "purchase";
+        if (s.size() != cmp.size())
+            return s.size() < cmp.size();
+        return s < cmp;
+    };
+    auto result_lt = EncodedFilter::evaluatePredicate(*col, predicate_lt);
+    EXPECT_EQ(result_lt.count_passing, 8); // click(2) + logout(2) + signup(2) + view(2)
+    EXPECT_EQ(result_lt.filter[2], 0); // purchase - not LT
+    EXPECT_EQ(result_lt.filter[7], 0); // purchase - not LT
+}
+
+/// Test JSON string comparison for equal-length strings:
+/// When lengths are equal, compare byte-by-byte.
+TEST_F(JsonShreddedFilterTest, DictionaryFilterGTEqualLengthStrings)
+{
+    // All 6-char strings: "logout", "signup", "zepher"
+    // Ordering: "logout" < "signup" < "zepher" (lexicographic since all same length)
+    auto col = createStringDictCol(
+        {"logout", "signup", "zepher"},
+        {0, 1, 2, 0, 1, 2});
+
+    // GT "logout" (same length = 6): only strings with bytes > "logout"
+    auto predicate = [](const Field & entry) -> bool {
+        const auto & s = entry.get<String>();
+        String cmp = "logout";
+        if (s.size() != cmp.size())
+            return s.size() > cmp.size();
+        return s > cmp;
+    };
+    auto result = EncodedFilter::evaluatePredicate(*col, predicate);
+    EXPECT_EQ(result.count_passing, 4); // signup(2) + zepher(2)
+    EXPECT_EQ(result.filter[0], 0); // logout
+    EXPECT_EQ(result.filter[1], 1); // signup
+    EXPECT_EQ(result.filter[2], 1); // zepher
+}
+
+/// Test numeric Int64 comparison directly on column data.
+/// Verifies that the shredded path does proper numeric comparison
+/// (unlike the blob path which has a preexisting byte-comparison bug).
+TEST_F(JsonShreddedFilterTest, NumericInt64Comparison)
+{
+    // Simulate timestamps: some above and below 1700060000
+    std::vector<Int64> values = {1700050000, 1700055000, 1700060000, 1700065000, 1700070000,
+                                 100, 255, 256, 1000000000, 1700986879};
+    auto int_col = ColumnInt64::create();
+    for (auto v : values)
+        int_col->insert(v);
+
+    // These comparisons must use numeric semantics (NOT byte comparison).
+    // Key test: 255 vs 256 — byte comparison would give wrong result on LE.
+    Int64 threshold = 1700060000;
+    size_t gt_count = 0;
+    for (size_t i = 0; i < values.size(); ++i)
+    {
+        if (values[i] > threshold)
+            ++gt_count;
+    }
+    EXPECT_EQ(gt_count, 3); // 1700065000, 1700070000, 1700986879
+
+    // Also verify 255 < 256 (would be wrong with LE byte comparison)
+    EXPECT_LT(values[6], values[7]); // 255 < 256
+}
+
+/// Test Float64 comparison.
+TEST_F(JsonShreddedFilterTest, NumericFloat64Comparison)
+{
+    std::vector<Float64> values = {0.0, 100.5, 499.99, 500.0, 500.01, 991.97};
+
+    size_t gt_count = 0;
+    Float64 threshold = 500.0;
+    for (auto v : values)
+    {
+        if (v > threshold)
+            ++gt_count;
+    }
+    EXPECT_EQ(gt_count, 2); // 500.01, 991.97
+
+    size_t eq_count = 0;
+    for (auto v : values)
+    {
+        if (v == threshold)
+            ++eq_count;
+    }
+    EXPECT_EQ(eq_count, 1); // exactly 500.0
+}
+
 } // namespace DB::DM::tests

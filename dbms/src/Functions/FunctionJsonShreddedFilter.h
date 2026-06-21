@@ -227,6 +227,22 @@ public:
             return;
         }
 
+        // Float64 comparison
+        if (const auto * float_col = typeid_cast<const ColumnFloat64 *>(&sub_nested))
+        {
+            block.getByPosition(result).column
+                = applyFloat64Filter(*float_col, sub_null_map, op, compare_value, rows);
+            return;
+        }
+
+        // UInt64 comparison
+        if (const auto * uint_col = typeid_cast<const ColumnUInt64 *>(&sub_nested))
+        {
+            block.getByPosition(result).column
+                = applyUInt64Filter(*uint_col, sub_null_map, op, compare_value, rows);
+            return;
+        }
+
         // Unsupported type — fall back
         setAllNull(block, result, rows);
     }
@@ -237,6 +253,23 @@ private:
         auto data_col = ColumnUInt8::create(rows, 0);
         auto null_map = ColumnUInt8::create(rows, 1);
         block.getByPosition(result).column = ColumnNullable::create(std::move(data_col), std::move(null_map));
+    }
+
+    /// Compare two strings using JSON string comparison semantics.
+    /// In binary JSON, strings are stored as [varint_length, bytes...].
+    /// Comparing binary representations means length is compared first.
+    static int jsonStringCompare(const String & a, const String & b)
+    {
+        if (a.size() != b.size())
+            return a.size() < b.size() ? -1 : 1;
+        return a.compare(b);
+    }
+
+    static int jsonStringCompare(StringRef a, const String & b)
+    {
+        if (a.size != b.size())
+            return a.size < b.size() ? -1 : 1;
+        return memcmp(a.data, b.data(), a.size);
     }
 
     static String decodeBinaryJsonToString(const String & binary_json)
@@ -281,11 +314,17 @@ private:
             memcpy(&val, binary_json.data() + 1, sizeof(Int64));
             return std::to_string(val);
         }
+        else if (type_code == JsonBinary::TYPE_CODE_UINT64 && binary_json.size() >= 9)
+        {
+            UInt64 val;
+            memcpy(&val, binary_json.data() + 1, sizeof(UInt64));
+            return std::to_string(val);
+        }
         else if (type_code == JsonBinary::TYPE_CODE_FLOAT64 && binary_json.size() >= 9)
         {
             Float64 val;
             memcpy(&val, binary_json.data() + 1, sizeof(Float64));
-            return std::to_string(val);
+            return fmt::format("{:.17g}", val);
         }
 
         // Return raw bytes as fallback
@@ -345,6 +384,30 @@ private:
                 data[i] = fr.filter[i];
             }
         }
+        else if (op == "gt" || op == "ge" || op == "lt" || op == "le")
+        {
+            auto predicate = [&](const Field & entry) -> bool {
+                const auto & entry_str = entry.get<String>();
+                int cmp = jsonStringCompare(entry_str, compare_value);
+                if (op == "gt")
+                    return cmp > 0;
+                if (op == "ge")
+                    return cmp >= 0;
+                if (op == "lt")
+                    return cmp < 0;
+                return cmp <= 0; // le
+            };
+            auto fr = DM::EncodedFilter::evaluatePredicate(dict_col, predicate);
+            for (size_t i = 0; i < rows; ++i)
+            {
+                if (null_map[i])
+                {
+                    nulls[i] = 1;
+                    continue;
+                }
+                data[i] = fr.filter[i];
+            }
+        }
         else
         {
             // Unknown op — all null
@@ -382,6 +445,14 @@ private:
                 data[i] = (row_val == compare_ref) ? 1 : 0;
             else if (op == "ne")
                 data[i] = (row_val != compare_ref) ? 1 : 0;
+            else if (op == "gt")
+                data[i] = (jsonStringCompare(row_val, compare_value) > 0) ? 1 : 0;
+            else if (op == "ge")
+                data[i] = (jsonStringCompare(row_val, compare_value) >= 0) ? 1 : 0;
+            else if (op == "lt")
+                data[i] = (jsonStringCompare(row_val, compare_value) < 0) ? 1 : 0;
+            else if (op == "le")
+                data[i] = (jsonStringCompare(row_val, compare_value) <= 0) ? 1 : 0;
             else if (op == "like")
                 data[i] = DM::EncodedFilter::matchLike(
                               String(row_val.data, row_val.size),
@@ -440,6 +511,110 @@ private:
                 data[i] = (int_data[i] > cmp_val) ? 1 : 0;
             else if (op == "ge")
                 data[i] = (int_data[i] >= cmp_val) ? 1 : 0;
+            else
+                nulls[i] = 1;
+        }
+
+        return ColumnNullable::create(std::move(result_data), std::move(result_null));
+    }
+
+    static ColumnPtr applyFloat64Filter(
+        const ColumnFloat64 & float_col,
+        const ColumnUInt8::Container & null_map,
+        const String & op,
+        const String & compare_value,
+        size_t rows)
+    {
+        auto result_data = ColumnUInt8::create(rows, 0);
+        auto result_null = ColumnUInt8::create(rows, 0);
+        auto & data = result_data->getData();
+        auto & nulls = result_null->getData();
+
+        Float64 cmp_val = 0;
+        try
+        {
+            cmp_val = std::stod(compare_value);
+        }
+        catch (...)
+        {
+            for (size_t i = 0; i < rows; ++i)
+                nulls[i] = 1;
+            return ColumnNullable::create(std::move(result_data), std::move(result_null));
+        }
+
+        const auto & float_data = float_col.getData();
+        for (size_t i = 0; i < rows; ++i)
+        {
+            if (null_map[i])
+            {
+                nulls[i] = 1;
+                continue;
+            }
+
+            if (op == "eq")
+                data[i] = (float_data[i] == cmp_val) ? 1 : 0;
+            else if (op == "ne")
+                data[i] = (float_data[i] != cmp_val) ? 1 : 0;
+            else if (op == "lt")
+                data[i] = (float_data[i] < cmp_val) ? 1 : 0;
+            else if (op == "le")
+                data[i] = (float_data[i] <= cmp_val) ? 1 : 0;
+            else if (op == "gt")
+                data[i] = (float_data[i] > cmp_val) ? 1 : 0;
+            else if (op == "ge")
+                data[i] = (float_data[i] >= cmp_val) ? 1 : 0;
+            else
+                nulls[i] = 1;
+        }
+
+        return ColumnNullable::create(std::move(result_data), std::move(result_null));
+    }
+
+    static ColumnPtr applyUInt64Filter(
+        const ColumnUInt64 & uint_col,
+        const ColumnUInt8::Container & null_map,
+        const String & op,
+        const String & compare_value,
+        size_t rows)
+    {
+        auto result_data = ColumnUInt8::create(rows, 0);
+        auto result_null = ColumnUInt8::create(rows, 0);
+        auto & data = result_data->getData();
+        auto & nulls = result_null->getData();
+
+        UInt64 cmp_val = 0;
+        try
+        {
+            cmp_val = std::stoull(compare_value);
+        }
+        catch (...)
+        {
+            for (size_t i = 0; i < rows; ++i)
+                nulls[i] = 1;
+            return ColumnNullable::create(std::move(result_data), std::move(result_null));
+        }
+
+        const auto & uint_data = uint_col.getData();
+        for (size_t i = 0; i < rows; ++i)
+        {
+            if (null_map[i])
+            {
+                nulls[i] = 1;
+                continue;
+            }
+
+            if (op == "eq")
+                data[i] = (uint_data[i] == cmp_val) ? 1 : 0;
+            else if (op == "ne")
+                data[i] = (uint_data[i] != cmp_val) ? 1 : 0;
+            else if (op == "lt")
+                data[i] = (uint_data[i] < cmp_val) ? 1 : 0;
+            else if (op == "le")
+                data[i] = (uint_data[i] <= cmp_val) ? 1 : 0;
+            else if (op == "gt")
+                data[i] = (uint_data[i] > cmp_val) ? 1 : 0;
+            else if (op == "ge")
+                data[i] = (uint_data[i] >= cmp_val) ? 1 : 0;
             else
                 nulls[i] = 1;
         }
