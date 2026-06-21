@@ -332,9 +332,12 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
     columns.reserve(read_columns.size());
 
     // Determine if we should attach shredded data.
+    // Never use blob-skip for Internal reads (compaction, delta-merge) — the real blob
+    // data is needed to write the new DMFile and re-shred sidecars.
     // Prefer per-query flag from ScanContext (thread-safe); fall back to global singleton.
-    const bool attach_shredded = scan_context ? scan_context->use_json_shredding
-                                              : JsonShreddingFlag::instance().useShredded();
+    const bool attach_shredded = read_tag != ReadTag::Internal
+        && (scan_context ? scan_context->use_json_shredding
+                         : JsonShreddingFlag::instance().useShredded());
     const String & dmfile_path = dmfile->path();
 
     for (const auto & cd : read_columns)

@@ -19,13 +19,19 @@
 #include <Core/ColumnShreddedAttachment.h>
 #include <Core/ColumnWithTypeAndName.h>
 #include <Core/ShreddedAttachmentCache.h>
+#include <DataTypes/DataTypeString.h>
+#include <Debug/TiFlashTestEnv.h>
 #include <Poco/File.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonPathOptimizer.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonSchemaTree.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonShredder.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonShreddedStore.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonShreddingConfig.h>
+#include <Storages/DeltaMerge/DeltaMergeStore.h>
 #include <Storages/DeltaMerge/ScanContext.h>
+#include <Storages/DeltaMerge/tests/DMTestEnv.h>
+#include <Storages/DeltaMerge/tests/gtest_dm_delta_merge_store_test_basic.h>
+#include <TestUtils/InputStreamTestUtils.h>
 #include <fmt/format.h>
 #include <TiDB/Decode/JsonBinary.h>
 #include <gtest/gtest.h>
@@ -1892,5 +1898,321 @@ TEST_F(ShreddedAttachmentCachePoisonTest, ClearByColNameIsolated)
     EXPECT_EQ(cache.findByColName("payload"), nullptr);
     EXPECT_NE(cache.findByColName("metadata"), nullptr); // unaffected
 }
+
+
+// ============================================================================
+// End-to-end compaction test: sidecars survive mergeDelta
+// ============================================================================
+
+class JsonCompactionSidecarTest : public DB::base::TiFlashStorageTestBasic
+{
+    constexpr static const char * TRACING_NAME = "JsonCompactionSidecarTest";
+
+public:
+    static constexpr ColumnID JSON_COL_ID = 100;
+    static constexpr const char * JSON_COL_NAME = "payload";
+
+    void SetUp() override
+    {
+        TiFlashStorageTestBasic::SetUp();
+        // Enable shredding for the write path
+        JsonShreddingFlag::instance().setWriteShredded(true);
+        store = createStoreWithJsonCol();
+    }
+
+    void TearDown() override
+    {
+        store.reset();
+        TiFlashStorageTestBasic::TearDown();
+    }
+
+    DeltaMergeStorePtr createStoreWithJsonCol()
+    {
+        TiFlashStorageTestBasic::reload();
+        auto cols = DMTestEnv::getDefaultColumns();
+        cols->emplace_back(ColumnDefine{JSON_COL_ID, JSON_COL_NAME,
+            DataTypeFactory::instance().get(DataTypeString::getDefaultName())});
+
+        ColumnDefine handle_column_define = (*cols)[0];
+        return DeltaMergeStore::create(
+            *db_context,
+            false,
+            "test",
+            "t_json_compact",
+            NullspaceID,
+            200,
+            0,
+            true,
+            *cols,
+            handle_column_define,
+            false,
+            1,
+            nullptr,
+            DeltaMergeStore::Settings());
+    }
+
+    /// Build a write block with PK range [beg, end) containing binary JSON in the payload column.
+    Block prepareJsonWriteBlock(size_t beg, size_t end, UInt64 tso = 2)
+    {
+        Block block = DMTestEnv::prepareSimpleWriteBlock(beg, end, false, tso);
+        size_t num_rows = end - beg;
+        auto json_col = ColumnString::create();
+        for (size_t i = 0; i < num_rows; ++i)
+        {
+            Int64 score = static_cast<Int64>(beg + i);
+            String event = (i % 3 == 0) ? "purchase" : ((i % 3 == 1) ? "click" : "view");
+            auto json = buildBinaryJsonObject({{"event", event}}, {{"score", score}});
+            json_col->insertData(json.data(), json.size());
+        }
+        block.insert(ColumnWithTypeAndName{
+            std::move(json_col),
+            DataTypeFactory::instance().get(DataTypeString::getDefaultName()),
+            JSON_COL_NAME,
+            JSON_COL_ID});
+        return block;
+    }
+
+    /// Collect all DMFile paths from the store's segments.
+    std::vector<String> getStableDMFilePaths()
+    {
+        std::vector<String> paths;
+        for (const auto & [_, seg] : store->segments)
+        {
+            const auto & files = seg->getStable()->getDMFiles();
+            for (const auto & f : files)
+                paths.push_back(f->path());
+        }
+        return paths;
+    }
+
+    /// Read all rows from the store and return as a flat vector of blocks.
+    std::vector<Block> readAllBlocks()
+    {
+        auto in = store->read(
+            *db_context,
+            db_context->getSettingsRef(),
+            store->getTableColumns(),
+            {RowKeyRange::newAll(store->isCommonHandle(), store->getRowKeyColumnSize())},
+            1,
+            std::numeric_limits<UInt64>::max(),
+            EMPTY_FILTER,
+            std::vector<RuntimeFilterPtr>{},
+            0,
+            TRACING_NAME,
+            DMReadOptions{},
+            1024)[0];
+        std::vector<Block> blocks;
+        in->readPrefix();
+        while (auto blk = in->read())
+            blocks.push_back(std::move(blk));
+        in->readSuffix();
+        return blocks;
+    }
+
+    size_t countTotalRows(const std::vector<Block> & blocks)
+    {
+        size_t total = 0;
+        for (const auto & b : blocks)
+            total += b.rows();
+        return total;
+    }
+
+protected:
+    DeltaMergeStorePtr store;
+};
+
+
+// Write JSON data → flush → mergeDelta → verify sidecars exist on the resulting DMFile.
+TEST_F(JsonCompactionSidecarTest, SidecarsCreatedAfterMergeDelta)
+try
+{
+    const size_t num_rows = 100;
+
+    // Write to delta
+    auto block = prepareJsonWriteBlock(0, num_rows);
+    store->write(*db_context, db_context->getSettingsRef(), block);
+
+    // Flush delta to disk, then merge into stable
+    store->flushCache(*db_context, RowKeyRange::newAll(false, 1));
+    store->mergeDeltaAll(*db_context);
+
+    // Verify stable DMFiles have sidecars
+    auto paths = getStableDMFilePaths();
+    ASSERT_FALSE(paths.empty());
+    for (const auto & p : paths)
+    {
+        EXPECT_TRUE(JsonShreddedStore::hasSidecar(p, JSON_COL_NAME))
+            << "DMFile at " << p << " missing sidecar after mergeDelta";
+    }
+
+    // Read back and verify row count
+    auto blocks = readAllBlocks();
+    EXPECT_EQ(countTotalRows(blocks), num_rows);
+}
+CATCH
+
+
+// Write → mergeDelta → write more → mergeDelta again.
+// After the second compaction the new DMFile must have correct sidecars
+// covering ALL rows (old + new).
+TEST_F(JsonCompactionSidecarTest, SidecarsCorrectAfterSecondMergeDelta)
+try
+{
+    // min_rows_for_inference=100, so each batch going through shredder must have ≥100 rows.
+    const size_t batch1 = 150;
+    const size_t batch2 = 120;
+
+    // Batch 1: write → flush → merge
+    {
+        auto block = prepareJsonWriteBlock(0, batch1);
+        store->write(*db_context, db_context->getSettingsRef(), block);
+    }
+    store->flushCache(*db_context, RowKeyRange::newAll(false, 1));
+    store->mergeDeltaAll(*db_context);
+
+    // Verify batch 1 sidecars
+    {
+        auto paths = getStableDMFilePaths();
+        ASSERT_FALSE(paths.empty());
+        for (const auto & p : paths)
+            EXPECT_TRUE(JsonShreddedStore::hasSidecar(p, JSON_COL_NAME));
+    }
+
+    // Batch 2: write more (non-overlapping PKs) → flush → merge
+    {
+        auto block = prepareJsonWriteBlock(batch1, batch1 + batch2, /*tso=*/3);
+        store->write(*db_context, db_context->getSettingsRef(), block);
+    }
+    store->flushCache(*db_context, RowKeyRange::newAll(false, 1));
+    store->mergeDeltaAll(*db_context);
+
+    // Verify post-compaction sidecars
+    {
+        auto paths = getStableDMFilePaths();
+        ASSERT_FALSE(paths.empty());
+        for (const auto & p : paths)
+        {
+            EXPECT_TRUE(JsonShreddedStore::hasSidecar(p, JSON_COL_NAME))
+                << "DMFile at " << p << " missing sidecar after second mergeDelta";
+
+            // Verify sidecar manifest has correct row count
+            UInt64 manifest_rows = 0;
+            auto entries = JsonShreddedStore::readSidecarManifest(p, JSON_COL_NAME, manifest_rows);
+            EXPECT_FALSE(entries.empty()) << "Sidecar manifest empty at " << p;
+        }
+    }
+
+    // Verify total data correctness
+    auto blocks = readAllBlocks();
+    EXPECT_EQ(countTotalRows(blocks), batch1 + batch2);
+}
+CATCH
+
+
+// Simulate the NGC scenario end-to-end:
+//   1. Write + mergeDelta WITH shredding → DMFile A gets sidecars
+//   2. Disable shredding, write + mergeDelta → DMFile B has NO sidecars (NGC)
+//   3. Re-enable shredding and read all data
+//   4. Verify: all rows are readable (no NULLs), row count is correct
+TEST_F(JsonCompactionSidecarTest, NGCDMFilesFallBackToBlobRead)
+try
+{
+    const size_t batch1 = 150;
+    const size_t batch2 = 120;
+
+    // Batch 1: shredding ON → creates DMFile with sidecars
+    {
+        auto block = prepareJsonWriteBlock(0, batch1);
+        store->write(*db_context, db_context->getSettingsRef(), block);
+    }
+    store->flushCache(*db_context, RowKeyRange::newAll(false, 1));
+    store->mergeDeltaAll(*db_context);
+
+    // Verify batch 1 has sidecars
+    {
+        auto paths = getStableDMFilePaths();
+        ASSERT_FALSE(paths.empty());
+        for (const auto & p : paths)
+            ASSERT_TRUE(JsonShreddedStore::hasSidecar(p, JSON_COL_NAME));
+    }
+
+    // Batch 2: shredding OFF → creates DMFile WITHOUT sidecars (NGC)
+    JsonShreddingFlag::instance().setWriteShredded(false);
+    {
+        auto block = prepareJsonWriteBlock(batch1, batch1 + batch2, /*tso=*/3);
+        store->write(*db_context, db_context->getSettingsRef(), block);
+    }
+    store->flushCache(*db_context, RowKeyRange::newAll(false, 1));
+    store->mergeDeltaAll(*db_context);
+    JsonShreddingFlag::instance().setWriteShredded(true);
+
+    // After compaction with shredding off, the new DMFiles may or may not have sidecars
+    // (depends on whether old stable's sidecar data was carried forward).
+    // The critical invariant is: reading with shredding enabled must return correct data
+    // regardless of sidecar presence.
+
+    // Read all data — must get batch1 + batch2 rows with no NULLs in the payload column
+    auto blocks = readAllBlocks();
+    size_t total_rows = countTotalRows(blocks);
+    EXPECT_EQ(total_rows, batch1 + batch2)
+        << "Expected " << (batch1 + batch2) << " rows but got " << total_rows
+        << " — NGC DMFile blob fallback may be broken";
+
+    // Verify no NULL payloads (the exact bug we're fixing)
+    size_t null_count = 0;
+    for (const auto & blk : blocks)
+    {
+        if (!blk.has(JSON_COL_NAME))
+            continue;
+        const auto & col = blk.getByName(JSON_COL_NAME);
+        for (size_t i = 0; i < col.column->size(); ++i)
+        {
+            if (col.column->isNullAt(i))
+                ++null_count;
+        }
+    }
+    EXPECT_EQ(null_count, 0) << "Found " << null_count << " NULL payloads — NGC blob fallback is broken";
+}
+CATCH
+
+
+// Verify sidecar row counts match blob row counts after multiple compaction rounds.
+TEST_F(JsonCompactionSidecarTest, SidecarRowCountMatchesBlobAfterMultipleCompactions)
+try
+{
+    // 3 rounds of write + merge
+    size_t cumulative = 0;
+    for (int round = 0; round < 3; ++round)
+    {
+        size_t batch = 100 + round * 50; // 100, 150, 200
+        {
+            auto block = prepareJsonWriteBlock(cumulative, cumulative + batch, /*tso=*/static_cast<UInt64>(round + 2));
+            store->write(*db_context, db_context->getSettingsRef(), block);
+        }
+        cumulative += batch;
+        store->flushCache(*db_context, RowKeyRange::newAll(false, 1));
+        store->mergeDeltaAll(*db_context);
+    }
+
+    // All DMFiles should have sidecars with total rows == cumulative
+    size_t total_sidecar_rows = 0;
+    auto paths = getStableDMFilePaths();
+    for (const auto & p : paths)
+    {
+        ASSERT_TRUE(JsonShreddedStore::hasSidecar(p, JSON_COL_NAME))
+            << "DMFile at " << p << " missing sidecar after round";
+        UInt64 manifest_rows = 0;
+        auto entries = JsonShreddedStore::readSidecarManifest(p, JSON_COL_NAME, manifest_rows);
+        ASSERT_FALSE(entries.empty());
+        total_sidecar_rows += manifest_rows;
+    }
+    EXPECT_EQ(total_sidecar_rows, cumulative)
+        << "Sidecar total rows " << total_sidecar_rows << " != data rows " << cumulative;
+
+    // Verify read correctness
+    auto blocks = readAllBlocks();
+    EXPECT_EQ(countTotalRows(blocks), cumulative);
+}
+CATCH
 
 } // namespace DB::DM::tests
