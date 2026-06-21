@@ -424,17 +424,12 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
                     cd.name,
                     sidecar_attachment);
             }
-            else if (attach_shredded
-                     && cd.id != MutSup::extra_handle_id
-                     && cd.id != MutSup::delmark_col_id
-                     && cd.id != MutSup::version_col_id)
-            {
-                // Column was read via blob (no sidecar for this DMFile).
-                // Clear any stale by-col-name cache entry so that
-                // FunctionJsonExtract does not pick up a sidecar attachment
-                // registered by a previously-read DMFile for the same column.
-                ShreddedAttachmentCache::instance().clearByColName(cd.name);
-            }
+            // NOTE: Previously clearByColName() was called here for NGC DMFiles
+            // (no sidecar) to prevent stale cache hits. Removed because it races
+            // with in-flight sidecar blocks that lost their attachment during
+            // pipeline reconstruction, making those blocks fall back to blob parse
+            // on placeholder columns → NULLs. After full compaction (ALTER TABLE
+            // COMPACT) all DMFiles have sidecars, eliminating NGC DMFiles entirely.
         }
         catch (DB::Exception & e)
         {
