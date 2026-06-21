@@ -225,7 +225,11 @@ DMFilePtr writeIntoNewDMFile(
             for (size_t col_idx = 0; col_idx < block.columns(); ++col_idx)
             {
                 const auto & col_with_name = block.getByPosition(col_idx);
-                const auto * col_string = typeid_cast<const ColumnString *>(col_with_name.column.get());
+                // Unwrap Nullable to get the underlying ColumnString for JSON detection
+                const IColumn * raw_col = col_with_name.column.get();
+                if (const auto * nullable_col = typeid_cast<const ColumnNullable *>(raw_col))
+                    raw_col = &nullable_col->getNestedColumn();
+                const auto * col_string = typeid_cast<const ColumnString *>(raw_col);
                 if (!col_string || !isBinaryJsonColumn(*col_string))
                     continue;
 

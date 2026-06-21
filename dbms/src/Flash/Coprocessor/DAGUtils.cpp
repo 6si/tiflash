@@ -160,7 +160,7 @@ const std::unordered_map<tipb::ScalarFuncSig, String> scalar_func_map({
     {tipb::ScalarFuncSig::LTDecimal, "less"},
     {tipb::ScalarFuncSig::LTTime, "less"},
     {tipb::ScalarFuncSig::LTDuration, "less"},
-    //{tipb::ScalarFuncSig::LTJson, "less"},
+    {tipb::ScalarFuncSig::LTJson, "less"},
     {tipb::ScalarFuncSig::LTVectorFloat32, "less"},
 
     {tipb::ScalarFuncSig::LEInt, "lessOrEquals"},
@@ -169,7 +169,7 @@ const std::unordered_map<tipb::ScalarFuncSig, String> scalar_func_map({
     {tipb::ScalarFuncSig::LEDecimal, "lessOrEquals"},
     {tipb::ScalarFuncSig::LETime, "lessOrEquals"},
     {tipb::ScalarFuncSig::LEDuration, "lessOrEquals"},
-    //{tipb::ScalarFuncSig::LEJson, "lessOrEquals"},
+    {tipb::ScalarFuncSig::LEJson, "lessOrEquals"},
     {tipb::ScalarFuncSig::LEVectorFloat32, "lessOrEquals"},
 
     {tipb::ScalarFuncSig::GTInt, "greater"},
@@ -178,7 +178,7 @@ const std::unordered_map<tipb::ScalarFuncSig, String> scalar_func_map({
     {tipb::ScalarFuncSig::GTDecimal, "greater"},
     {tipb::ScalarFuncSig::GTTime, "greater"},
     {tipb::ScalarFuncSig::GTDuration, "greater"},
-    //{tipb::ScalarFuncSig::GTJson, "greater"},
+    {tipb::ScalarFuncSig::GTJson, "greater"},
     {tipb::ScalarFuncSig::GTVectorFloat32, "greater"},
 
     {tipb::ScalarFuncSig::GreatestInt, "tidbGreatest"},
@@ -202,7 +202,7 @@ const std::unordered_map<tipb::ScalarFuncSig, String> scalar_func_map({
     {tipb::ScalarFuncSig::GEDecimal, "greaterOrEquals"},
     {tipb::ScalarFuncSig::GETime, "greaterOrEquals"},
     {tipb::ScalarFuncSig::GEDuration, "greaterOrEquals"},
-    //{tipb::ScalarFuncSig::GEJson, "greaterOrEquals"},
+    {tipb::ScalarFuncSig::GEJson, "greaterOrEquals"},
     {tipb::ScalarFuncSig::GEVectorFloat32, "greaterOrEquals"},
 
     {tipb::ScalarFuncSig::EQInt, "equals"},
@@ -211,7 +211,7 @@ const std::unordered_map<tipb::ScalarFuncSig, String> scalar_func_map({
     {tipb::ScalarFuncSig::EQDecimal, "equals"},
     {tipb::ScalarFuncSig::EQTime, "equals"},
     {tipb::ScalarFuncSig::EQDuration, "equals"},
-    //{tipb::ScalarFuncSig::EQJson, "equals"},
+    {tipb::ScalarFuncSig::EQJson, "equals"},
     {tipb::ScalarFuncSig::EQVectorFloat32, "equals"},
 
     {tipb::ScalarFuncSig::NEInt, "notEquals"},
@@ -220,7 +220,7 @@ const std::unordered_map<tipb::ScalarFuncSig, String> scalar_func_map({
     {tipb::ScalarFuncSig::NEDecimal, "notEquals"},
     {tipb::ScalarFuncSig::NETime, "notEquals"},
     {tipb::ScalarFuncSig::NEDuration, "notEquals"},
-    //{tipb::ScalarFuncSig::NEJson, "notEquals"},
+    {tipb::ScalarFuncSig::NEJson, "notEquals"},
     {tipb::ScalarFuncSig::NEVectorFloat32, "notEquals"},
 
     //{tipb::ScalarFuncSig::NullEQInt, "cast"},

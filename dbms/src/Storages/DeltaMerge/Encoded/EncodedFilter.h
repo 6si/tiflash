@@ -80,14 +80,14 @@ public:
     static std::optional<FilterResult> tryApplyIn(const IColumn & column, const std::vector<Field> & values);
     static std::optional<FilterResult> tryApplyPredicate(const IColumn & column, const Predicate & predicate);
 
+    /// Simple LIKE pattern matching (supports % and _ wildcards)
+    static bool matchLike(const String & str, const String & pattern);
+
 private:
     /// Pre-compute filter results for all dictionary entries
     static std::vector<UInt8> precomputeDictionaryFilter(
         const std::vector<Field> & dictionary,
         const Predicate & predicate);
-
-    /// Simple LIKE pattern matching (supports % and _ wildcards)
-    static bool matchLike(const String & str, const String & pattern);
 };
 
 } // namespace DB::DM

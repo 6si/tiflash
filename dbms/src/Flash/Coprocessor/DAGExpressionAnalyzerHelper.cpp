@@ -17,6 +17,8 @@
 #include <Common/FmtUtils.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeSet.h>
+#include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/getLeastSupertype.h>
 #include <Flash/Coprocessor/DAGExpressionAnalyzer.h>
 #include <Flash/Coprocessor/DAGExpressionAnalyzerHelper.h>
@@ -25,6 +27,7 @@
 #include <Functions/FunctionsGrouping.h>
 #include <Functions/FunctionsJson.h>
 #include <Functions/FunctionsTiDBConversion.h>
+#include <Storages/DeltaMerge/JsonShredding/JsonShreddingConfig.h>
 #include <TiDB/Decode/TypeMapping.h>
 
 namespace DB
@@ -508,6 +511,114 @@ String DAGExpressionAnalyzerHelper::buildGroupingFunction(
     return result_name;
 }
 
+String DAGExpressionAnalyzerHelper::buildComparisonWithJsonExtractOptimization(
+    DAGExpressionAnalyzer * analyzer,
+    const tipb::Expr & expr,
+    const ExpressionActionsPtr & actions)
+{
+    // Pattern: equals(json_extract(col, const_path), const_value)
+    // Optimized: json_shredded_filter(col, path, "eq", value)
+    //
+    // This fused function bypasses binary JSON re-encoding entirely.
+    // For dictionary-encoded sub-columns, uses EncodedFilter (integer comparison).
+    // Falls back to normal equals() if shredding is not available at runtime.
+
+    if (!DM::JsonShreddingFlag::instance().useShredded())
+        return buildDefaultFunction(analyzer, expr, actions);
+
+    if (expr.children_size() != 2)
+        return buildDefaultFunction(analyzer, expr, actions);
+
+    const auto & child0 = expr.children(0);
+    const auto & child1 = expr.children(1);
+
+    // Detect: one child is json_extract, the other is a constant or CAST-wrapped constant
+    const tipb::Expr * json_extract_expr = nullptr;
+    const tipb::Expr * const_expr = nullptr;
+
+    // Helper: check if an expr is a constant (literal or CAST(literal) chain)
+    auto isConstantOrCast = [](const tipb::Expr & e) -> bool {
+        if (isLiteralExpr(e))
+            return true;
+        // Check for CAST(... AS JSON) wrapping a literal
+        const tipb::Expr * curr = &e;
+        for (int depth = 0; depth < 4; ++depth)
+        {
+            if (!isScalarFunctionExpr(*curr))
+                return isLiteralExpr(*curr);
+            String fn = getFunctionName(*curr);
+            if (fn.find("cast") == String::npos)
+                return false;
+            if (curr->children_size() < 1)
+                return false;
+            curr = &curr->children(0);
+        }
+        return isLiteralExpr(*curr);
+    };
+
+    if (isScalarFunctionExpr(child0) && getFunctionName(child0) == "json_extract" && isConstantOrCast(child1))
+    {
+        json_extract_expr = &child0;
+        const_expr = &child1;
+    }
+    else if (isScalarFunctionExpr(child1) && getFunctionName(child1) == "json_extract" && isConstantOrCast(child0))
+    {
+        json_extract_expr = &child1;
+        const_expr = &child0;
+    }
+
+    if (!json_extract_expr || !const_expr)
+        return buildDefaultFunction(analyzer, expr, actions);
+
+    // Verify json_extract has 2 children: column + const path
+    if (json_extract_expr->children_size() != 2)
+        return buildDefaultFunction(analyzer, expr, actions);
+
+    const auto & json_col_expr = json_extract_expr->children(0);
+    const auto & path_expr = json_extract_expr->children(1);
+
+    if (!isLiteralExpr(path_expr))
+        return buildDefaultFunction(analyzer, expr, actions);
+
+    // Determine the comparison operator
+    const String & func_name = getFunctionName(expr);
+    String op;
+    if (func_name == "equals")
+        op = "eq";
+    else if (func_name == "notEquals")
+        op = "ne";
+    else if (func_name == "less")
+        op = "lt";
+    else if (func_name == "lessOrEquals")
+        op = "le";
+    else if (func_name == "greater")
+        op = "gt";
+    else if (func_name == "greaterOrEquals")
+        op = "ge";
+    else
+        return buildDefaultFunction(analyzer, expr, actions);
+
+    // Build the fused function: json_shredded_filter(json_col, path, op, value)
+    // First, build the json_col argument (the original column)
+    String col_name = analyzer->getActions(json_col_expr, actions);
+
+    // Build path constant
+    String path_name = analyzer->getActions(path_expr, actions);
+
+    // Build op constant
+    auto op_type = std::make_shared<DataTypeString>();
+    auto op_const_col = op_type->createColumnConst(1, Field(op));
+    String op_name = "json_shred_op_" + op;
+    actions->add(ExpressionAction::addColumn(
+        ColumnWithTypeAndName(std::move(op_const_col), op_type, op_name)));
+
+    // Build value constant
+    String value_name = analyzer->getActions(*const_expr, actions);
+
+    Names argument_names = {col_name, path_name, op_name, value_name};
+    return analyzer->applyFunction("json_shredded_filter", argument_names, actions, nullptr);
+}
+
 String DAGExpressionAnalyzerHelper::buildDefaultFunction(
     DAGExpressionAnalyzer * analyzer,
     const tipb::Expr & expr,
@@ -571,6 +682,12 @@ DAGExpressionAnalyzerHelper::FunctionBuilderMap DAGExpressionAnalyzerHelper::fun
      {"regexp", DAGExpressionAnalyzerHelper::buildRegexpFunction},
      {"replaceRegexpAll", DAGExpressionAnalyzerHelper::buildRegexpFunction},
      {"tidbRound", DAGExpressionAnalyzerHelper::buildRoundFunction},
-     {"grouping", DAGExpressionAnalyzerHelper::buildGroupingFunction}});
+     {"grouping", DAGExpressionAnalyzerHelper::buildGroupingFunction},
+     {"equals", DAGExpressionAnalyzerHelper::buildComparisonWithJsonExtractOptimization},
+     {"notEquals", DAGExpressionAnalyzerHelper::buildComparisonWithJsonExtractOptimization},
+     {"less", DAGExpressionAnalyzerHelper::buildComparisonWithJsonExtractOptimization},
+     {"lessOrEquals", DAGExpressionAnalyzerHelper::buildComparisonWithJsonExtractOptimization},
+     {"greater", DAGExpressionAnalyzerHelper::buildComparisonWithJsonExtractOptimization},
+     {"greaterOrEquals", DAGExpressionAnalyzerHelper::buildComparisonWithJsonExtractOptimization}});
 
 } // namespace DB

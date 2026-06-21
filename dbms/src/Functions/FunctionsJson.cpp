@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <Functions/FunctionFactory.h>
+#include <Functions/FunctionJsonShreddedFilter.h>
 #include <Functions/FunctionsJson.h>
 
 namespace DB
@@ -20,6 +21,7 @@ namespace DB
 void registerFunctionsJson(FunctionFactory & factory)
 {
     factory.registerFunction<FunctionJsonExtract>();
+    factory.registerFunction<FunctionJsonShreddedFilter>();
     factory.registerFunction<FunctionJsonUnquote>();
     factory.registerFunction<FunctionCastJsonAsString>();
     factory.registerFunction<FunctionJsonLength>();

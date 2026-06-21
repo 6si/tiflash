@@ -418,8 +418,13 @@ void ExpressionAction::execute(Block & block) const
         break;
 
     case COPY_COLUMN:
-        block.insert({block.getByName(source_name).column, result_type, result_name});
+    {
+        const auto & src = block.getByName(source_name);
+        ColumnWithTypeAndName copied{src.column, result_type, result_name};
+        copied.shredded_attachment = src.shredded_attachment;
+        block.insert(std::move(copied));
         break;
+    }
 
     default:
         throw Exception("Unknown action type", ErrorCodes::UNKNOWN_ACTION);
@@ -546,8 +551,49 @@ void ExpressionActions::prependProjectInput()
 
 void ExpressionActions::execute(Block & block) const
 {
-    for (const auto & action : actions)
-        action.execute(block);
+    static std::atomic<int> exec_log_count{0};
+    bool had_attachment = false;
+    if (exec_log_count.load() < 10)
+    {
+        for (size_t i = 0; i < block.columns(); ++i)
+        {
+            if (block.getByPosition(i).shredded_attachment)
+            {
+                had_attachment = true;
+                break;
+            }
+        }
+    }
+
+    for (size_t action_idx = 0; action_idx < actions.size(); ++action_idx)
+    {
+        actions[action_idx].execute(block);
+
+        if (had_attachment && exec_log_count.load() < 10)
+        {
+            bool still_has = false;
+            for (size_t i = 0; i < block.columns(); ++i)
+            {
+                if (block.getByPosition(i).shredded_attachment)
+                {
+                    still_has = true;
+                    break;
+                }
+            }
+            if (!still_has)
+            {
+                exec_log_count.fetch_add(1);
+                static auto exec_log = Logger::get("ExprActDiag");
+                LOG_INFO(
+                    exec_log,
+                    "Attachment LOST after action[{}] type={} result_name='{}'",
+                    action_idx,
+                    static_cast<int>(actions[action_idx].type),
+                    actions[action_idx].result_name);
+                had_attachment = false;
+            }
+        }
+    }
 }
 
 template <class NameAndTypeContainer>

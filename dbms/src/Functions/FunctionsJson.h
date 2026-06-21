@@ -15,6 +15,7 @@
 #pragma once
 
 #include <Columns/ColumnConst.h>
+#include <Columns/ColumnDictionary.h>
 #include <Columns/ColumnFixedString.h>
 #include <Columns/ColumnString.h>
 #include <Columns/countBytesInFilter.h>
@@ -293,7 +294,51 @@ private:
 
         // Detect column type ONCE outside the loop (all rows have the same type).
         // This eliminates per-row typeid_cast dispatch — major CPU savings.
-        if (const auto * str_col = typeid_cast<const ColumnString *>(&nested))
+        if (const auto * dict_col = typeid_cast<const ColumnDictionary *>(&nested))
+        {
+            // Dictionary-encoded path: pre-encode each dictionary entry to binary JSON ONCE,
+            // then copy pre-encoded bytes per row using dictionary ID lookup.
+            // Cost: O(cardinality) encoding + O(rows) memcpy vs O(rows) full encoding.
+            const auto & dictionary = dict_col->getDictionary();
+            const auto & dict_ids = dict_col->getDictionaryIds();
+
+            // Phase 1: Pre-encode each dictionary entry to binary JSON
+            std::vector<String> encoded_entries(dictionary.size());
+            for (size_t d = 0; d < dictionary.size(); ++d)
+            {
+                const auto & val = dictionary[d].get<String>();
+                // Binary JSON string format: TYPE_CODE_STRING + varint(len) + data
+                String encoded;
+                encoded.push_back(static_cast<char>(JsonBinary::TYPE_CODE_STRING));
+                // Write varint length
+                UInt64 len = val.size();
+                while (len >= 0x80)
+                {
+                    encoded.push_back(static_cast<char>((len & 0x7F) | 0x80));
+                    len >>= 7;
+                }
+                encoded.push_back(static_cast<char>(len));
+                encoded.append(val);
+                encoded_entries[d] = std::move(encoded);
+            }
+
+            // Phase 2: For each row, copy pre-encoded bytes by dictionary ID
+            for (size_t row = 0; row < rows; ++row)
+            {
+                if (null_map[row])
+                {
+                    null_map_to[row] = 1;
+                    writeChar(0, write_buffer);
+                    offsets_to[row] = write_buffer.count();
+                    continue;
+                }
+                const auto & encoded = encoded_entries[dict_ids[row]];
+                write_buffer.write(encoded.data(), encoded.size());
+                writeChar(0, write_buffer);
+                offsets_to[row] = write_buffer.count();
+            }
+        }
+        else if (const auto * str_col = typeid_cast<const ColumnString *>(&nested))
         {
             for (size_t row = 0; row < rows; ++row)
             {

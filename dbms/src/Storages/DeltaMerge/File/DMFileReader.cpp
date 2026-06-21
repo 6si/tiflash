@@ -18,6 +18,7 @@
 #include <Common/Stopwatch.h>
 #include <Common/TiFlashMetrics.h>
 #include <Common/escapeForFileName.h>
+#include <Core/ShreddedAttachmentCache.h>
 #include <DataTypes/IDataType.h>
 #include <Storages/DeltaMerge/DeltaMergeDefines.h>
 #include <Storages/DeltaMerge/File/ColumnCacheLongTerm.h>
@@ -369,6 +370,20 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
                 auto manifest_entries
                     = JsonShreddedStore::readSidecarManifest(dmfile_path, cd.name, manifest_num_rows);
 
+                static std::atomic<int> diag_log_count{0};
+                if (diag_log_count.fetch_add(1) < 5)
+                {
+                    static auto diag_log = Logger::get("JsonShredDiag");
+                    LOG_INFO(
+                        diag_log,
+                        "readSidecarManifest: col='{}' col_id={} dmfile='{}' entries={} num_rows={}",
+                        cd.name,
+                        cd.id,
+                        dmfile_path,
+                        manifest_entries.size(),
+                        manifest_num_rows);
+                }
+
                 if (!manifest_entries.empty())
                 {
                     auto attachment = std::make_shared<DM::ColumnShreddedAttachment>();
@@ -379,7 +394,6 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
                     attachment->buildPathIndex();
                     attachment->row_offset = start_row_offset;
                     attachment->row_count = read_rows;
-                    inserted.shredded_attachment = std::move(attachment);
 
                     static std::atomic<int> attach_log_count{0};
                     if (attach_log_count.fetch_add(1) < 3)
@@ -396,6 +410,13 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
                             start_row_offset,
                             read_rows);
                     }
+                    inserted.shredded_attachment = attachment;
+                    // Register in global cache so pipeline threads can find it
+                    // even if the attachment gets lost during block reconstruction.
+                    ShreddedAttachmentCache::instance().registerAttachment(
+                        dmfile_path,
+                        cd.name,
+                        attachment);
                 }
             }
         }

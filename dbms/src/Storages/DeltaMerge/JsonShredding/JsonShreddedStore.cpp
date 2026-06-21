@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <Columns/ColumnDictionary.h>
 #include <Common/Exception.h>
 #include <Common/assert_cast.h>
+#include <DataTypes/DataTypeString.h>
 #include <IO/Buffer/ReadBufferFromFile.h>
 #include <IO/Buffer/WriteBufferFromFile.h>
 #include <IO/ReadHelpers.h>
@@ -558,21 +560,23 @@ ColumnPtr JsonShreddedStore::readColumnFile(
     {
         UInt32 cardinality;
         readBinary(cardinality, col_buf);
-        std::vector<String> dictionary(cardinality);
+        std::vector<String> dict_strings(cardinality);
         for (UInt32 d = 0; d < cardinality; ++d)
-            readBinary(dictionary[d], col_buf);
+            readBinary(dict_strings[d], col_buf);
 
         PaddedPODArray<UInt32> ids(num_rows);
         col_buf.readStrict(reinterpret_cast<char *>(ids.data()), num_rows * sizeof(UInt32));
 
-        auto col = ColumnString::create();
-        col->reserve(num_rows);
-        for (size_t row = 0; row < num_rows; ++row)
-        {
-            const auto & val = dictionary[ids[row]];
-            col->insertData(val.data(), val.size());
-        }
-        inner = std::move(col);
+        // Return a ColumnDictionary — keeps data encoded, enables EncodedFilter
+        std::vector<Field> dict_fields;
+        dict_fields.reserve(cardinality);
+        for (const auto & s : dict_strings)
+            dict_fields.emplace_back(s);
+
+        inner = ColumnDictionary::createMutable(
+            std::move(dict_fields),
+            std::move(ids),
+            std::make_shared<DataTypeString>());
     }
     else
     {

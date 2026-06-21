@@ -27,6 +27,7 @@ ColumnWithTypeAndName ColumnWithTypeAndName::cloneEmpty() const
 {
     ColumnWithTypeAndName
         res{(column != nullptr ? column->cloneEmpty() : nullptr), type, name, column_id, default_value};
+    res.shredded_attachment = shredded_attachment;
     return res;
 }
 
