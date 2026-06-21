@@ -19,6 +19,7 @@
 #include <Columns/ColumnFixedString.h>
 #include <Columns/ColumnString.h>
 #include <Columns/countBytesInFilter.h>
+#include <Core/ShreddedAttachmentCache.h>
 #include <Core/Types.h>
 #include <DataTypes/DataTypeMyDate.h>
 #include <DataTypes/DataTypeMyDateTime.h>
@@ -139,9 +140,14 @@ public:
         if (arguments.size() == 2)
         {
             const auto & json_col_ref = block.getByPosition(arguments[0]);
-            if (json_col_ref.shredded_attachment
-                && (json_col_ref.shredded_attachment->isLazy()
-                    || json_col_ref.shredded_attachment->data))
+            // Try to get attachment: first from column, then from global cache.
+            // The attachment may be lost during filtered reads or pipeline handoff.
+            auto attach_ptr = json_col_ref.shredded_attachment;
+            if (!attach_ptr)
+                attach_ptr = DM::ShreddedAttachmentCache::instance().findByColName(json_col_ref.name);
+            if (attach_ptr
+                && (attach_ptr->isLazy()
+                    || attach_ptr->data))
             {
                 const auto & path_col = block.getByPosition(arguments[1]).column;
                 const auto * const_path = typeid_cast<const ColumnConst *>(path_col.get());
@@ -165,7 +171,7 @@ public:
                         if (dot_path.size() > 2 && dot_path[0] == '$' && dot_path[1] == '.')
                             dot_path = dot_path.substr(2);
 
-                        const auto & attach = *json_col_ref.shredded_attachment;
+                        const auto & attach = *attach_ptr;
                         ColumnPtr sub_col;
 
                         if (attach.isLazy())

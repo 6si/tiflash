@@ -342,82 +342,94 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
         try
         {
             ColumnPtr col;
-            // For handle, tag and version column, we can try to do clean read.
-            switch (cd.id)
-            {
-            case MutSup::extra_handle_id:
-                col = readExtraColumn(cd, start_pack_id, pack_count, read_rows, handle_column_clean_read_packs);
-                break;
-            case MutSup::delmark_col_id:
-                col = readExtraColumn(cd, start_pack_id, pack_count, read_rows, del_column_clean_read_packs);
-                break;
-            case MutSup::version_col_id:
-                col = readExtraColumn(cd, start_pack_id, pack_count, read_rows, version_column_clean_read_packs);
-                break;
-            default:
-                col = readColumn(cd, start_pack_id, pack_count, read_rows);
-                break;
-            }
-            auto & inserted = columns.emplace_back(std::move(col), cd.type, cd.name, cd.id);
+            std::shared_ptr<DM::ColumnShreddedAttachment> sidecar_attachment;
 
-            // JSON shredding: attach lazy sidecar handle to the column.
-            // Only reads the manifest (~1KB) — actual sub-column data is loaded on
-            // demand when FunctionJsonExtract needs a specific path.
-            // This reduces I/O from ~89MB (all 49 sub-columns) to ~1-2MB (one path).
-            if (attach_shredded)
+            // JSON shredding blob-skip: check for sidecar BEFORE reading the blob.
+            // If a sidecar manifest exists, create a lightweight placeholder column
+            // instead of reading the full blob from disk (~55MB → ~1KB manifest).
+            // FunctionJsonExtract will use the sidecar data; the blob is never accessed.
+            if (attach_shredded
+                && cd.id != MutSup::extra_handle_id
+                && cd.id != MutSup::delmark_col_id
+                && cd.id != MutSup::version_col_id)
             {
                 UInt64 manifest_num_rows = 0;
                 auto manifest_entries
                     = JsonShreddedStore::readSidecarManifest(dmfile_path, cd.name, manifest_num_rows);
 
-                static std::atomic<int> diag_log_count{0};
-                if (diag_log_count.fetch_add(1) < 5)
-                {
-                    static auto diag_log = Logger::get("JsonShredDiag");
-                    LOG_INFO(
-                        diag_log,
-                        "readSidecarManifest: col='{}' col_id={} dmfile='{}' entries={} num_rows={}",
-                        cd.name,
-                        cd.id,
-                        dmfile_path,
-                        manifest_entries.size(),
-                        manifest_num_rows);
-                }
-
                 if (!manifest_entries.empty())
                 {
-                    auto attachment = std::make_shared<DM::ColumnShreddedAttachment>();
-                    attachment->dmfile_path = dmfile_path;
-                    attachment->col_name = cd.name;
-                    attachment->num_rows = manifest_num_rows;
-                    attachment->manifest_entries = std::move(manifest_entries);
-                    attachment->buildPathIndex();
-                    attachment->row_offset = start_row_offset;
-                    attachment->row_count = read_rows;
+                    // Sidecar available — skip the expensive blob read.
+                    // Create a default-value placeholder column (no disk I/O).
+                    // Cannot use ColumnConst because insertSelectiveFrom
+                    // requires matching column types in the filtered read path.
+                    col = createColumnWithDefaultValue(cd, read_rows);
 
-                    static std::atomic<int> attach_log_count{0};
-                    if (attach_log_count.fetch_add(1) < 3)
+                    sidecar_attachment = std::make_shared<DM::ColumnShreddedAttachment>();
+                    sidecar_attachment->dmfile_path = dmfile_path;
+                    sidecar_attachment->col_name = cd.name;
+                    sidecar_attachment->num_rows = manifest_num_rows;
+                    sidecar_attachment->manifest_entries = std::move(manifest_entries);
+                    sidecar_attachment->buildPathIndex();
+                    sidecar_attachment->row_offset = start_row_offset;
+                    sidecar_attachment->row_count = read_rows;
+
+                    static std::atomic<int> skip_log_count{0};
+                    if (skip_log_count.fetch_add(1) < 5)
                     {
-                        static auto attach_log = Logger::get("JsonShredDiag");
+                        static auto skip_log = Logger::get("JsonShredDiag");
                         LOG_INFO(
-                            attach_log,
-                            "DMFileReader ATTACHED lazy shredded: col='{}' col_id={} dmfile='{}' "
-                            "paths={} row_offset={} read_rows={}",
+                            skip_log,
+                            "BLOB-SKIP: col='{}' col_id={} dmfile='{}' "
+                            "paths={} read_rows={} — skipped blob read, using sidecar",
                             cd.name,
                             cd.id,
                             dmfile_path,
-                            attachment->manifest_entries.size(),
-                            start_row_offset,
+                            sidecar_attachment->manifest_entries.size(),
                             read_rows);
                     }
-                    inserted.shredded_attachment = attachment;
-                    // Register in global cache so pipeline threads can find it
-                    // even if the attachment gets lost during block reconstruction.
-                    ShreddedAttachmentCache::instance().registerAttachment(
-                        dmfile_path,
-                        cd.name,
-                        attachment);
                 }
+            }
+
+            if (!col)
+            {
+                // Normal read path: no sidecar available or shredding disabled.
+                switch (cd.id)
+                {
+                case MutSup::extra_handle_id:
+                    col = readExtraColumn(cd, start_pack_id, pack_count, read_rows, handle_column_clean_read_packs);
+                    break;
+                case MutSup::delmark_col_id:
+                    col = readExtraColumn(cd, start_pack_id, pack_count, read_rows, del_column_clean_read_packs);
+                    break;
+                case MutSup::version_col_id:
+                    col = readExtraColumn(cd, start_pack_id, pack_count, read_rows, version_column_clean_read_packs);
+                    break;
+                default:
+                    col = readColumn(cd, start_pack_id, pack_count, read_rows);
+                    break;
+                }
+            }
+
+            auto & inserted = columns.emplace_back(std::move(col), cd.type, cd.name, cd.id);
+
+            if (sidecar_attachment)
+            {
+                inserted.shredded_attachment = sidecar_attachment;
+                ShreddedAttachmentCache::instance().registerAttachment(
+                    dmfile_path,
+                    cd.name,
+                    sidecar_attachment);
+            }
+            else if (attach_shredded
+                     && cd.id != MutSup::extra_handle_id
+                     && cd.id != MutSup::delmark_col_id
+                     && cd.id != MutSup::version_col_id)
+            {
+                // Column was read normally but shredding is enabled —
+                // try to attach sidecar metadata for columns without a manifest
+                // (non-JSON columns, or columns whose sidecar wasn't created).
+                // This path is a no-op since readSidecarManifest already returned empty.
             }
         }
         catch (DB::Exception & e)
