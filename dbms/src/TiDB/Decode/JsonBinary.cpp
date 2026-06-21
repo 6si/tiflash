@@ -1292,4 +1292,86 @@ void JsonBinary::appendSIMDJsonElem(JsonBinaryWriteBuffer & write_buffer, const 
     write_buffer.write(getJsonType(elem));
     appendValueOfSIMDJsonElem(write_buffer, elem);
 }
+std::pair<Int64, bool> JsonBinary::toInt64() const
+{
+    switch (type)
+    {
+    case TYPE_CODE_INT64:
+        return {getInt64(), false};
+    case TYPE_CODE_UINT64:
+    {
+        auto v = getUInt64();
+        return {static_cast<Int64>(v), false};
+    }
+    case TYPE_CODE_FLOAT64:
+    {
+        auto v = getFloat64();
+        return {static_cast<Int64>(std::llround(v)), false};
+    }
+    case TYPE_CODE_STRING:
+    {
+        auto s = getString();
+        try
+        {
+            size_t pos = 0;
+            double d = std::stod(String(s.data, s.size), &pos);
+            return {static_cast<Int64>(std::llround(d)), false};
+        }
+        catch (...)
+        {
+            return {0, false};
+        }
+    }
+    case TYPE_CODE_LITERAL:
+    {
+        auto lit = static_cast<UInt8>(data.data[0]);
+        if (lit == LITERAL_TRUE)
+            return {1, false};
+        if (lit == LITERAL_FALSE)
+            return {0, false};
+        return {0, true}; // null
+    }
+    default:
+        return {0, false};
+    }
+}
+
+std::pair<Float64, bool> JsonBinary::toFloat64() const
+{
+    switch (type)
+    {
+    case TYPE_CODE_INT64:
+        return {static_cast<Float64>(getInt64()), false};
+    case TYPE_CODE_UINT64:
+        return {static_cast<Float64>(getUInt64()), false};
+    case TYPE_CODE_FLOAT64:
+        return {getFloat64(), false};
+    case TYPE_CODE_STRING:
+    {
+        auto s = getString();
+        try
+        {
+            size_t pos = 0;
+            double d = std::stod(String(s.data, s.size), &pos);
+            return {d, false};
+        }
+        catch (...)
+        {
+            return {0.0, false};
+        }
+    }
+    case TYPE_CODE_LITERAL:
+    {
+        auto lit = static_cast<UInt8>(data.data[0]);
+        if (lit == LITERAL_TRUE)
+            return {1.0, false};
+        if (lit == LITERAL_FALSE)
+            return {0.0, false};
+        return {0.0, true}; // null
+    }
+    default:
+        return {0.0, false};
+    }
+}
+
 } // namespace DB

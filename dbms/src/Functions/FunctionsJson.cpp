@@ -24,6 +24,8 @@ void registerFunctionsJson(FunctionFactory & factory)
     factory.registerFunction<FunctionJsonShreddedFilter>();
     factory.registerFunction<FunctionJsonUnquote>();
     factory.registerFunction<FunctionCastJsonAsString>();
+    factory.registerFunction<FunctionCastJsonAsInt>();
+    factory.registerFunction<FunctionCastJsonAsReal>();
     factory.registerFunction<FunctionJsonLength>();
     factory.registerFunction<FunctionJsonArray>();
     factory.registerFunction<FunctionJsonObject>();

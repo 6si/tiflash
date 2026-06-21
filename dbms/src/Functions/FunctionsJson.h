@@ -826,6 +826,130 @@ private:
     const Context & context;
 };
 
+class FunctionCastJsonAsInt : public IFunction
+{
+public:
+    static constexpr auto name = "cast_json_as_int";
+    static FunctionPtr create(const Context &) { return std::make_shared<FunctionCastJsonAsInt>(); }
+
+    String getName() const override { return name; }
+    size_t getNumberOfArguments() const override { return 1; }
+    bool useDefaultImplementationForConstants() const override { return true; }
+
+    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+    {
+        if unlikely (!arguments[0]->isString())
+            throw Exception(
+                "Illegal type " + arguments[0]->getName() + " of argument of function " + getName(),
+                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+        return makeNullable(std::make_shared<DataTypeInt64>());
+    }
+
+    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result) const override
+    {
+        const ColumnPtr column = block.getByPosition(arguments[0]).column;
+        size_t rows = block.rows();
+        if (const auto * col_from = checkAndGetColumn<ColumnString>(column.get()))
+        {
+            const ColumnString::Chars_t & data_from = col_from->getChars();
+            const IColumn::Offsets & offsets_from = col_from->getOffsets();
+            auto col_to = ColumnInt64::create(rows);
+            auto & vec_to = col_to->getData();
+            auto col_null_map = ColumnUInt8::create(rows, 0);
+            auto & vec_null_map = col_null_map->getData();
+            size_t current_offset = 0;
+            for (size_t i = 0; i < rows; ++i)
+            {
+                size_t next_offset = offsets_from[i];
+                size_t json_length = next_offset - current_offset - 1;
+                if unlikely (isNullJsonBinary(json_length))
+                {
+                    vec_null_map[i] = 1;
+                    vec_to[i] = 0;
+                }
+                else
+                {
+                    JsonBinary json_binary(
+                        data_from[current_offset],
+                        StringRef(&data_from[current_offset + 1], json_length - 1));
+                    auto [val, is_null] = json_binary.toInt64();
+                    vec_to[i] = val;
+                    vec_null_map[i] = is_null ? 1 : 0;
+                }
+                current_offset = next_offset;
+            }
+            block.getByPosition(result).column
+                = ColumnNullable::create(std::move(col_to), std::move(col_null_map));
+        }
+        else
+            throw Exception(
+                fmt::format("Illegal column {} of argument of function {}", column->getName(), getName()),
+                ErrorCodes::ILLEGAL_COLUMN);
+    }
+};
+
+class FunctionCastJsonAsReal : public IFunction
+{
+public:
+    static constexpr auto name = "cast_json_as_real";
+    static FunctionPtr create(const Context &) { return std::make_shared<FunctionCastJsonAsReal>(); }
+
+    String getName() const override { return name; }
+    size_t getNumberOfArguments() const override { return 1; }
+    bool useDefaultImplementationForConstants() const override { return true; }
+
+    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+    {
+        if unlikely (!arguments[0]->isString())
+            throw Exception(
+                "Illegal type " + arguments[0]->getName() + " of argument of function " + getName(),
+                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+        return makeNullable(std::make_shared<DataTypeFloat64>());
+    }
+
+    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result) const override
+    {
+        const ColumnPtr column = block.getByPosition(arguments[0]).column;
+        size_t rows = block.rows();
+        if (const auto * col_from = checkAndGetColumn<ColumnString>(column.get()))
+        {
+            const ColumnString::Chars_t & data_from = col_from->getChars();
+            const IColumn::Offsets & offsets_from = col_from->getOffsets();
+            auto col_to = ColumnFloat64::create(rows);
+            auto & vec_to = col_to->getData();
+            auto col_null_map = ColumnUInt8::create(rows, 0);
+            auto & vec_null_map = col_null_map->getData();
+            size_t current_offset = 0;
+            for (size_t i = 0; i < rows; ++i)
+            {
+                size_t next_offset = offsets_from[i];
+                size_t json_length = next_offset - current_offset - 1;
+                if unlikely (isNullJsonBinary(json_length))
+                {
+                    vec_null_map[i] = 1;
+                    vec_to[i] = 0.0;
+                }
+                else
+                {
+                    JsonBinary json_binary(
+                        data_from[current_offset],
+                        StringRef(&data_from[current_offset + 1], json_length - 1));
+                    auto [val, is_null] = json_binary.toFloat64();
+                    vec_to[i] = val;
+                    vec_null_map[i] = is_null ? 1 : 0;
+                }
+                current_offset = next_offset;
+            }
+            block.getByPosition(result).column
+                = ColumnNullable::create(std::move(col_to), std::move(col_null_map));
+        }
+        else
+            throw Exception(
+                fmt::format("Illegal column {} of argument of function {}", column->getName(), getName()),
+                ErrorCodes::ILLEGAL_COLUMN);
+    }
+};
+
 class FunctionJsonLength : public IFunction
 {
 public:

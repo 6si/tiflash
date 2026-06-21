@@ -195,6 +195,11 @@ public:
 
     static void assertJsonDepth(UInt64 depth);
 
+    /// Convert JSON value to numeric types (matching TiDB semantics).
+    /// Returns {value, is_null}. Null for JSON null; 0 for object/array.
+    std::pair<Int64, bool> toInt64() const;
+    std::pair<Float64, bool> toFloat64() const;
+
 private:
     Int64 getInt64() const;
     UInt64 getUInt64() const;
