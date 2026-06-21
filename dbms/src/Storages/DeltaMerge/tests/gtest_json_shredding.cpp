@@ -44,9 +44,11 @@ namespace DB::DM::tests
 
 /// Helper: build a binary JSON object from key-value pairs.
 /// This produces the MySQL 5.7 binary JSON format that TiFlash stores.
+/// null_fields: keys whose value is JSON null (TYPE_CODE_LITERAL + LITERAL_NIL, inlined).
 static String buildBinaryJsonObject(const std::vector<std::pair<String, String>> & str_fields,
                                      const std::vector<std::pair<String, Int64>> & int_fields = {},
-                                     const std::vector<std::pair<String, double>> & float_fields = {})
+                                     const std::vector<std::pair<String, double>> & float_fields = {},
+                                     const std::vector<String> & null_fields = {})
 {
     // Build JSON string first, then convert to binary format.
     // For testing, we'll use a simplified binary builder.
@@ -56,10 +58,19 @@ static String buildBinaryJsonObject(const std::vector<std::pair<String, String>>
     // object = element-count(u32) + size(u32) + key-entries + value-entries + keys + values
 
     // Total element count
-    UInt32 elem_count = str_fields.size() + int_fields.size() + float_fields.size();
+    UInt32 elem_count = str_fields.size() + int_fields.size() + float_fields.size() + null_fields.size();
 
-    // Collect all keys in order
-    std::vector<std::pair<String, std::pair<UInt8, String>>> entries; // key -> (type, value_bytes)
+    // Collect all keys in order.
+    // For non-inline types: (type, value_bytes, inline=false)
+    // For inline types (literals): (type, "", inline=true, inline_value)
+    struct EntryValue
+    {
+        UInt8 type;
+        String value_bytes;
+        bool is_inline = false;
+        UInt32 inline_value = 0;
+    };
+    std::vector<std::pair<String, EntryValue>> entries;
 
     for (const auto & [key, val] : str_fields)
     {
@@ -74,7 +85,7 @@ static String buildBinaryJsonObject(const std::vector<std::pair<String, String>>
         }
         value_bytes += static_cast<char>(len);
         value_bytes += val;
-        entries.push_back({key, {JsonBinary::TYPE_CODE_STRING, value_bytes}});
+        entries.push_back({key, {JsonBinary::TYPE_CODE_STRING, value_bytes, false, 0}});
     }
 
     for (const auto & [key, val] : int_fields)
@@ -82,7 +93,7 @@ static String buildBinaryJsonObject(const std::vector<std::pair<String, String>>
         // Int64 value: 8 bytes little-endian
         String value_bytes(8, '\0');
         memcpy(value_bytes.data(), &val, 8);
-        entries.push_back({key, {JsonBinary::TYPE_CODE_INT64, value_bytes}});
+        entries.push_back({key, {JsonBinary::TYPE_CODE_INT64, value_bytes, false, 0}});
     }
 
     for (const auto & [key, val] : float_fields)
@@ -90,7 +101,13 @@ static String buildBinaryJsonObject(const std::vector<std::pair<String, String>>
         // Float64 value: 8 bytes
         String value_bytes(8, '\0');
         memcpy(value_bytes.data(), &val, 8);
-        entries.push_back({key, {JsonBinary::TYPE_CODE_FLOAT64, value_bytes}});
+        entries.push_back({key, {JsonBinary::TYPE_CODE_FLOAT64, value_bytes, false, 0}});
+    }
+
+    for (const auto & key : null_fields)
+    {
+        // JSON null: TYPE_CODE_LITERAL with LITERAL_NIL inlined in the value entry
+        entries.push_back({key, {JsonBinary::TYPE_CODE_LITERAL, "", true, JsonBinary::LITERAL_NIL}});
     }
 
     // Sort by key (binary JSON objects have keys in sorted order)
@@ -117,10 +134,13 @@ static String buildBinaryJsonObject(const std::vector<std::pair<String, String>>
     for (const auto & [key, _] : entries)
         keys_data_size += key.size();
 
-    // Calculate value data size
+    // Calculate value data size (skip inline entries — they have no out-of-line data)
     UInt32 values_data_size = 0;
-    for (const auto & [_, tv] : entries)
-        values_data_size += tv.second.size();
+    for (const auto & [_, ev] : entries)
+    {
+        if (!ev.is_inline)
+            values_data_size += ev.value_bytes.size();
+    }
 
     UInt32 total_size = metadata_size + keys_data_size + values_data_size;
 
@@ -151,13 +171,20 @@ static String buildBinaryJsonObject(const std::vector<std::pair<String, String>>
     UInt32 ve_base = header_size + key_entries_total;
     for (UInt32 i = 0; i < elem_count; ++i)
     {
-        UInt8 type_code = entries[i].second.first;
-        buf[ve_base + i * value_entry_size] = type_code;
+        const auto & ev = entries[i].second;
+        buf[ve_base + i * value_entry_size] = ev.type;
 
-        // Check if value can be inlined (literals and small ints)
-        // For simplicity, always use offset
-        memcpy(buf + ve_base + i * value_entry_size + 1, &value_data_offset, 4);
-        value_data_offset += entries[i].second.second.size();
+        if (ev.is_inline)
+        {
+            // Inline value (e.g., TYPE_CODE_LITERAL): write literal byte + zero padding
+            UInt32 inline_val = ev.inline_value;
+            memcpy(buf + ve_base + i * value_entry_size + 1, &inline_val, 4);
+        }
+        else
+        {
+            memcpy(buf + ve_base + i * value_entry_size + 1, &value_data_offset, 4);
+            value_data_offset += ev.value_bytes.size();
+        }
     }
 
     // Write keys data
@@ -168,11 +195,14 @@ static String buildBinaryJsonObject(const std::vector<std::pair<String, String>>
         offset += key.size();
     }
 
-    // Write values data
-    for (const auto & [_, tv] : entries)
+    // Write values data (skip inline entries)
+    for (const auto & [_, ev] : entries)
     {
-        memcpy(buf + offset, tv.second.data(), tv.second.size());
-        offset += tv.second.size();
+        if (!ev.is_inline)
+        {
+            memcpy(buf + offset, ev.value_bytes.data(), ev.value_bytes.size());
+            offset += ev.value_bytes.size();
+        }
     }
 
     return result;
@@ -2214,5 +2244,420 @@ try
     EXPECT_EQ(countTotalRows(blocks), cumulative);
 }
 CATCH
+
+// ============================================================================
+// JSON Edge Case Tests: missing keys, null values
+// ============================================================================
+
+class JsonEdgeCaseTest : public DB::base::TiFlashStorageTestBasic
+{
+    constexpr static const char * TRACING_NAME = "JsonEdgeCaseTest";
+
+public:
+    static constexpr ColumnID JSON_COL_ID = 100;
+    static constexpr const char * JSON_COL_NAME = "payload";
+
+    void SetUp() override
+    {
+        TiFlashStorageTestBasic::SetUp();
+        JsonShreddingFlag::instance().setWriteShredded(true);
+        store = createStoreWithJsonCol();
+    }
+
+    void TearDown() override
+    {
+        store.reset();
+        TiFlashStorageTestBasic::TearDown();
+    }
+
+    DeltaMergeStorePtr createStoreWithJsonCol()
+    {
+        TiFlashStorageTestBasic::reload();
+        auto cols = DMTestEnv::getDefaultColumns();
+        cols->emplace_back(ColumnDefine{JSON_COL_ID, JSON_COL_NAME,
+            DataTypeFactory::instance().get(DataTypeString::getDefaultName())});
+
+        ColumnDefine handle_column_define = (*cols)[0];
+        return DeltaMergeStore::create(
+            *db_context,
+            false,
+            "test",
+            "t_json_edge",
+            NullspaceID,
+            201,
+            0,
+            true,
+            *cols,
+            handle_column_define,
+            false,
+            1,
+            nullptr,
+            DeltaMergeStore::Settings());
+    }
+
+    /// Build a block where each row has a different subset of JSON keys.
+    /// Pattern repeats every 4 rows:
+    ///   row 0: {"event":"purchase","score":N}          — both keys
+    ///   row 1: {"event":"click"}                       — missing "score"
+    ///   row 2: {"score":N}                             — missing "event"
+    ///   row 3: {"event":"view","score":N,"extra":"x"}  — extra key
+    Block prepareBlockMissingKeys(size_t beg, size_t end, UInt64 tso = 2)
+    {
+        Block block = DMTestEnv::prepareSimpleWriteBlock(beg, end, false, tso);
+        size_t num_rows = end - beg;
+        auto json_col = ColumnString::create();
+        for (size_t i = 0; i < num_rows; ++i)
+        {
+            Int64 score = static_cast<Int64>(beg + i);
+            String json;
+            switch (i % 4)
+            {
+            case 0:
+                json = buildBinaryJsonObject({{"event", "purchase"}}, {{"score", score}});
+                break;
+            case 1:
+                json = buildBinaryJsonObject({{"event", "click"}});
+                break;
+            case 2:
+                json = buildBinaryJsonObject({}, {{"score", score}});
+                break;
+            case 3:
+                json = buildBinaryJsonObject({{"event", "view"}, {"extra", "x"}}, {{"score", score}});
+                break;
+            }
+            json_col->insertData(json.data(), json.size());
+        }
+        block.insert(ColumnWithTypeAndName{
+            std::move(json_col),
+            DataTypeFactory::instance().get(DataTypeString::getDefaultName()),
+            JSON_COL_NAME,
+            JSON_COL_ID});
+        return block;
+    }
+
+    /// Build a block where some rows have JSON null values.
+    /// Pattern repeats every 4 rows:
+    ///   row 0: {"event":"purchase","score":N}        — normal
+    ///   row 1: {"event":null,"score":N}              — event is null
+    ///   row 2: {"event":"click","score":null}        — score is null (literal)
+    ///   row 3: {"event":null,"score":null}           — both null
+    Block prepareBlockNullValues(size_t beg, size_t end, UInt64 tso = 2)
+    {
+        Block block = DMTestEnv::prepareSimpleWriteBlock(beg, end, false, tso);
+        size_t num_rows = end - beg;
+        auto json_col = ColumnString::create();
+        for (size_t i = 0; i < num_rows; ++i)
+        {
+            Int64 score = static_cast<Int64>(beg + i);
+            String json;
+            switch (i % 4)
+            {
+            case 0:
+                json = buildBinaryJsonObject({{"event", "purchase"}}, {{"score", score}});
+                break;
+            case 1:
+                json = buildBinaryJsonObject({}, {{"score", score}}, {}, {"event"});
+                break;
+            case 2:
+                json = buildBinaryJsonObject({{"event", "click"}}, {}, {}, {"score"});
+                break;
+            case 3:
+                json = buildBinaryJsonObject({}, {}, {}, {"event", "score"});
+                break;
+            }
+            json_col->insertData(json.data(), json.size());
+        }
+        block.insert(ColumnWithTypeAndName{
+            std::move(json_col),
+            DataTypeFactory::instance().get(DataTypeString::getDefaultName()),
+            JSON_COL_NAME,
+            JSON_COL_ID});
+        return block;
+    }
+
+    std::vector<Block> readAllBlocks()
+    {
+        auto in = store->read(
+            *db_context,
+            db_context->getSettingsRef(),
+            store->getTableColumns(),
+            {RowKeyRange::newAll(store->isCommonHandle(), store->getRowKeyColumnSize())},
+            1,
+            std::numeric_limits<UInt64>::max(),
+            EMPTY_FILTER,
+            std::vector<RuntimeFilterPtr>{},
+            0,
+            TRACING_NAME,
+            DMReadOptions{},
+            1024)[0];
+        std::vector<Block> blocks;
+        in->readPrefix();
+        while (auto blk = in->read())
+            blocks.push_back(std::move(blk));
+        in->readSuffix();
+        return blocks;
+    }
+
+    size_t countTotalRows(const std::vector<Block> & blocks)
+    {
+        size_t total = 0;
+        for (const auto & b : blocks)
+            total += b.rows();
+        return total;
+    }
+
+    size_t countSqlNullPayloads(const std::vector<Block> & blocks)
+    {
+        size_t null_count = 0;
+        for (const auto & blk : blocks)
+        {
+            if (!blk.has(JSON_COL_NAME))
+                continue;
+            const auto & col = blk.getByName(JSON_COL_NAME);
+            for (size_t i = 0; i < col.column->size(); ++i)
+            {
+                if (col.column->isNullAt(i))
+                    ++null_count;
+            }
+        }
+        return null_count;
+    }
+
+protected:
+    DeltaMergeStorePtr store;
+};
+
+
+// JSON with missing keys: different rows have different subsets of keys.
+// The shredder must handle sparse schemas correctly.
+TEST_F(JsonEdgeCaseTest, MissingKeysAfterCompaction)
+try
+{
+    const size_t batch = 120;
+
+    {
+        auto block = prepareBlockMissingKeys(0, batch);
+        store->write(*db_context, db_context->getSettingsRef(), block);
+    }
+    store->flushCache(*db_context, RowKeyRange::newAll(false, 1));
+    store->mergeDeltaAll(*db_context);
+
+    auto blocks = readAllBlocks();
+    EXPECT_EQ(countTotalRows(blocks), batch);
+    EXPECT_EQ(countSqlNullPayloads(blocks), 0)
+        << "Payload column has SQL NULLs — shredding corrupted sparse JSON";
+
+    for (const auto & [_, seg] : store->segments)
+    {
+        const auto & files = seg->getStable()->getDMFiles();
+        for (const auto & f : files)
+            EXPECT_TRUE(JsonShreddedStore::hasSidecar(f->path(), JSON_COL_NAME));
+    }
+}
+CATCH
+
+
+// Two rounds with different key patterns merged by compaction.
+TEST_F(JsonEdgeCaseTest, MissingKeysMergedAcrossCompactions)
+try
+{
+    const size_t batch1 = 120;
+    const size_t batch2 = 120;
+
+    {
+        auto block = prepareBlockMissingKeys(0, batch1);
+        store->write(*db_context, db_context->getSettingsRef(), block);
+    }
+    store->flushCache(*db_context, RowKeyRange::newAll(false, 1));
+    store->mergeDeltaAll(*db_context);
+
+    {
+        auto block = prepareBlockMissingKeys(batch1, batch1 + batch2, /*tso=*/3);
+        store->write(*db_context, db_context->getSettingsRef(), block);
+    }
+    store->flushCache(*db_context, RowKeyRange::newAll(false, 1));
+    store->mergeDeltaAll(*db_context);
+
+    auto blocks = readAllBlocks();
+    EXPECT_EQ(countTotalRows(blocks), batch1 + batch2);
+    EXPECT_EQ(countSqlNullPayloads(blocks), 0)
+        << "Payload column has SQL NULLs after multi-batch merge with sparse keys";
+}
+CATCH
+
+
+// JSON with explicit null values: {"event": null, "score": null}.
+// These are valid JSON null inside the blob, distinct from SQL NULL.
+TEST_F(JsonEdgeCaseTest, NullValuesAfterCompaction)
+try
+{
+    const size_t batch = 120;
+
+    {
+        auto block = prepareBlockNullValues(0, batch);
+        store->write(*db_context, db_context->getSettingsRef(), block);
+    }
+    store->flushCache(*db_context, RowKeyRange::newAll(false, 1));
+    store->mergeDeltaAll(*db_context);
+
+    auto blocks = readAllBlocks();
+    EXPECT_EQ(countTotalRows(blocks), batch);
+    EXPECT_EQ(countSqlNullPayloads(blocks), 0)
+        << "Payload column has SQL NULLs — null-value JSON was corrupted";
+
+    for (const auto & [_, seg] : store->segments)
+    {
+        const auto & files = seg->getStable()->getDMFiles();
+        for (const auto & f : files)
+            EXPECT_TRUE(JsonShreddedStore::hasSidecar(f->path(), JSON_COL_NAME));
+    }
+}
+CATCH
+
+
+// First batch normal JSON, second batch has null values, compaction merges.
+TEST_F(JsonEdgeCaseTest, NullValuesMergedWithNormalValues)
+try
+{
+    const size_t batch1 = 120;
+    const size_t batch2 = 120;
+
+    {
+        Block block = DMTestEnv::prepareSimpleWriteBlock(0, batch1, false, 2);
+        auto json_col = ColumnString::create();
+        for (size_t i = 0; i < batch1; ++i)
+        {
+            String event = (i % 3 == 0) ? "purchase" : ((i % 3 == 1) ? "click" : "view");
+            auto json = buildBinaryJsonObject({{"event", event}}, {{"score", static_cast<Int64>(i)}});
+            json_col->insertData(json.data(), json.size());
+        }
+        block.insert(ColumnWithTypeAndName{
+            std::move(json_col),
+            DataTypeFactory::instance().get(DataTypeString::getDefaultName()),
+            JSON_COL_NAME,
+            JSON_COL_ID});
+        store->write(*db_context, db_context->getSettingsRef(), block);
+    }
+    store->flushCache(*db_context, RowKeyRange::newAll(false, 1));
+    store->mergeDeltaAll(*db_context);
+
+    {
+        auto block = prepareBlockNullValues(batch1, batch1 + batch2, /*tso=*/3);
+        store->write(*db_context, db_context->getSettingsRef(), block);
+    }
+    store->flushCache(*db_context, RowKeyRange::newAll(false, 1));
+    store->mergeDeltaAll(*db_context);
+
+    auto blocks = readAllBlocks();
+    EXPECT_EQ(countTotalRows(blocks), batch1 + batch2);
+    EXPECT_EQ(countSqlNullPayloads(blocks), 0)
+        << "Payload column has SQL NULLs after merging normal + null-value JSON";
+}
+CATCH
+
+
+// Combined: rows with missing keys AND null values in the same batch.
+TEST_F(JsonEdgeCaseTest, MissingKeysAndNullValuesCombined)
+try
+{
+    const size_t batch = 200;
+
+    Block block = DMTestEnv::prepareSimpleWriteBlock(0, batch, false, 2);
+    auto json_col = ColumnString::create();
+    for (size_t i = 0; i < batch; ++i)
+    {
+        String json;
+        switch (i % 6)
+        {
+        case 0:
+            json = buildBinaryJsonObject({{"event", "purchase"}}, {{"score", static_cast<Int64>(i)}});
+            break;
+        case 1:
+            json = buildBinaryJsonObject({{"event", "click"}});
+            break;
+        case 2:
+            json = buildBinaryJsonObject({}, {{"score", static_cast<Int64>(i)}}, {}, {"event"});
+            break;
+        case 3:
+            json = buildBinaryJsonObject({}, {}, {}, {"score"});
+            break;
+        case 4:
+            json = buildBinaryJsonObject({}, {}, {}, {"event", "score"});
+            break;
+        case 5:
+            json = buildBinaryJsonObject({{"event", "view"}, {"tag", "promo"}}, {{"score", static_cast<Int64>(i)}});
+            break;
+        }
+        json_col->insertData(json.data(), json.size());
+    }
+    block.insert(ColumnWithTypeAndName{
+        std::move(json_col),
+        DataTypeFactory::instance().get(DataTypeString::getDefaultName()),
+        JSON_COL_NAME,
+        JSON_COL_ID});
+    store->write(*db_context, db_context->getSettingsRef(), block);
+
+    store->flushCache(*db_context, RowKeyRange::newAll(false, 1));
+    store->mergeDeltaAll(*db_context);
+
+    auto blocks = readAllBlocks();
+    EXPECT_EQ(countTotalRows(blocks), batch);
+    EXPECT_EQ(countSqlNullPayloads(blocks), 0)
+        << "Payload column has SQL NULLs — combined missing-key + null-value handling is broken";
+
+    for (const auto & [_, seg] : store->segments)
+    {
+        const auto & files = seg->getStable()->getDMFiles();
+        for (const auto & f : files)
+            EXPECT_TRUE(JsonShreddedStore::hasSidecar(f->path(), JSON_COL_NAME));
+    }
+
+    // Second compaction round with same pattern
+    {
+        auto block2 = DMTestEnv::prepareSimpleWriteBlock(batch, batch * 2, false, 3);
+        auto json_col2 = ColumnString::create();
+        for (size_t i = 0; i < batch; ++i)
+        {
+            String json;
+            switch (i % 6)
+            {
+            case 0:
+                json = buildBinaryJsonObject({{"event", "purchase"}}, {{"score", static_cast<Int64>(batch + i)}});
+                break;
+            case 1:
+                json = buildBinaryJsonObject({{"event", "click"}});
+                break;
+            case 2:
+                json = buildBinaryJsonObject({}, {{"score", static_cast<Int64>(batch + i)}}, {}, {"event"});
+                break;
+            case 3:
+                json = buildBinaryJsonObject({}, {}, {}, {"score"});
+                break;
+            case 4:
+                json = buildBinaryJsonObject({}, {}, {}, {"event", "score"});
+                break;
+            case 5:
+                json = buildBinaryJsonObject({{"event", "view"}, {"tag", "promo"}}, {{"score", static_cast<Int64>(batch + i)}});
+                break;
+            }
+            json_col2->insertData(json.data(), json.size());
+        }
+        block2.insert(ColumnWithTypeAndName{
+            std::move(json_col2),
+            DataTypeFactory::instance().get(DataTypeString::getDefaultName()),
+            JSON_COL_NAME,
+            JSON_COL_ID});
+        store->write(*db_context, db_context->getSettingsRef(), block2);
+    }
+    store->flushCache(*db_context, RowKeyRange::newAll(false, 1));
+    store->mergeDeltaAll(*db_context);
+
+    auto blocks2 = readAllBlocks();
+    EXPECT_EQ(countTotalRows(blocks2), batch * 2);
+    EXPECT_EQ(countSqlNullPayloads(blocks2), 0)
+        << "Payload column has SQL NULLs after second merge with mixed edge cases";
+}
+CATCH
+
 
 } // namespace DB::DM::tests
