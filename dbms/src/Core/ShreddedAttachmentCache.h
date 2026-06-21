@@ -83,6 +83,15 @@ public:
         return nullptr;
     }
 
+    /// Clear the by-col-name fallback entry for a column.
+    /// Called when a DMFile without a sidecar is read — prevents stale
+    /// attachments from a previously-read DMFile from poisoning lookups.
+    void clearByColName(const String & col_name)
+    {
+        std::unique_lock lock(mutex_);
+        by_col_name_.erase(col_name);
+    }
+
     /// Remove all entries for a specific DMFile (called during cleanup/GC).
     void clearForDMFile(const String & dmfile_path)
     {

@@ -18,6 +18,7 @@
 #include <Common/assert_cast.h>
 #include <Core/ColumnShreddedAttachment.h>
 #include <Core/ColumnWithTypeAndName.h>
+#include <Core/ShreddedAttachmentCache.h>
 #include <Poco/File.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonPathOptimizer.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonSchemaTree.h>
@@ -1756,6 +1757,140 @@ TEST(JsonShreddingLazyLoadTest, ColumnCacheHitOnRepeatedReads)
 
     // Clean up
     Poco::File(dmfile_path).remove(true);
+}
+
+
+// ============================================================================
+// ShreddedAttachmentCache stale-entry poisoning tests
+// ============================================================================
+
+class ShreddedAttachmentCachePoisonTest : public ::testing::Test
+{
+protected:
+    void SetUp() override
+    {
+        ShreddedAttachmentCache::instance().clear();
+    }
+    void TearDown() override
+    {
+        ShreddedAttachmentCache::instance().clear();
+    }
+};
+
+// Reproduces the NGC DMFile correctness bug:
+// DMFile A has a sidecar → registers cache entry for "payload".
+// DMFile B (NGC) has no sidecar → reads blob normally.
+// FunctionJsonExtract for DMFile B's block must NOT pick up
+// DMFile A's stale cache entry via findByColName("payload").
+TEST_F(ShreddedAttachmentCachePoisonTest, ClearByColNamePreventsStaleHit)
+{
+    auto & cache = ShreddedAttachmentCache::instance();
+    const String col_name = "payload";
+
+    // Simulate DMFile A: has sidecar → registerAttachment
+    auto attach_a = std::make_shared<ColumnShreddedAttachment>();
+    attach_a->dmfile_path = "/data/t_1/stable/dmf_100";
+    attach_a->col_name = col_name;
+    attach_a->num_rows = 16384;
+    cache.registerAttachment(attach_a->dmfile_path, col_name, attach_a);
+
+    // Verify cache has the entry
+    ASSERT_NE(cache.findByColName(col_name), nullptr);
+    EXPECT_EQ(cache.findByColName(col_name)->dmfile_path, "/data/t_1/stable/dmf_100");
+
+    // Simulate DMFile B (NGC): no sidecar → clearByColName
+    cache.clearByColName(col_name);
+
+    // findByColName must return nullptr now — no stale poisoning
+    EXPECT_EQ(cache.findByColName(col_name), nullptr);
+
+    // Exact-match lookup for DMFile A should still work
+    EXPECT_NE(cache.findAttachment("/data/t_1/stable/dmf_100", col_name), nullptr);
+}
+
+// Verify that after clearing, a new registration works correctly.
+TEST_F(ShreddedAttachmentCachePoisonTest, ClearThenReRegister)
+{
+    auto & cache = ShreddedAttachmentCache::instance();
+    const String col_name = "payload";
+
+    // Register for DMFile A
+    auto attach_a = std::make_shared<ColumnShreddedAttachment>();
+    attach_a->dmfile_path = "/data/t_1/stable/dmf_100";
+    attach_a->col_name = col_name;
+    cache.registerAttachment(attach_a->dmfile_path, col_name, attach_a);
+
+    // Clear (simulating NGC DMFile B read)
+    cache.clearByColName(col_name);
+    EXPECT_EQ(cache.findByColName(col_name), nullptr);
+
+    // Register for DMFile C (has sidecar)
+    auto attach_c = std::make_shared<ColumnShreddedAttachment>();
+    attach_c->dmfile_path = "/data/t_1/stable/dmf_300";
+    attach_c->col_name = col_name;
+    cache.registerAttachment(attach_c->dmfile_path, col_name, attach_c);
+
+    // findByColName should return DMFile C's attachment
+    auto found = cache.findByColName(col_name);
+    ASSERT_NE(found, nullptr);
+    EXPECT_EQ(found->dmfile_path, "/data/t_1/stable/dmf_300");
+}
+
+// Simulate the interleaved read pattern: A(sidecar) → B(NGC) → C(sidecar)
+// Each step must see the correct state.
+TEST_F(ShreddedAttachmentCachePoisonTest, InterleavedSidecarAndNGC)
+{
+    auto & cache = ShreddedAttachmentCache::instance();
+    const String col_name = "payload";
+
+    // Step 1: Read DMFile A (has sidecar)
+    auto attach_a = std::make_shared<ColumnShreddedAttachment>();
+    attach_a->dmfile_path = "/data/dmf_A";
+    attach_a->col_name = col_name;
+    attach_a->num_rows = 16384;
+    cache.registerAttachment(attach_a->dmfile_path, col_name, attach_a);
+    EXPECT_EQ(cache.findByColName(col_name)->dmfile_path, "/data/dmf_A");
+
+    // Step 2: Read DMFile B (NGC — no sidecar)
+    // DMFileReader falls through to blob read and clears cache
+    cache.clearByColName(col_name);
+    EXPECT_EQ(cache.findByColName(col_name), nullptr);
+    // FunctionJsonExtract for B's block will use blob data (correct!)
+
+    // Step 3: Read DMFile C (has sidecar)
+    auto attach_c = std::make_shared<ColumnShreddedAttachment>();
+    attach_c->dmfile_path = "/data/dmf_C";
+    attach_c->col_name = col_name;
+    attach_c->num_rows = 16384;
+    cache.registerAttachment(attach_c->dmfile_path, col_name, attach_c);
+    EXPECT_EQ(cache.findByColName(col_name)->dmfile_path, "/data/dmf_C");
+
+    // All exact-match lookups should work independently
+    EXPECT_NE(cache.findAttachment("/data/dmf_A", col_name), nullptr);
+    EXPECT_EQ(cache.findAttachment("/data/dmf_B", col_name), nullptr); // NGC, never registered
+    EXPECT_NE(cache.findAttachment("/data/dmf_C", col_name), nullptr);
+}
+
+// Multiple columns: clearing one column name must not affect others.
+TEST_F(ShreddedAttachmentCachePoisonTest, ClearByColNameIsolated)
+{
+    auto & cache = ShreddedAttachmentCache::instance();
+
+    auto attach_payload = std::make_shared<ColumnShreddedAttachment>();
+    attach_payload->dmfile_path = "/data/dmf_1";
+    attach_payload->col_name = "payload";
+    cache.registerAttachment("/data/dmf_1", "payload", attach_payload);
+
+    auto attach_meta = std::make_shared<ColumnShreddedAttachment>();
+    attach_meta->dmfile_path = "/data/dmf_1";
+    attach_meta->col_name = "metadata";
+    cache.registerAttachment("/data/dmf_1", "metadata", attach_meta);
+
+    // Clear only "payload"
+    cache.clearByColName("payload");
+
+    EXPECT_EQ(cache.findByColName("payload"), nullptr);
+    EXPECT_NE(cache.findByColName("metadata"), nullptr); // unaffected
 }
 
 } // namespace DB::DM::tests

@@ -426,10 +426,11 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
                      && cd.id != MutSup::delmark_col_id
                      && cd.id != MutSup::version_col_id)
             {
-                // Column was read normally but shredding is enabled —
-                // try to attach sidecar metadata for columns without a manifest
-                // (non-JSON columns, or columns whose sidecar wasn't created).
-                // This path is a no-op since readSidecarManifest already returned empty.
+                // Column was read via blob (no sidecar for this DMFile).
+                // Clear any stale by-col-name cache entry so that
+                // FunctionJsonExtract does not pick up a sidecar attachment
+                // registered by a previously-read DMFile for the same column.
+                ShreddedAttachmentCache::instance().clearByColName(cd.name);
             }
         }
         catch (DB::Exception & e)
