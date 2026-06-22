@@ -159,19 +159,6 @@ public:
                 attach_ptr = nullptr; // is_ngc sentinel — fall through to blob extraction
             }
 
-            // Diagnostic: trace fast path decision
-            static std::atomic<int> fj_diag_count{0};
-            if (fj_diag_count.fetch_add(1) < 30)
-            {
-                static auto fj_log = Logger::get("JsonExtractDiag");
-                LOG_INFO(fj_log, "FJDIAG: col='{}' rows={} attach={} lazy={} has_data={} is_ngc={}",
-                    json_col_ref.name, rows,
-                    (bool)attach_ptr,
-                    attach_ptr ? attach_ptr->isLazy() : false,
-                    attach_ptr && attach_ptr->data ? true : false,
-                    attach_ptr ? attach_ptr->is_ngc : false);
-            }
-
             if (attach_ptr
                 && (attach_ptr->isLazy()
                     || attach_ptr->data))
@@ -201,16 +188,6 @@ public:
                         const auto & attach = *attach_ptr;
                         ColumnPtr sub_col;
 
-                        static std::atomic<int> fj_path_count{0};
-                        bool do_path_log = fj_path_count.fetch_add(1) < 30;
-                        if (do_path_log)
-                        {
-                            static auto fj_log2 = Logger::get("JsonExtractDiag");
-                            LOG_INFO(fj_log2, "FJPATH: dot_path='{}' lazy={} has_path={} row_offset={} row_count={} mvcc_filter_sz={}",
-                                dot_path, attach.isLazy(), attach.hasPath(dot_path),
-                                attach.row_offset, attach.row_count, attach.mvcc_filter.size());
-                        }
-
                         if (attach.isLazy())
                         {
                             // Lazy mode: load only the single needed column from disk
@@ -220,12 +197,6 @@ public:
                                     attach.dmfile_path,
                                     attach.col_name,
                                     dot_path);
-                                if (do_path_log)
-                                {
-                                    static auto fj_log3 = Logger::get("JsonExtractDiag");
-                                    LOG_INFO(fj_log3, "FJCOL: full_col_size={} attach.row_count={} attach.row_offset={}",
-                                        full_col ? full_col->size() : 0, attach.row_count, attach.row_offset);
-                                }
                                 if (full_col)
                                 {
                                     if (full_col->size() == attach.row_count)
@@ -258,21 +229,9 @@ public:
                             sub_col = sub_col->filter(filter, rows);
                         }
 
-                        if (do_path_log)
-                        {
-                            static auto fj_log4 = Logger::get("JsonExtractDiag");
-                            LOG_INFO(fj_log4, "FJRESULT: sub_col={} sub_col_size={} rows={}",
-                                (bool)sub_col, sub_col ? sub_col->size() : 0, rows);
-                        }
-
                         if (sub_col)
                         {
                             res_col = convertShreddedToJsonBinary(sub_col, rows);
-                            if (do_path_log)
-                            {
-                                static auto fj_log5 = Logger::get("JsonExtractDiag");
-                                LOG_INFO(fj_log5, "FJBIN: res_col={} converted={}", (bool)res_col, res_col ? "yes" : "no");
-                            }
                             if (res_col)
                                 return;
                         }

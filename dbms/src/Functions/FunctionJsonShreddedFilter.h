@@ -91,19 +91,6 @@ public:
         String op = op_col->getValue<String>();
         String value_binary_json = value_col->getValue<String>();
 
-        LOG_DEBUG(
-            Logger::get("JsonShreddedFilter"),
-            "executeImpl: path={} op={} value_len={} value_hex={}",
-            path,
-            op,
-            value_binary_json.size(),
-            [&]() {
-                String hex;
-                for (size_t i = 0; i < std::min(value_binary_json.size(), size_t(32)); ++i)
-                    hex += fmt::format("{:02x}", static_cast<unsigned char>(value_binary_json[i]));
-                return hex;
-            }());
-
         // Strip "$." prefix from path for sidecar lookup
         String lookup_path = path;
         if (lookup_path.size() > 2 && lookup_path[0] == '$' && lookup_path[1] == '.')
@@ -211,13 +198,6 @@ public:
         // Decode the comparison value from binary JSON
         String compare_value = decodeBinaryJsonToString(value_binary_json);
 
-        LOG_DEBUG(
-            Logger::get("JsonShreddedFilter"),
-            "decoded compare_value='{}' sub_col_type={} sub_col_size={}",
-            compare_value,
-            sub_col ? sub_col->getName() : "null",
-            sub_col ? sub_col->size() : 0);
-
         // Now perform the filter directly on the sub-column
         const auto * nullable_sub = typeid_cast<const ColumnNullable *>(sub_col.get());
         if (!nullable_sub)
@@ -274,6 +254,20 @@ public:
     }
 
 private:
+    enum class FilterOp : UInt8 { EQ, NE, GT, GE, LT, LE, LIKE, UNKNOWN };
+
+    static FilterOp parseOp(const String & op)
+    {
+        if (op == "eq") return FilterOp::EQ;
+        if (op == "ne") return FilterOp::NE;
+        if (op == "gt") return FilterOp::GT;
+        if (op == "ge") return FilterOp::GE;
+        if (op == "lt") return FilterOp::LT;
+        if (op == "le") return FilterOp::LE;
+        if (op == "like") return FilterOp::LIKE;
+        return FilterOp::UNKNOWN;
+    }
+
     /// Fallback for NGC DMFile blocks (no sidecar): extract the JSON path from the real
     /// blob column and compare row-by-row. Slower than sidecar path but always correct.
     static ColumnPtr blobFallbackFilter(
@@ -300,6 +294,7 @@ private:
             return ColumnNullable::create(std::move(result_data), std::move(result_null));
 
         auto path_exprs = DB::buildPathExprContainer(StringRef(path.data(), path.size()));
+        const auto filter_op = parseOp(op);
 
         for (size_t i = 0; i < rows; ++i)
         {
@@ -317,30 +312,25 @@ private:
                 JsonBinary::JsonBinaryWriteBuffer json_write_buf(buf);
                 bool matched = json_bin.extract(path_exprs, json_write_buf);
                 if (!matched)
-                    continue; // null result — no match for eq
-            } // destructor trims buf to actual written size
+                    continue;
+            }
             if (buf.empty())
                 continue;
 
-            // buf contains binary JSON of the extracted value
             String extracted(reinterpret_cast<const char *>(buf.data()), buf.size());
             String extracted_str = decodeBinaryJsonToString(extracted);
 
-            nulls[i] = 0; // we have a real value
-            if (op == "eq")
-                data[i] = (extracted_str == compare_value) ? 1 : 0;
-            else if (op == "ne")
-                data[i] = (extracted_str != compare_value) ? 1 : 0;
-            else if (op == "gt")
-                data[i] = (jsonStringCompare(extracted_str, compare_value) > 0) ? 1 : 0;
-            else if (op == "ge")
-                data[i] = (jsonStringCompare(extracted_str, compare_value) >= 0) ? 1 : 0;
-            else if (op == "lt")
-                data[i] = (jsonStringCompare(extracted_str, compare_value) < 0) ? 1 : 0;
-            else if (op == "le")
-                data[i] = (jsonStringCompare(extracted_str, compare_value) <= 0) ? 1 : 0;
-            else
-                nulls[i] = 1; // unknown op
+            nulls[i] = 0;
+            switch (filter_op)
+            {
+            case FilterOp::EQ: data[i] = (extracted_str == compare_value) ? 1 : 0; break;
+            case FilterOp::NE: data[i] = (extracted_str != compare_value) ? 1 : 0; break;
+            case FilterOp::GT: data[i] = (jsonStringCompare(extracted_str, compare_value) > 0) ? 1 : 0; break;
+            case FilterOp::GE: data[i] = (jsonStringCompare(extracted_str, compare_value) >= 0) ? 1 : 0; break;
+            case FilterOp::LT: data[i] = (jsonStringCompare(extracted_str, compare_value) < 0) ? 1 : 0; break;
+            case FilterOp::LE: data[i] = (jsonStringCompare(extracted_str, compare_value) <= 0) ? 1 : 0; break;
+            default: nulls[i] = 1; break;
+            }
         }
 
         return ColumnNullable::create(std::move(result_data), std::move(result_null));
@@ -529,6 +519,7 @@ private:
         auto & nulls = result_null->getData();
 
         StringRef compare_ref(compare_value.data(), compare_value.size());
+        const auto filter_op = parseOp(op);
 
         for (size_t i = 0; i < rows; ++i)
         {
@@ -539,26 +530,22 @@ private:
             }
 
             StringRef row_val = str_col.getDataAt(i);
-            if (op == "eq")
-                data[i] = (row_val == compare_ref) ? 1 : 0;
-            else if (op == "ne")
-                data[i] = (row_val != compare_ref) ? 1 : 0;
-            else if (op == "gt")
-                data[i] = (jsonStringCompare(row_val, compare_value) > 0) ? 1 : 0;
-            else if (op == "ge")
-                data[i] = (jsonStringCompare(row_val, compare_value) >= 0) ? 1 : 0;
-            else if (op == "lt")
-                data[i] = (jsonStringCompare(row_val, compare_value) < 0) ? 1 : 0;
-            else if (op == "le")
-                data[i] = (jsonStringCompare(row_val, compare_value) <= 0) ? 1 : 0;
-            else if (op == "like")
+            switch (filter_op)
+            {
+            case FilterOp::EQ: data[i] = (row_val == compare_ref) ? 1 : 0; break;
+            case FilterOp::NE: data[i] = (row_val != compare_ref) ? 1 : 0; break;
+            case FilterOp::GT: data[i] = (jsonStringCompare(row_val, compare_value) > 0) ? 1 : 0; break;
+            case FilterOp::GE: data[i] = (jsonStringCompare(row_val, compare_value) >= 0) ? 1 : 0; break;
+            case FilterOp::LT: data[i] = (jsonStringCompare(row_val, compare_value) < 0) ? 1 : 0; break;
+            case FilterOp::LE: data[i] = (jsonStringCompare(row_val, compare_value) <= 0) ? 1 : 0; break;
+            case FilterOp::LIKE:
                 data[i] = DM::EncodedFilter::matchLike(
                               String(row_val.data, row_val.size),
                               compare_value)
-                              ? 1
-                              : 0;
-            else
-                nulls[i] = 1;
+                              ? 1 : 0;
+                break;
+            default: nulls[i] = 1; break;
+            }
         }
 
         return ColumnNullable::create(std::move(result_data), std::move(result_null));
@@ -589,6 +576,7 @@ private:
         }
 
         const auto & int_data = int_col.getData();
+        const auto filter_op = parseOp(op);
         for (size_t i = 0; i < rows; ++i)
         {
             if (null_map[i])
@@ -597,20 +585,16 @@ private:
                 continue;
             }
 
-            if (op == "eq")
-                data[i] = (int_data[i] == cmp_val) ? 1 : 0;
-            else if (op == "ne")
-                data[i] = (int_data[i] != cmp_val) ? 1 : 0;
-            else if (op == "lt")
-                data[i] = (int_data[i] < cmp_val) ? 1 : 0;
-            else if (op == "le")
-                data[i] = (int_data[i] <= cmp_val) ? 1 : 0;
-            else if (op == "gt")
-                data[i] = (int_data[i] > cmp_val) ? 1 : 0;
-            else if (op == "ge")
-                data[i] = (int_data[i] >= cmp_val) ? 1 : 0;
-            else
-                nulls[i] = 1;
+            switch (filter_op)
+            {
+            case FilterOp::EQ: data[i] = (int_data[i] == cmp_val) ? 1 : 0; break;
+            case FilterOp::NE: data[i] = (int_data[i] != cmp_val) ? 1 : 0; break;
+            case FilterOp::LT: data[i] = (int_data[i] < cmp_val) ? 1 : 0; break;
+            case FilterOp::LE: data[i] = (int_data[i] <= cmp_val) ? 1 : 0; break;
+            case FilterOp::GT: data[i] = (int_data[i] > cmp_val) ? 1 : 0; break;
+            case FilterOp::GE: data[i] = (int_data[i] >= cmp_val) ? 1 : 0; break;
+            default: nulls[i] = 1; break;
+            }
         }
 
         return ColumnNullable::create(std::move(result_data), std::move(result_null));
@@ -641,6 +625,7 @@ private:
         }
 
         const auto & float_data = float_col.getData();
+        const auto filter_op = parseOp(op);
         for (size_t i = 0; i < rows; ++i)
         {
             if (null_map[i])
@@ -649,20 +634,16 @@ private:
                 continue;
             }
 
-            if (op == "eq")
-                data[i] = (float_data[i] == cmp_val) ? 1 : 0;
-            else if (op == "ne")
-                data[i] = (float_data[i] != cmp_val) ? 1 : 0;
-            else if (op == "lt")
-                data[i] = (float_data[i] < cmp_val) ? 1 : 0;
-            else if (op == "le")
-                data[i] = (float_data[i] <= cmp_val) ? 1 : 0;
-            else if (op == "gt")
-                data[i] = (float_data[i] > cmp_val) ? 1 : 0;
-            else if (op == "ge")
-                data[i] = (float_data[i] >= cmp_val) ? 1 : 0;
-            else
-                nulls[i] = 1;
+            switch (filter_op)
+            {
+            case FilterOp::EQ: data[i] = (float_data[i] == cmp_val) ? 1 : 0; break;
+            case FilterOp::NE: data[i] = (float_data[i] != cmp_val) ? 1 : 0; break;
+            case FilterOp::LT: data[i] = (float_data[i] < cmp_val) ? 1 : 0; break;
+            case FilterOp::LE: data[i] = (float_data[i] <= cmp_val) ? 1 : 0; break;
+            case FilterOp::GT: data[i] = (float_data[i] > cmp_val) ? 1 : 0; break;
+            case FilterOp::GE: data[i] = (float_data[i] >= cmp_val) ? 1 : 0; break;
+            default: nulls[i] = 1; break;
+            }
         }
 
         return ColumnNullable::create(std::move(result_data), std::move(result_null));
@@ -693,6 +674,7 @@ private:
         }
 
         const auto & uint_data = uint_col.getData();
+        const auto filter_op = parseOp(op);
         for (size_t i = 0; i < rows; ++i)
         {
             if (null_map[i])
@@ -701,20 +683,16 @@ private:
                 continue;
             }
 
-            if (op == "eq")
-                data[i] = (uint_data[i] == cmp_val) ? 1 : 0;
-            else if (op == "ne")
-                data[i] = (uint_data[i] != cmp_val) ? 1 : 0;
-            else if (op == "lt")
-                data[i] = (uint_data[i] < cmp_val) ? 1 : 0;
-            else if (op == "le")
-                data[i] = (uint_data[i] <= cmp_val) ? 1 : 0;
-            else if (op == "gt")
-                data[i] = (uint_data[i] > cmp_val) ? 1 : 0;
-            else if (op == "ge")
-                data[i] = (uint_data[i] >= cmp_val) ? 1 : 0;
-            else
-                nulls[i] = 1;
+            switch (filter_op)
+            {
+            case FilterOp::EQ: data[i] = (uint_data[i] == cmp_val) ? 1 : 0; break;
+            case FilterOp::NE: data[i] = (uint_data[i] != cmp_val) ? 1 : 0; break;
+            case FilterOp::LT: data[i] = (uint_data[i] < cmp_val) ? 1 : 0; break;
+            case FilterOp::LE: data[i] = (uint_data[i] <= cmp_val) ? 1 : 0; break;
+            case FilterOp::GT: data[i] = (uint_data[i] > cmp_val) ? 1 : 0; break;
+            case FilterOp::GE: data[i] = (uint_data[i] >= cmp_val) ? 1 : 0; break;
+            default: nulls[i] = 1; break;
+            }
         }
 
         return ColumnNullable::create(std::move(result_data), std::move(result_null));
