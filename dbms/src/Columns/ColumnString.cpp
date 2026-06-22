@@ -301,6 +301,7 @@ ColumnPtr ColumnString::replicateRange(size_t start_row, size_t end_row, const I
 
 void ColumnString::gather(ColumnGathererStream & gatherer)
 {
+    ensureBlobLoaded();
     gatherer.gather(*this);
 }
 
@@ -339,6 +340,7 @@ void ColumnString::reserveAlignWithTotalMemoryHint(size_t n, Int64 total_memory_
 
 void ColumnString::getExtremes(Field & min, Field & max) const
 {
+    ensureBlobLoaded();
     min = String();
     max = String();
 
@@ -500,6 +502,7 @@ void ColumnString::getPermutationWithCollationImpl(
 
 void ColumnString::countSerializeByteSize(PaddedPODArray<size_t> & byte_size) const
 {
+    ensureBlobLoaded();
     countSerializeByteSizeImpl</*need_decode_collator=*/false, /*has_nullmap=*/false>(byte_size, nullptr, nullptr);
 }
 
@@ -508,6 +511,7 @@ void ColumnString::countSerializeByteSizeForCmp(
     const NullMap * nullmap,
     const TiDB::TiDBCollatorPtr & collator) const
 {
+    ensureBlobLoaded();
     // For now, sortKeyReservedSpaceMultipler() of bin collator(padding or non-padding) is 1.
     // So bin collator will skip to decode collator.
     // And other collators will first count code point then compute the needed memory.
@@ -705,6 +709,7 @@ inline bool needDecodeCollatorForCmp(const TiDB::TiDBCollatorPtr & collator)
 
 void ColumnString::serializeToPos(PaddedPODArray<char *> & pos, size_t start, size_t length, bool has_null) const
 {
+    ensureBlobLoaded();
     if (has_null)
         serializeToPosImpl<
             /*has_null=*/true,
@@ -728,6 +733,7 @@ void ColumnString::serializeToPosForCmp(
     const TiDB::TiDBCollatorPtr & collator,
     String * sort_key_container) const
 {
+    ensureBlobLoaded();
 #define M(VAR_PREFIX, COLLATOR_NAME, IMPL_TYPE, COLLATOR_ID, has_null, has_nullmap) \
     case (COLLATOR_ID):                                                             \
     {                                                                               \
@@ -1345,6 +1351,7 @@ void ColumnString::updateWeakHash32(
     const TiDB::TiDBCollatorPtr & collator,
     String & sort_key_container) const
 {
+    ensureBlobLoaded();
     WeakHash32Info info{
         .hash_data = &hash.getData(),
         .sort_key_container = sort_key_container,
@@ -1361,6 +1368,7 @@ void ColumnString::updateWeakHash32(
     String & sort_key_container,
     const BlockSelective & selective) const
 {
+    ensureBlobLoaded();
     WeakHash32Info info{
         .hash_data = &hash.getData(),
         .sort_key_container = sort_key_container,
@@ -1375,6 +1383,7 @@ void ColumnString::updateHashWithValues(
     const TiDB::TiDBCollatorPtr & collator,
     String & sort_key_container) const
 {
+    ensureBlobLoaded();
     if (collator != nullptr)
     {
         switch (collator->getCollatorType())

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
 #include <Columns/countBytesInFilter.h>
 #include <Common/Exception.h>
@@ -390,7 +391,10 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
                             ColumnString::Chars_t & out_chars,
                             ColumnString::Offsets & out_offsets) {
                             auto real_col = readColumn(cd_copy, start_pack_id, pack_count, read_rows);
-                            const auto & real_str = static_cast<const ColumnString &>(*real_col);
+                            const IColumn * raw = real_col.get();
+                            if (const auto * nullable = typeid_cast<const ColumnNullable *>(raw))
+                                raw = &nullable->getNestedColumn();
+                            const auto & real_str = static_cast<const ColumnString &>(*raw);
                             out_chars.assign(real_str.getChars().begin(), real_str.getChars().end());
                             out_offsets.assign(real_str.getOffsets().begin(), real_str.getOffsets().end());
                         });
