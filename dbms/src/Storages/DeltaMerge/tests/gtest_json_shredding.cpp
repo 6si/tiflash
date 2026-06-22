@@ -3310,5 +3310,38 @@ TEST(ColumnStringLazyBlobTest, CopyConstructorTriggersLoad)
     EXPECT_EQ(cloned->getDataAt(1).toString(), "too");
 }
 
+TEST(ColumnStringLazyBlobTest, LoaderSurvivesAfterSourceDestroyed)
+{
+    // Simulates the exact crash scenario: the object that created the lazy
+    // loader is destroyed before the lazy load fires (like DMFileReader being
+    // destroyed before firstrow() triggers ensureBlobLoadedSlow()).
+    // The loader must be self-contained — no dangling references.
+
+    auto col = ColumnString::create();
+    col->insertManyDefaults(3);
+
+    // Simulate a "reader" object that goes out of scope before the load fires.
+    // The loader captures a shared_ptr to data, NOT a raw pointer to the reader.
+    {
+        auto shared_data = std::make_shared<std::vector<String>>(
+            std::vector<String>{"after", "reader", "gone"});
+        col->setLazyBlobLoader(
+            [shared_data](ColumnString::Chars_t & chars, ColumnString::Offsets & offsets) {
+                buildRealColumnData(*shared_data, chars, offsets);
+            });
+        // shared_data goes out of scope here but the shared_ptr in the lambda
+        // keeps it alive — analogous to DMFilePtr keeping the file alive.
+    }
+
+    // The "reader" is now destroyed. Access the column — must not crash.
+    EXPECT_EQ(col->size(), 3u);
+    auto sv = col->getDataAt(0);
+    EXPECT_EQ(sv.toString(), "after");
+    sv = col->getDataAt(1);
+    EXPECT_EQ(sv.toString(), "reader");
+    sv = col->getDataAt(2);
+    EXPECT_EQ(sv.toString(), "gone");
+}
+
 
 } // namespace DB::DM::tests

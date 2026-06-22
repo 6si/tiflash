@@ -16,6 +16,7 @@
 #include <Columns/ColumnString.h>
 #include <Columns/countBytesInFilter.h>
 #include <Common/Exception.h>
+#include <Core/Defines.h>
 #include <Common/MemoryTracker.h>
 #include <Common/Stopwatch.h>
 #include <Common/TiFlashMetrics.h>
@@ -384,13 +385,49 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
                     auto placeholder = ColumnString::create();
                     placeholder->insertManyDefaults(read_rows);
 
-                    // Capture context for deferred blob read.
+                    // Capture self-contained state for deferred blob read.
+                    // IMPORTANT: do NOT capture `this` — DMFileReader is destroyed
+                    // before the lazy load fires (use-after-free). Instead, capture
+                    // shared_ptrs and value copies, then create a temporary reader
+                    // inside the lambda when (if) materialization is triggered.
                     auto cd_copy = cd;
+                    auto dmfile_copy = dmfile;
+                    auto pack_filter_copy = pack_filter;
+                    auto mark_cache_copy = mark_cache;
+                    auto file_provider_copy = file_provider;
+                    auto scan_context_copy = scan_context;
+                    auto is_common_handle_copy = is_common_handle;
+                    auto read_tag_copy = read_tag;
                     placeholder->setLazyBlobLoader(
-                        [this, cd_copy, start_pack_id, pack_count, read_rows](
+                        [dmfile_copy, pack_filter_copy, mark_cache_copy, file_provider_copy,
+                         scan_context_copy, is_common_handle_copy, read_tag_copy,
+                         cd_copy, start_pack_id, pack_count, read_rows](
                             ColumnString::Chars_t & out_chars,
                             ColumnString::Offsets & out_offsets) {
-                            auto real_col = readColumn(cd_copy, start_pack_id, pack_count, read_rows);
+                            // Create a temporary reader to read just this one column.
+                            ColumnDefines single_col{cd_copy};
+                            DMFileReader tmp_reader(
+                                dmfile_copy,
+                                single_col,
+                                is_common_handle_copy,
+                                /*enable_handle_clean_read*/ false,
+                                /*enable_del_clean_read*/ false,
+                                /*is_fast_scan*/ false,
+                                /*max_read_version*/ 0,
+                                pack_filter_copy,
+                                mark_cache_copy,
+                                /*enable_column_cache*/ false,
+                                /*column_cache*/ nullptr,
+                                DBMS_DEFAULT_BUFFER_SIZE,
+                                file_provider_copy,
+                                /*read_limiter*/ nullptr,
+                                /*rows_threshold_per_read*/ std::numeric_limits<size_t>::max(),
+                                /*read_one_pack_every_time*/ false,
+                                /*tracing_id*/ "lazy-blob-materializer",
+                                /*max_sharing_column_bytes*/ 0,
+                                scan_context_copy,
+                                read_tag_copy);
+                            auto real_col = tmp_reader.readColumn(cd_copy, start_pack_id, pack_count, read_rows);
                             const IColumn * raw = real_col.get();
                             if (const auto * nullable = typeid_cast<const ColumnNullable *>(raw))
                                 raw = &nullable->getNestedColumn();
