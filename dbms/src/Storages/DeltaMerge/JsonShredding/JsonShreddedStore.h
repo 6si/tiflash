@@ -216,6 +216,18 @@ private:
         return c;
     }
 
+    struct ManifestCacheEntry
+    {
+        UInt64 num_rows;
+        std::vector<SidecarSchemaEntry> entries;
+    };
+
+    static std::unordered_map<String, ManifestCacheEntry> & manifestCache()
+    {
+        static std::unordered_map<String, ManifestCacheEntry> c;
+        return c;
+    }
+
     static String cacheKey(const String & dmfile_path, const String & col_name)
     {
         return dmfile_path + "/" + col_name;

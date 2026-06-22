@@ -478,6 +478,18 @@ std::vector<SidecarSchemaEntry> JsonShreddedStore::readSidecarManifest(
     const String & col_name,
     UInt64 & out_num_rows)
 {
+    // Check manifest cache first — avoids filesystem stat + read on every readSidecarColumn call.
+    {
+        std::lock_guard lock(cacheMutex());
+        auto key = cacheKey(dmfile_path, col_name);
+        auto it = manifestCache().find(key);
+        if (it != manifestCache().end())
+        {
+            out_num_rows = it->second.num_rows;
+            return it->second.entries;
+        }
+    }
+
     String dir = sidecarPath(dmfile_path, col_name);
     String manifest_path = dir + "/manifest.bin";
 
@@ -522,6 +534,13 @@ std::vector<SidecarSchemaEntry> JsonShreddedStore::readSidecarManifest(
             entry.encoding = static_cast<UInt8>(SubColumnEncoding::Raw);
         }
         entries.push_back(std::move(entry));
+    }
+
+    // Cache the manifest for future lookups
+    {
+        std::lock_guard lock(cacheMutex());
+        auto key = cacheKey(dmfile_path, col_name);
+        manifestCache()[key] = ManifestCacheEntry{num_rows, entries};
     }
 
     return entries;
