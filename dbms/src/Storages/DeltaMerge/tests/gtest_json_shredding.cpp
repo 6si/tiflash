@@ -2665,6 +2665,142 @@ CATCH
 
 
 // ============================================================================
+// All-Null JSON Block Sidecar Row-Count Shortfall Test (5770 NULL Bug)
+//
+// Reproduces the bug where blocks of all-empty JSON objects ({}) produce
+// empty sub_columns during shredding, causing the block to be skipped in
+// block_results. The sidecar ends up with fewer rows than the DMFile total.
+// On read, the last multi-pack batch has row_offset + row_count > sidecar rows
+// → sub_col is too small → falls back to blob on placeholder → NULLs.
+// ============================================================================
+
+TEST_F(JsonEdgeCaseTest, AllEmptyJsonBlocksCauseSidecarRowShortfall)
+try
+{
+    const size_t normal_batch = 150;
+    const size_t empty_batch = 150;
+
+    // Batch 1: normal JSON objects with extractable keys
+    {
+        auto block = DMTestEnv::prepareSimpleWriteBlock(0, normal_batch, false, 2);
+        auto json_col = ColumnString::create();
+        for (size_t i = 0; i < normal_batch; ++i)
+        {
+            auto json = buildBinaryJsonObject(
+                {{"event", (i % 2 == 0) ? "purchase" : "click"}},
+                {{"score", static_cast<Int64>(i * 10)}});
+            json_col->insertData(json.data(), json.size());
+        }
+        block.insert(ColumnWithTypeAndName{
+            std::move(json_col),
+            DataTypeFactory::instance().get(DataTypeString::getDefaultName()),
+            JSON_COL_NAME,
+            JSON_COL_ID});
+        store->write(*db_context, db_context->getSettingsRef(), block);
+    }
+
+    // Batch 2: all-empty JSON objects {} — no extractable keys.
+    // This is the trigger: shredder returns empty sub_columns for
+    // every row in this block → block not appended to block_results
+    // → sidecar has only `normal_batch` rows instead of total.
+    {
+        auto block = DMTestEnv::prepareSimpleWriteBlock(normal_batch, normal_batch + empty_batch, false, 2);
+        auto json_col = ColumnString::create();
+        // Empty JSON object: type=OBJECT, elem_count=0, size=8
+        auto empty_obj = buildBinaryJsonObject({});
+        for (size_t i = 0; i < empty_batch; ++i)
+            json_col->insertData(empty_obj.data(), empty_obj.size());
+        block.insert(ColumnWithTypeAndName{
+            std::move(json_col),
+            DataTypeFactory::instance().get(DataTypeString::getDefaultName()),
+            JSON_COL_NAME,
+            JSON_COL_ID});
+        store->write(*db_context, db_context->getSettingsRef(), block);
+    }
+
+    store->flushCache(*db_context, RowKeyRange::newAll(false, 1));
+    store->mergeDeltaAll(*db_context);
+
+    size_t total_expected = normal_batch + empty_batch;
+
+    // Verify all rows are readable and no SQL NULLs in payload column
+    auto blocks = readAllBlocks();
+    EXPECT_EQ(countTotalRows(blocks), total_expected)
+        << "Expected " << total_expected << " rows after compaction with all-empty JSON block";
+    EXPECT_EQ(countSqlNullPayloads(blocks), 0)
+        << "Payload column has SQL NULLs — all-empty JSON block caused sidecar row-count shortfall (5770 bug)";
+
+    // Verify sidecar exists and row count matches
+    for (const auto & [_, seg] : store->segments)
+    {
+        const auto & files = seg->getStable()->getDMFiles();
+        for (const auto & f : files)
+        {
+            ASSERT_TRUE(JsonShreddedStore::hasSidecar(f->path(), JSON_COL_NAME))
+                << "DMFile at " << f->path() << " missing sidecar";
+        }
+    }
+}
+CATCH
+
+
+// Same as above but interleaved: normal → empty → normal → empty.
+// This exercises the merge path where empty blocks appear between normal ones.
+TEST_F(JsonEdgeCaseTest, InterleavedEmptyAndNormalJsonBlocks)
+try
+{
+    const size_t batch_size = 120;
+    size_t pk = 0;
+
+    // Write 4 batches: normal, empty, normal, empty
+    for (int round = 0; round < 4; ++round)
+    {
+        auto block = DMTestEnv::prepareSimpleWriteBlock(pk, pk + batch_size, false, 2);
+        auto json_col = ColumnString::create();
+
+        if (round % 2 == 0)
+        {
+            // Normal JSON
+            for (size_t i = 0; i < batch_size; ++i)
+            {
+                auto json = buildBinaryJsonObject(
+                    {{"event", "action"}},
+                    {{"score", static_cast<Int64>(pk + i)}});
+                json_col->insertData(json.data(), json.size());
+            }
+        }
+        else
+        {
+            // All-empty JSON objects {}
+            auto empty_obj = buildBinaryJsonObject({});
+            for (size_t i = 0; i < batch_size; ++i)
+                json_col->insertData(empty_obj.data(), empty_obj.size());
+        }
+
+        block.insert(ColumnWithTypeAndName{
+            std::move(json_col),
+            DataTypeFactory::instance().get(DataTypeString::getDefaultName()),
+            JSON_COL_NAME,
+            JSON_COL_ID});
+        store->write(*db_context, db_context->getSettingsRef(), block);
+        pk += batch_size;
+    }
+
+    store->flushCache(*db_context, RowKeyRange::newAll(false, 1));
+    store->mergeDeltaAll(*db_context);
+
+    size_t total_expected = batch_size * 4;
+
+    auto blocks = readAllBlocks();
+    EXPECT_EQ(countTotalRows(blocks), total_expected)
+        << "Expected " << total_expected << " rows after compaction with interleaved empty JSON blocks";
+    EXPECT_EQ(countSqlNullPayloads(blocks), 0)
+        << "Interleaved empty JSON blocks caused SQL NULLs — sidecar row-count shortfall (5770 bug variant)";
+}
+CATCH
+
+
+// ============================================================================
 // BitmapFilter + Sidecar Row Count Mismatch Test
 //
 // Reproduces the exact bug: BitmapFilterBlockInputStream filters block rows
