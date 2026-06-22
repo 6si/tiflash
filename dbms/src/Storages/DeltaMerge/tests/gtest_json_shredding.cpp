@@ -3147,5 +3147,168 @@ try
 }
 CATCH
 
+// ============================================================================
+// Lazy blob-skip tests
+// ============================================================================
+
+/// Unit tests for ColumnString lazy blob loading used by blob-skip optimization.
+/// These tests verify that:
+///   1. size() works without triggering materialization
+///   2. Data access (getDataAt, getDataAtWithTerminatingZero) triggers materialization
+///   3. Materialized data matches the original
+///   4. insertRangeFrom a lazy column triggers materialization of the source
+///   5. filter() on a lazy column triggers materialization
+
+static void buildRealColumnData(
+    const std::vector<String> & real_data,
+    ColumnString::Chars_t & chars,
+    ColumnString::Offsets & offsets)
+{
+    chars.clear();
+    offsets.clear();
+    offsets.reserve(real_data.size());
+    for (const auto & s : real_data)
+    {
+        for (char c : s)
+            chars.push_back(static_cast<UInt8>(c));
+        chars.push_back(0); // terminating zero
+        offsets.push_back(chars.size());
+    }
+}
+
+TEST(ColumnStringLazyBlobTest, SizeDoesNotTriggerLoad)
+{
+    const size_t num_rows = 100;
+    bool loader_called = false;
+
+    auto col = ColumnString::create();
+    col->insertManyDefaults(num_rows);
+    col->setLazyBlobLoader(
+        [&loader_called](ColumnString::Chars_t &, ColumnString::Offsets &) {
+            loader_called = true;
+        });
+
+    EXPECT_EQ(col->size(), num_rows);
+    EXPECT_FALSE(loader_called) << "size() must not trigger lazy blob load";
+    EXPECT_TRUE(col->hasLazyBlob());
+}
+
+TEST(ColumnStringLazyBlobTest, GetDataTriggersLoad)
+{
+    const size_t num_rows = 5;
+    bool loader_called = false;
+    std::vector<String> real_data = {"hello", "world", "foo", "bar", "baz"};
+
+    auto col = ColumnString::create();
+    col->insertManyDefaults(num_rows);
+    col->setLazyBlobLoader(
+        [&loader_called, &real_data](ColumnString::Chars_t & chars, ColumnString::Offsets & offsets) {
+            loader_called = true;
+            buildRealColumnData(real_data, chars, offsets);
+        });
+
+    EXPECT_FALSE(loader_called);
+
+    auto ref = col->getDataAt(0);
+    EXPECT_TRUE(loader_called) << "getDataAt must trigger lazy blob load";
+    EXPECT_EQ(ref.toString(), "hello");
+
+    for (size_t i = 0; i < num_rows; ++i)
+    {
+        auto r = col->getDataAt(i);
+        EXPECT_EQ(r.toString(), real_data[i]) << "Row " << i << " mismatch after materialization";
+    }
+}
+
+TEST(ColumnStringLazyBlobTest, GetDataAtWithTerminatingZeroTriggersLoad)
+{
+    const size_t num_rows = 3;
+    int load_count = 0;
+    std::vector<String> real_data = {"alpha", "beta", "gamma"};
+
+    auto col = ColumnString::create();
+    col->insertManyDefaults(num_rows);
+    col->setLazyBlobLoader(
+        [&load_count, &real_data](ColumnString::Chars_t & chars, ColumnString::Offsets & offsets) {
+            ++load_count;
+            buildRealColumnData(real_data, chars, offsets);
+        });
+
+    // This is the exact method called by firstrow() in HashAgg
+    auto ref = col->getDataAtWithTerminatingZero(1);
+    EXPECT_EQ(load_count, 1);
+    EXPECT_EQ(String(ref.data, ref.size - 1), "beta");
+
+    // Second call must NOT re-trigger the loader (std::call_once)
+    auto ref2 = col->getDataAtWithTerminatingZero(2);
+    EXPECT_EQ(load_count, 1) << "Loader must be called exactly once";
+    EXPECT_EQ(String(ref2.data, ref2.size - 1), "gamma");
+}
+
+TEST(ColumnStringLazyBlobTest, InsertRangeFromLazySourceTriggersLoad)
+{
+    const size_t num_rows = 4;
+    bool loader_called = false;
+    std::vector<String> real_data = {"one", "two", "three", "four"};
+
+    auto src = ColumnString::create();
+    src->insertManyDefaults(num_rows);
+    src->setLazyBlobLoader(
+        [&loader_called, &real_data](ColumnString::Chars_t & chars, ColumnString::Offsets & offsets) {
+            loader_called = true;
+            buildRealColumnData(real_data, chars, offsets);
+        });
+
+    auto dst = ColumnString::create();
+    dst->insertRangeFrom(*src, 1, 2);
+    EXPECT_TRUE(loader_called);
+    EXPECT_EQ(dst->size(), 2u);
+    EXPECT_EQ(dst->getDataAt(0).toString(), "two");
+    EXPECT_EQ(dst->getDataAt(1).toString(), "three");
+}
+
+TEST(ColumnStringLazyBlobTest, FilterTriggersLoad)
+{
+    const size_t num_rows = 4;
+    bool loader_called = false;
+    std::vector<String> real_data = {"keep", "drop", "keep", "drop"};
+
+    auto col = ColumnString::create();
+    col->insertManyDefaults(num_rows);
+    col->setLazyBlobLoader(
+        [&loader_called, &real_data](ColumnString::Chars_t & chars, ColumnString::Offsets & offsets) {
+            loader_called = true;
+            buildRealColumnData(real_data, chars, offsets);
+        });
+
+    IColumn::Filter filter = {1, 0, 1, 0};
+    auto filtered = col->filter(filter, -1);
+    EXPECT_TRUE(loader_called);
+    EXPECT_EQ(filtered->size(), 2u);
+    EXPECT_EQ(filtered->getDataAt(0).toString(), "keep");
+    EXPECT_EQ(filtered->getDataAt(1).toString(), "keep");
+}
+
+TEST(ColumnStringLazyBlobTest, CopyConstructorTriggersLoad)
+{
+    const size_t num_rows = 2;
+    bool loader_called = false;
+    std::vector<String> real_data = {"copy_me", "too"};
+
+    auto col = ColumnString::create();
+    col->insertManyDefaults(num_rows);
+    col->setLazyBlobLoader(
+        [&loader_called, &real_data](ColumnString::Chars_t & chars, ColumnString::Offsets & offsets) {
+            loader_called = true;
+            buildRealColumnData(real_data, chars, offsets);
+        });
+
+    auto cloned = col->cloneResized(num_rows);
+    EXPECT_TRUE(loader_called);
+    EXPECT_EQ(cloned->size(), num_rows);
+    EXPECT_EQ(cloned->getDataAt(0).toString(), "copy_me");
+    EXPECT_EQ(cloned->getDataAt(1).toString(), "too");
+}
+
 
 } // namespace DB::DM::tests

@@ -37,8 +37,17 @@ extern const int PARAMETER_OUT_OF_BOUND;
 extern const int SIZES_OF_COLUMNS_DOESNT_MATCH;
 } // namespace ErrorCodes
 
+void ColumnString::ensureBlobLoadedSlow() const
+{
+    std::call_once(lazy_blob_->flag, [this]() {
+        auto * self = const_cast<ColumnString *>(this);
+        lazy_blob_->load_fn(self->chars, self->offsets);
+    });
+}
+
 MutableColumnPtr ColumnString::cloneResized(size_t to_size) const
 {
+    ensureBlobLoaded();
     auto res = ColumnString::create();
 
     if (to_size == 0)
@@ -87,6 +96,7 @@ void ColumnString::insertRangeFrom(const IColumn & src, size_t start, size_t len
         return;
 
     const auto & src_concrete = static_cast<const ColumnString &>(src);
+    src_concrete.ensureBlobLoaded();
 
     if (start + length > src_concrete.offsets.size())
         throw Exception(
@@ -123,6 +133,7 @@ void ColumnString::insertRangeFrom(const IColumn & src, size_t start, size_t len
 
 ColumnPtr ColumnString::filter(const Filter & filt, ssize_t result_size_hint) const
 {
+    ensureBlobLoaded();
     if (offsets.empty())
         return ColumnString::create();
 
@@ -138,6 +149,7 @@ ColumnPtr ColumnString::filter(const Filter & filt, ssize_t result_size_hint) co
 
 ColumnPtr ColumnString::permute(const Permutation & perm, size_t limit) const
 {
+    ensureBlobLoaded();
     size_t size = offsets.size();
 
     if (limit == 0)
@@ -212,6 +224,7 @@ struct ColumnString::less
 
 void ColumnString::getPermutation(bool reverse, size_t limit, int /*nan_direction_hint*/, Permutation & res) const
 {
+    ensureBlobLoaded();
     size_t s = offsets.size();
     res.resize(s);
     for (size_t i = 0; i < s; ++i)
@@ -239,6 +252,7 @@ void ColumnString::getPermutation(bool reverse, size_t limit, int /*nan_directio
 ColumnPtr ColumnString::replicateRange(size_t start_row, size_t end_row, const IColumn::Offsets & replicate_offsets)
     const
 {
+    ensureBlobLoaded();
     size_t col_rows = size();
     if (col_rows != replicate_offsets.size())
         throw Exception("Size of offsets doesn't match size of column.", ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);

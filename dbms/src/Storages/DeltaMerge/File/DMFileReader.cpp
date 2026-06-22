@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <Columns/ColumnString.h>
 #include <Columns/countBytesInFilter.h>
 #include <Common/Exception.h>
 #include <Common/MemoryTracker.h>
@@ -361,8 +362,14 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
 
                 if (!manifest_entries.empty())
                 {
-                    // Sidecar available — blob will still be read below for correctness,
-                    // but json_extract will use sidecar sub-columns to skip JSON parsing.
+                    // Sidecar available — skip the blob read entirely (blob-skip).
+                    // Create a lightweight placeholder ColumnString instead.
+                    // json_extract / FunctionJsonShreddedFilter use sidecar sub-columns
+                    // and never access the placeholder data.
+                    // If any other operation (firstrow in HashAgg, serialization, etc.)
+                    // accesses this column's data, the lazy loader fires and reads the
+                    // blob from disk on demand. This preserves correctness while saving
+                    // ~55MB I/O for filter-only queries.
                     sidecar_attachment = std::make_shared<DM::ColumnShreddedAttachment>();
                     sidecar_attachment->dmfile_path = dmfile_path;
                     sidecar_attachment->col_name = cd.name;
@@ -372,14 +379,32 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
                     sidecar_attachment->row_offset = start_row_offset;
                     sidecar_attachment->row_count = read_rows;
 
+                    // Create placeholder column with correct row count, minimal memory.
+                    auto placeholder = ColumnString::create();
+                    placeholder->insertManyDefaults(read_rows);
+
+                    // Capture context for deferred blob read.
+                    auto cd_copy = cd;
+                    placeholder->setLazyBlobLoader(
+                        [this, cd_copy, start_pack_id, pack_count, read_rows](
+                            ColumnString::Chars_t & out_chars,
+                            ColumnString::Offsets & out_offsets) {
+                            auto real_col = readColumn(cd_copy, start_pack_id, pack_count, read_rows);
+                            const auto & real_str = static_cast<const ColumnString &>(*real_col);
+                            out_chars.assign(real_str.getChars().begin(), real_str.getChars().end());
+                            out_offsets.assign(real_str.getOffsets().begin(), real_str.getOffsets().end());
+                        });
+
+                    col = std::move(placeholder);
+
                     static std::atomic<int> skip_log_count{0};
                     if (skip_log_count.fetch_add(1) < 5)
                     {
                         static auto skip_log = Logger::get("JsonShredDiag");
                         LOG_INFO(
                             skip_log,
-                            "SIDECAR-ATTACH: col='{}' col_id={} dmfile='{}' "
-                            "paths={} read_rows={} — reading blob + attaching sidecar",
+                            "BLOB-SKIP: col='{}' col_id={} dmfile='{}' "
+                            "paths={} read_rows={} — placeholder created, blob deferred",
                             cd.name,
                             cd.id,
                             dmfile_path,
