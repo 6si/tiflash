@@ -2744,6 +2744,89 @@ try
 CATCH
 
 
+// Reproduces the EXACT 5770 bug: the last block during compaction has fewer
+// than min_rows_for_inference (100) rows, so schema inference produces empty
+// sub_columns. If the write path drops that block from block_results, the
+// sidecar num_rows falls short of DMFile total → NULLs on read.
+TEST_F(JsonEdgeCaseTest, SmallFinalBlockBelowInferenceThreshold)
+try
+{
+    const size_t large_batch = 150; // Above min_rows_for_inference (100)
+    const size_t small_batch = 80;  // Below threshold — triggers the bug
+
+    // Batch 1: 150 normal JSON rows — flush to separate delta column file
+    {
+        auto block = DMTestEnv::prepareSimpleWriteBlock(0, large_batch, false, 2);
+        auto json_col = ColumnString::create();
+        for (size_t i = 0; i < large_batch; ++i)
+        {
+            auto json = buildBinaryJsonObject(
+                {{"event", "purchase"}},
+                {{"score", static_cast<Int64>(i)}});
+            json_col->insertData(json.data(), json.size());
+        }
+        block.insert(ColumnWithTypeAndName{
+            std::move(json_col),
+            DataTypeFactory::instance().get(DataTypeString::getDefaultName()),
+            JSON_COL_NAME,
+            JSON_COL_ID});
+        store->write(*db_context, db_context->getSettingsRef(), block);
+    }
+    store->flushCache(*db_context, RowKeyRange::newAll(false, 1));
+
+    // Batch 2: 80 normal JSON rows — flush to a SEPARATE delta column file
+    // During MergeDelta, this becomes the last block with only 80 rows.
+    // min_rows_for_inference=100 → schema inference skipped → sub_columns.empty()
+    // BUG: block dropped from block_results → sidecar has only 150 rows
+    {
+        auto block = DMTestEnv::prepareSimpleWriteBlock(large_batch, large_batch + small_batch, false, 3);
+        auto json_col = ColumnString::create();
+        for (size_t i = 0; i < small_batch; ++i)
+        {
+            auto json = buildBinaryJsonObject(
+                {{"event", "click"}},
+                {{"score", static_cast<Int64>(large_batch + i)}});
+            json_col->insertData(json.data(), json.size());
+        }
+        block.insert(ColumnWithTypeAndName{
+            std::move(json_col),
+            DataTypeFactory::instance().get(DataTypeString::getDefaultName()),
+            JSON_COL_NAME,
+            JSON_COL_ID});
+        store->write(*db_context, db_context->getSettingsRef(), block);
+    }
+    store->flushCache(*db_context, RowKeyRange::newAll(false, 1));
+
+    // Compact: merges both delta column files into one stable DMFile
+    store->mergeDeltaAll(*db_context);
+
+    size_t total_expected = large_batch + small_batch; // 230
+
+    // Read back and verify
+    auto blocks = readAllBlocks();
+    EXPECT_EQ(countTotalRows(blocks), total_expected)
+        << "Expected " << total_expected << " rows but got fewer — small final block was lost";
+    EXPECT_EQ(countSqlNullPayloads(blocks), 0)
+        << "Small final block (<100 rows) caused sidecar row-count shortfall → NULLs (5770 bug)";
+
+    // Verify sidecar row count matches DMFile total
+    for (const auto & [_, seg] : store->segments)
+    {
+        const auto & files = seg->getStable()->getDMFiles();
+        for (const auto & f : files)
+        {
+            ASSERT_TRUE(JsonShreddedStore::hasSidecar(f->path(), JSON_COL_NAME));
+            UInt64 manifest_rows = 0;
+            auto entries = JsonShreddedStore::readSidecarManifest(f->path(), JSON_COL_NAME, manifest_rows);
+            EXPECT_EQ(manifest_rows, total_expected)
+                << "Sidecar num_rows=" << manifest_rows << " != DMFile total=" << total_expected
+                << " — small final block was dropped from block_results";
+        }
+    }
+}
+CATCH
+
+
 // Same as above but interleaved: normal → empty → normal → empty.
 // This exercises the merge path where empty blocks appear between normal ones.
 TEST_F(JsonEdgeCaseTest, InterleavedEmptyAndNormalJsonBlocks)
