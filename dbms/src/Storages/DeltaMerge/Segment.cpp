@@ -253,8 +253,11 @@ DMFilePtr writeIntoNewDMFile(
                 JsonShredder shredder;
                 ShreddedJsonData block_shredded = shredder.shred(*col_string);
                 state->total_rows += col_string->size();
-                if (!block_shredded.sub_columns.empty())
-                    state->block_results.push_back(std::move(block_shredded));
+                // Always append — even when sub_columns is empty (schema inference failed,
+                // e.g. block too small for min_rows_for_inference). The merge path uses
+                // original_blob to track total row count; omitting a block causes the sidecar
+                // num_rows to fall short of DMFile total rows, producing NULLs for those rows.
+                state->block_results.push_back(std::move(block_shredded));
             }
         }
 
