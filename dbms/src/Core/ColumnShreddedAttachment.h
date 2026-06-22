@@ -88,6 +88,11 @@ struct ColumnShreddedAttachment
     /// to block the findByColName() fallback in FunctionsJson/FunctionJsonShreddedFilter,
     /// preventing stale sidecar attachments from poisoning real-blob column reads.
     bool is_ngc = false;
+
+    /// MVCC row-selection filter: non-empty when MVCC filtering reduced the block's row
+    /// count below row_count. Each element is 1 (row survived) or 0 (row filtered out).
+    /// Length == row_count. FunctionsJson applies this to sub_col to get the right rows.
+    std::vector<UInt8> mvcc_filter;
 };
 
 using ColumnShreddedAttachmentPtr = std::shared_ptr<const ColumnShreddedAttachment>;

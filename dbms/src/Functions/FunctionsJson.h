@@ -216,6 +216,16 @@ public:
                             }
                         }
 
+                        // Apply MVCC filter if present (set when DMVersionFilter
+                        // reduced the block's row count below the sidecar row_count).
+                        if (sub_col && !attach.mvcc_filter.empty()
+                            && sub_col->size() == attach.row_count)
+                        {
+                            IColumn::Filter filter;
+                            filter.insert(filter.end(), attach.mvcc_filter.begin(), attach.mvcc_filter.end());
+                            sub_col = sub_col->filter(filter, rows);
+                        }
+
                         if (sub_col)
                         {
                             res_col = convertShreddedToJsonBinary(sub_col, rows);

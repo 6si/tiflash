@@ -193,6 +193,21 @@ public:
             }
         }
 
+        // Apply MVCC filter if present (set when DMVersionFilter reduced the block's
+        // row count below the sidecar row_count after MVCC filtering).
+        if (sub_col && !attach.mvcc_filter.empty() && sub_col->size() == attach.row_count)
+        {
+            IColumn::Filter filter;
+            filter.insert(filter.end(), attach.mvcc_filter.begin(), attach.mvcc_filter.end());
+            sub_col = sub_col->filter(filter, rows);
+        }
+
+        if (!sub_col || sub_col->size() != rows)
+        {
+            setAllNull(block, result, rows);
+            return;
+        }
+
         // Decode the comparison value from binary JSON
         String compare_value = decodeBinaryJsonToString(value_binary_json);
 
@@ -294,7 +309,7 @@ private:
             auto json_ref = str_col->getDataAt(i);
             if (json_ref.size < 1)
                 continue;
-            JsonBinary json_bin(json_ref.data[0], StringRef(json_ref.data + 1, json_ref.size - 1));
+            JsonBinary json_bin(static_cast<UInt8>(json_ref.data[0]), StringRef(json_ref.data + 1, json_ref.size - 1));
 
             ColumnString::Chars_t buf;
             buf.reserve(64);

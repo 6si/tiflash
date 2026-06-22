@@ -14,6 +14,8 @@
 
 #include <DataStreams/SelectionByColumnIdTransformAction.h>
 
+#include <Core/ColumnShreddedAttachment.h>
+
 namespace DB
 {
 SelectionByColumnIdTransformAction::SelectionByColumnIdTransformAction(
@@ -52,6 +54,20 @@ Block SelectionByColumnIdTransformAction::filterAndTransform(
         auto col_to_trans = in_block.getByPosition(col_offset_by_id.at(c.column_id));
         col_to_trans.name = c.name;
         col_to_trans.column = col_to_trans.column->filter(filter, result_size_hint);
+
+        // When this column has a shredded sidecar attachment AND MVCC filtering reduced
+        // the row count, attach the filter bitmap so FunctionsJson can select the correct
+        // sidecar rows. The attachment's row_count reflects the unfiltered pack size; the
+        // mvcc_filter tells FunctionsJson which of those rows actually survived.
+        if (col_to_trans.shredded_attachment && !col_to_trans.shredded_attachment->is_ngc
+            && !filter.empty()
+            && col_to_trans.column->size() != col_to_trans.shredded_attachment->row_count)
+        {
+            auto new_attach = std::make_shared<DM::ColumnShreddedAttachment>(*col_to_trans.shredded_attachment);
+            new_attach->mvcc_filter.assign(filter.begin(), filter.end());
+            col_to_trans.shredded_attachment = std::move(new_attach);
+        }
+
         new_block.insert(std::move(col_to_trans));
     }
     return new_block;
