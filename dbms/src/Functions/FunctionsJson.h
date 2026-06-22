@@ -333,10 +333,19 @@ private:
         offsets_to.resize(rows);
         ColumnUInt8::MutablePtr col_null_map = ColumnUInt8::create(rows, 0);
         ColumnUInt8::Container & null_map_to = col_null_map->getData();
-        JsonBinary::JsonBinaryWriteBuffer write_buffer(data_to, rows);
 
         const auto & null_map = nullable->getNullMapData();
         const auto & nested = nullable->getNestedColumn();
+
+        // Pre-compute reserve size to avoid mid-loop reallocations.
+        // Int64/UInt64/Float64: 10 bytes/row (type_code + 8-byte value + null-term).
+        // Strings: estimate ~12 bytes/row (type_code + varint + avg string + null-term).
+        size_t bytes_per_row = 12;
+        if (typeid_cast<const ColumnInt64 *>(&nested)
+            || typeid_cast<const ColumnUInt64 *>(&nested)
+            || typeid_cast<const ColumnFloat64 *>(&nested))
+            bytes_per_row = 10;
+        JsonBinary::JsonBinaryWriteBuffer write_buffer(data_to, rows * bytes_per_row);
 
         // Detect column type ONCE outside the loop (all rows have the same type).
         // This eliminates per-row typeid_cast dispatch — major CPU savings.
