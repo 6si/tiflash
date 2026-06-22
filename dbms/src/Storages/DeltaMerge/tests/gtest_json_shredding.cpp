@@ -2665,6 +2665,122 @@ CATCH
 
 
 // ============================================================================
+// JSON Null Literal vs SQL NULL Distinction Test
+//
+// Verifies that the sidecar preserves the distinction between:
+//   - Missing key (key absent from JSON object) → SQL NULL (null_map=1)
+//   - JSON null literal (key present, value is JSON null) → JSON null (null_map=2)
+//
+// Bug: JsonShredder::extractRow used null_map=1 for BOTH cases, causing
+// json_extract to return SQL NULL for both. Fix uses null_map=2 sentinel
+// for "key present, value is JSON null".
+// ============================================================================
+
+TEST_F(JsonEdgeCaseTest, JsonNullLiteralDistinctFromSqlNull)
+try
+{
+    const size_t batch = 120;
+
+    // Write rows with 3 patterns:
+    //   Pattern A (40 rows): {"event":"purchase","score":N} — normal
+    //   Pattern B (40 rows): {"score":N}                    — missing "event" key (SQL NULL)
+    //   Pattern C (40 rows): {"event":null,"score":N}       — JSON null literal for "event"
+    Block block = DMTestEnv::prepareSimpleWriteBlock(0, batch, false, 2);
+    auto json_col = ColumnString::create();
+    for (size_t i = 0; i < batch; ++i)
+    {
+        Int64 score = static_cast<Int64>(i);
+        String json;
+        switch (i % 3)
+        {
+        case 0: // Pattern A: normal
+            json = buildBinaryJsonObject({{"event", "purchase"}}, {{"score", score}});
+            break;
+        case 1: // Pattern B: missing "event" key entirely
+            json = buildBinaryJsonObject({}, {{"score", score}});
+            break;
+        case 2: // Pattern C: "event" key present, value is JSON null
+            json = buildBinaryJsonObject({}, {{"score", score}}, {}, {"event"});
+            break;
+        }
+        json_col->insertData(json.data(), json.size());
+    }
+    block.insert(ColumnWithTypeAndName{
+        std::move(json_col),
+        DataTypeFactory::instance().get(DataTypeString::getDefaultName()),
+        JSON_COL_NAME,
+        JSON_COL_ID});
+    store->write(*db_context, db_context->getSettingsRef(), block);
+
+    store->flushCache(*db_context, RowKeyRange::newAll(false, 1));
+    store->mergeDeltaAll(*db_context);
+
+    // Verify basic correctness
+    auto blocks = readAllBlocks();
+    EXPECT_EQ(countTotalRows(blocks), batch);
+    EXPECT_EQ(countSqlNullPayloads(blocks), 0)
+        << "Payload column has SQL NULLs — raw blob was corrupted";
+
+    // Read the sidecar and check null_map values for the "event" sub-column
+    for (const auto & [_, seg] : store->segments)
+    {
+        const auto & files = seg->getStable()->getDMFiles();
+        for (const auto & f : files)
+        {
+            ASSERT_TRUE(JsonShreddedStore::hasSidecar(f->path(), JSON_COL_NAME));
+
+            auto sidecar = JsonShreddedStore::readSidecar(f->path(), JSON_COL_NAME);
+            ASSERT_TRUE(sidecar.has_value());
+
+            // Find the "event" sub-column
+            bool found_event = false;
+            for (const auto & sub_col : sidecar->sub_columns)
+            {
+                if (sub_col.path != "event")
+                    continue;
+                found_event = true;
+
+                ASSERT_NE(sub_col.data, nullptr);
+                const auto & nullable = assert_cast<const ColumnNullable &>(*sub_col.data);
+                const auto & null_map = nullable.getNullMapData();
+
+                // Count the different null_map values:
+                // null_map=0: non-null (Pattern A: "purchase")
+                // null_map=1: SQL NULL (Pattern B: key absent)
+                // null_map=2: JSON null literal (Pattern C: key present, value null)
+                size_t count_normal = 0, count_sql_null = 0, count_json_null = 0;
+                for (size_t i = 0; i < null_map.size(); ++i)
+                {
+                    if (null_map[i] == 0)
+                        ++count_normal;
+                    else if (null_map[i] == 1)
+                        ++count_sql_null;
+                    else if (null_map[i] == 2)
+                        ++count_json_null;
+                }
+
+                EXPECT_EQ(count_normal, 40)
+                    << "Expected 40 non-null 'event' values (Pattern A)";
+                EXPECT_EQ(count_sql_null, 40)
+                    << "Expected 40 SQL NULL 'event' values (Pattern B: missing key)";
+
+                // THE KEY CHECK: JSON null literals should use null_map=2,
+                // NOT null_map=1. Before the fix, both are null_map=1.
+                bool json_null_distinguished = (count_json_null == 40);
+                EXPECT_TRUE(json_null_distinguished)
+                    << "JSON null literals not distinguished from SQL NULLs in sidecar null_map. "
+                    << "count_json_null(null_map=2)=" << count_json_null
+                    << " count_sql_null(null_map=1)=" << count_sql_null
+                    << ". Expected 40 each. json_extract will return SQL NULL for JSON null rows.";
+            }
+            EXPECT_TRUE(found_event) << "No 'event' sub-column found in sidecar";
+        }
+    }
+}
+CATCH
+
+
+// ============================================================================
 // All-Null JSON Block Sidecar Row-Count Shortfall Test (5770 NULL Bug)
 //
 // Reproduces the bug where blocks of all-empty JSON objects ({}) produce
