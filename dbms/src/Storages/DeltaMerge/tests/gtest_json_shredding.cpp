@@ -15,13 +15,17 @@
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnsNumber.h>
+#include <Columns/countBytesInFilter.h>
 #include <Common/assert_cast.h>
 #include <Core/ColumnShreddedAttachment.h>
 #include <Core/ColumnWithTypeAndName.h>
 #include <Core/ShreddedAttachmentCache.h>
+#include <DataStreams/OneBlockInputStream.h>
 #include <DataTypes/DataTypeString.h>
 #include <Debug/TiFlashTestEnv.h>
 #include <Poco/File.h>
+#include <Storages/DeltaMerge/BitmapFilter/BitmapFilter.h>
+#include <Storages/DeltaMerge/BitmapFilter/BitmapFilterBlockInputStream.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonPathOptimizer.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonSchemaTree.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonShredder.h>
@@ -2656,6 +2660,155 @@ try
     EXPECT_EQ(countTotalRows(blocks2), batch * 2);
     EXPECT_EQ(countSqlNullPayloads(blocks2), 0)
         << "Payload column has SQL NULLs after second merge with mixed edge cases";
+}
+CATCH
+
+
+// ============================================================================
+// BitmapFilter + Sidecar Row Count Mismatch Test
+//
+// Reproduces the exact bug: BitmapFilterBlockInputStream filters block rows
+// (MVCC dedup) but does NOT update the shredded_attachment row_count.
+// FunctionJsonExtract then sees sub_col->size() != block.rows() → returns
+// nullptr → falls back to blob parse on placeholder column → NULLs.
+// ============================================================================
+
+// Direct unit test: creates a Block with shredded_attachment, filters via
+// BitmapFilterBlockInputStream, and checks the attachment is updated.
+TEST(JsonBitmapFilterMismatchTest, AttachmentRowCountUpdatedAfterFilter)
+try
+{
+    const size_t total_rows = 200;
+    const size_t filtered_rows = 120; // After BitmapFilter, 120 of 200 survive
+
+    // Build a block with a payload column that has a shredded_attachment
+    auto payload_col = ColumnString::create();
+    for (size_t i = 0; i < total_rows; ++i)
+        payload_col->insertData("placeholder", 11);
+
+    auto attach = std::make_shared<ColumnShreddedAttachment>();
+    attach->row_offset = 0;
+    attach->row_count = total_rows;
+    attach->dmfile_path = "/fake/dmfile/path";
+    attach->col_name = "payload";
+
+    Block block;
+    ColumnWithTypeAndName col;
+    col.column = std::move(payload_col);
+    col.type = DataTypeFactory::instance().get(DataTypeString::getDefaultName());
+    col.name = "payload";
+    col.column_id = 100;
+    col.shredded_attachment = attach;
+    block.insert(std::move(col));
+    block.setStartOffset(0);
+
+    // Create a BitmapFilter: first 120 rows pass, last 80 filtered out
+    auto bitmap = std::make_shared<BitmapFilter>(total_rows, false);
+    for (UInt32 i = 0; i < filtered_rows; ++i)
+        (*bitmap)[i] = 1;
+
+    // Column definitions for BitmapFilterBlockInputStream
+    ColumnDefines col_defs;
+    col_defs.push_back(ColumnDefine{100, "payload",
+        DataTypeFactory::instance().get(DataTypeString::getDefaultName())});
+
+    auto inner_stream = std::make_shared<OneBlockInputStream>(block);
+    // Use base class pointer — read() is public on IBlockInputStream
+    BlockInputStreamPtr bitmap_stream
+        = std::make_shared<BitmapFilterBlockInputStream>(col_defs, inner_stream, bitmap);
+
+    bitmap_stream->readPrefix();
+    auto result = bitmap_stream->read();
+    bitmap_stream->readSuffix();
+
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result.rows(), filtered_rows)
+        << "BitmapFilter should reduce block from " << total_rows << " to " << filtered_rows << " rows";
+
+    // THE KEY CHECK: the shredded_attachment must be usable for the filtered block.
+    // Either row_count is updated to match filtered rows, or a filter bitmap is stored.
+    const auto & out_col = result.getByName("payload");
+    ASSERT_NE(out_col.shredded_attachment, nullptr)
+        << "Shredded attachment was lost during BitmapFilter";
+
+    // The attachment must allow FunctionJsonExtract to get exactly filtered_rows
+    // worth of sidecar data. If row_count still equals total_rows (the bug),
+    // convertShreddedToJsonBinary will fail with sub_col->size() != block.rows().
+    const auto & out_attach = *out_col.shredded_attachment;
+
+    // After the fix, either:
+    //   (a) row_count was reduced to match filtered_rows, or
+    //   (b) the attachment was replaced with one carrying an mvcc_filter bitmap
+    bool has_correct_row_count = (out_attach.row_count == filtered_rows);
+    bool is_different_attachment = (out_col.shredded_attachment.get() != attach.get());
+
+    EXPECT_TRUE(has_correct_row_count || is_different_attachment)
+        << "BitmapFilter did not propagate row reduction to shredded_attachment. "
+        << "attachment.row_count=" << out_attach.row_count
+        << " but block.rows()=" << filtered_rows
+        << ". This causes FunctionJsonExtract to return NULLs (the 99M NULL bug).";
+}
+CATCH
+
+
+// End-to-end test: overlapping MVCC writes create the BitmapFilter scenario
+// during reads. Verifies that sidecar-enabled reads with MVCC dedup return
+// correct data (no NULLs in payload) for all visible rows.
+TEST_F(JsonCompactionSidecarTest, MVCCOverlapDoesNotCorruptSidecar)
+try
+{
+    const size_t batch1 = 200;
+    const size_t overlap = 100; // handles 50-149 written twice
+
+    // Batch 1: write 200 rows (handles 0-199) → flush → compact into stable with sidecars
+    {
+        auto block = prepareJsonWriteBlock(0, batch1, /*tso=*/2);
+        store->write(*db_context, db_context->getSettingsRef(), block);
+    }
+    store->flushCache(*db_context, RowKeyRange::newAll(false, 1));
+    store->mergeDeltaAll(*db_context);
+
+    // Verify stable has sidecars
+    {
+        auto paths = getStableDMFilePaths();
+        ASSERT_FALSE(paths.empty());
+        for (const auto & p : paths)
+            ASSERT_TRUE(JsonShreddedStore::hasSidecar(p, JSON_COL_NAME));
+    }
+
+    // Batch 2: write 100 overlapping rows (handles 50-149, higher tso) → flush only
+    // This creates MVCC versions: stable has old version, delta has new version for handles 50-149.
+    // On read, BitmapFilter will filter out the 100 old stable rows for handles 50-149.
+    {
+        auto block = prepareJsonWriteBlock(50, 50 + overlap, /*tso=*/3);
+        store->write(*db_context, db_context->getSettingsRef(), block);
+    }
+    store->flushCache(*db_context, RowKeyRange::newAll(false, 1));
+
+    // Read all data — BitmapFilter will filter stable rows where delta has newer versions.
+    // Total visible rows = 200 (100 unique stable + 100 from delta).
+    auto blocks = readAllBlocks();
+    size_t total_rows = countTotalRows(blocks);
+    EXPECT_EQ(total_rows, batch1)
+        << "Expected " << batch1 << " visible rows after MVCC dedup, got " << total_rows;
+
+    // Verify no NULL payloads — every row has valid JSON.
+    // If BitmapFilter + sidecar mismatch bug is present, stable blocks
+    // get attachment.row_count > block.rows() after filtering → NULLs.
+    size_t null_count = 0;
+    for (const auto & blk : blocks)
+    {
+        if (!blk.has(JSON_COL_NAME))
+            continue;
+        const auto & payload_col = blk.getByName(JSON_COL_NAME);
+        for (size_t i = 0; i < payload_col.column->size(); ++i)
+        {
+            if (payload_col.column->isNullAt(i))
+                ++null_count;
+        }
+    }
+    EXPECT_EQ(null_count, 0)
+        << "Found " << null_count << " NULL payloads — BitmapFilter + sidecar mismatch bug";
 }
 CATCH
 
