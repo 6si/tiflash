@@ -347,10 +347,9 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
             ColumnPtr col;
             std::shared_ptr<DM::ColumnShreddedAttachment> sidecar_attachment;
 
-            // JSON shredding blob-skip: check for sidecar BEFORE reading the blob.
-            // If a sidecar manifest exists, create a lightweight placeholder column
-            // instead of reading the full blob from disk (~55MB → ~1KB manifest).
-            // FunctionJsonExtract will use the sidecar data; the blob is never accessed.
+            // JSON shredding: check for sidecar manifest to enable fast json_extract path.
+            // The blob is always read for correctness (firstrow/copy operations need real data).
+            // FunctionJsonExtract will use the sidecar data to avoid JSON parsing overhead.
             if (attach_shredded
                 && cd.id != MutSup::extra_handle_id
                 && cd.id != MutSup::delmark_col_id
@@ -362,12 +361,8 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
 
                 if (!manifest_entries.empty())
                 {
-                    // Sidecar available — skip the expensive blob read.
-                    // Create a default-value placeholder column (no disk I/O).
-                    // Cannot use ColumnConst because insertSelectiveFrom
-                    // requires matching column types in the filtered read path.
-                    col = createColumnWithDefaultValue(cd, read_rows);
-
+                    // Sidecar available — blob will still be read below for correctness,
+                    // but json_extract will use sidecar sub-columns to skip JSON parsing.
                     sidecar_attachment = std::make_shared<DM::ColumnShreddedAttachment>();
                     sidecar_attachment->dmfile_path = dmfile_path;
                     sidecar_attachment->col_name = cd.name;
@@ -383,8 +378,8 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
                         static auto skip_log = Logger::get("JsonShredDiag");
                         LOG_INFO(
                             skip_log,
-                            "BLOB-SKIP: col='{}' col_id={} dmfile='{}' "
-                            "paths={} read_rows={} — skipped blob read, using sidecar",
+                            "SIDECAR-ATTACH: col='{}' col_id={} dmfile='{}' "
+                            "paths={} read_rows={} — reading blob + attaching sidecar",
                             cd.name,
                             cd.id,
                             dmfile_path,
