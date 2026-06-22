@@ -43,6 +43,11 @@ struct JsonSubColumn
     /// For Float64 paths: ColumnNullable(ColumnFloat64)
     /// For String/Mixed paths: ColumnNullable(ColumnString)
     /// For Bool paths: ColumnNullable(ColumnUInt8)
+    ///
+    /// null_map encoding:
+    ///   0 = value present (non-null)
+    ///   1 = key absent → json_extract returns SQL NULL
+    ///   2 = key present but value is JSON null literal → json_extract returns JSON null, not SQL NULL
     MutableColumnPtr data;
 
     size_t rows() const { return data ? data->size() : 0; }

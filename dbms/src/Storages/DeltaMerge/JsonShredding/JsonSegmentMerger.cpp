@@ -119,10 +119,14 @@ ColumnPtr JsonSegmentMerger::readPathAcrossSegments(
         ColumnPtr sub_col = JsonSubColumnReader::readPath(*seg, path);
         if (sub_col)
         {
-            // Segment has this path — copy the sub-column values
-            const auto & nullable = assert_cast<const ColumnNullable &>(*sub_col);
-            for (size_t i = 0; i < nullable.size(); ++i)
-                result->insert(nullable[i]);
+            // Segment has this path — copy the sub-column values preserving null_map sentinels
+            const auto & src_nullable = assert_cast<const ColumnNullable &>(*sub_col);
+            auto & dst_nullable = assert_cast<ColumnNullable &>(*result);
+            dst_nullable.getNestedColumn().insertRangeFrom(
+                src_nullable.getNestedColumn(), 0, src_nullable.size());
+            const auto & src_null_map = src_nullable.getNullMapData();
+            auto & dst_null_map = dst_nullable.getNullMapData();
+            dst_null_map.insert(dst_null_map.end(), src_null_map.begin(), src_null_map.end());
         }
         else
         {
@@ -210,12 +214,21 @@ ShreddedJsonData JsonSegmentMerger::mergeIdenticalSchemas(
         merged_sub.type = sub_a.type;
         merged_sub.is_array = sub_a.is_array;
 
-        // Clone sub_a's data and append sub_b's data
+        // Clone sub_a's data and append sub_b's data.
+        // Must use insertRangeFrom (not insert-via-Field) to preserve null_map=2 sentinel
+        // (JSON null literal: key present, value is JSON null — distinct from SQL NULL).
         auto cloned = sub_a.data->cloneFullColumn();
-        if (sub_b.data)
+        if (sub_b.data && sub_b.data->size() > 0)
         {
-            for (size_t i = 0; i < sub_b.data->size(); ++i)
-                cloned->insert((*sub_b.data)[i]);
+            auto & cloned_nullable = assert_cast<ColumnNullable &>(*cloned);
+            const auto & src_nullable = assert_cast<const ColumnNullable &>(*sub_b.data);
+            // Append nested column data verbatim (preserves raw bytes)
+            cloned_nullable.getNestedColumn().insertRangeFrom(
+                src_nullable.getNestedColumn(), 0, src_nullable.size());
+            // Append null_map verbatim (preserves sentinel value 2 for JSON null)
+            const auto & src_null_map = src_nullable.getNullMapData();
+            auto & dst_null_map = cloned_nullable.getNullMapData();
+            dst_null_map.insert(dst_null_map.end(), src_null_map.begin(), src_null_map.end());
         }
         merged_sub.data = std::move(cloned);
 

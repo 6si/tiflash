@@ -341,6 +341,22 @@ public:
     }
 
 private:
+    /// Emit a JSON null literal into write_buffer and mark the output row as non-SQL-null.
+    /// Used when sidecar null_map=2 (key present, value is JSON null).
+    static void emitJsonNullLiteral(
+        JsonBinary::JsonBinaryWriteBuffer & write_buffer,
+        ColumnString::Offsets & offsets_to,
+        ColumnUInt8::Container & null_map_to,
+        size_t row)
+    {
+        // JSON null literal = TYPE_CODE_LITERAL (0x04) + LITERAL_NIL (0x00)
+        writeChar(static_cast<char>(JsonBinary::TYPE_CODE_LITERAL), write_buffer);
+        writeChar(static_cast<char>(JsonBinary::LITERAL_NIL), write_buffer);
+        writeChar(0, write_buffer); // ColumnString null-terminator
+        null_map_to[row] = 0; // NOT SQL NULL — json_extract returns the JSON null literal
+        offsets_to[row] = write_buffer.count();
+    }
+
     /// Convert a shredded sub-column (Nullable typed values) to the binary JSON string format
     /// that json_extract normally returns.
     ColumnPtr convertShreddedToJsonBinary(const ColumnPtr & sub_col, size_t rows) const
@@ -396,6 +412,12 @@ private:
             // Phase 2: For each row, copy pre-encoded bytes by dictionary ID
             for (size_t row = 0; row < rows; ++row)
             {
+                if (null_map[row] == 2)
+                {
+                    // JSON null literal: key present, value is JSON null
+                    emitJsonNullLiteral(write_buffer, offsets_to, null_map_to, row);
+                    continue;
+                }
                 if (null_map[row])
                 {
                     null_map_to[row] = 1;
@@ -413,6 +435,11 @@ private:
         {
             for (size_t row = 0; row < rows; ++row)
             {
+                if (null_map[row] == 2)
+                {
+                    emitJsonNullLiteral(write_buffer, offsets_to, null_map_to, row);
+                    continue;
+                }
                 if (null_map[row])
                 {
                     null_map_to[row] = 1;
@@ -430,6 +457,11 @@ private:
             const auto & int_data = int_col->getData();
             for (size_t row = 0; row < rows; ++row)
             {
+                if (null_map[row] == 2)
+                {
+                    emitJsonNullLiteral(write_buffer, offsets_to, null_map_to, row);
+                    continue;
+                }
                 if (null_map[row])
                 {
                     null_map_to[row] = 1;
@@ -447,6 +479,11 @@ private:
             const auto & uint_data = uint_col->getData();
             for (size_t row = 0; row < rows; ++row)
             {
+                if (null_map[row] == 2)
+                {
+                    emitJsonNullLiteral(write_buffer, offsets_to, null_map_to, row);
+                    continue;
+                }
                 if (null_map[row])
                 {
                     null_map_to[row] = 1;
@@ -464,6 +501,11 @@ private:
             const auto & float_data = float_col->getData();
             for (size_t row = 0; row < rows; ++row)
             {
+                if (null_map[row] == 2)
+                {
+                    emitJsonNullLiteral(write_buffer, offsets_to, null_map_to, row);
+                    continue;
+                }
                 if (null_map[row])
                 {
                     null_map_to[row] = 1;

@@ -112,6 +112,7 @@ std::vector<JsonSubColumn> JsonShredder::initSubColumns(
         }
 
         sub_col.data = ColumnNullable::create(std::move(inner), ColumnUInt8::create());
+        // json_null_bitmap is populated by extractRow; pre-reserve but do not size here.
         sub_columns.push_back(std::move(sub_col));
     }
 
@@ -125,11 +126,11 @@ void JsonShredder::extractRow(
 {
     if (json_data.size == 0)
     {
-        // NULL row — insert NULL into all sub-columns
+        // NULL row — key absent, SQL NULL (null_map=1)
         for (auto & sub_col : sub_columns)
         {
             auto & nullable = assert_cast<ColumnNullable &>(*sub_col.data);
-            nullable.insertDefault(); // inserts NULL
+            nullable.insertDefault();
         }
         return;
     }
@@ -147,19 +148,24 @@ void JsonShredder::extractRow(
 
         if (!nav_result.has_value())
         {
-            nullable.insertDefault(); // NULL — path not present
+            // Key absent — null_map=1 (SQL NULL — json_extract returns SQL NULL)
+            nullable.insertDefault();
             continue;
         }
 
         auto & val = nav_result.value();
 
-        // Check for JSON null literal
+        // Check for JSON null literal — key present but value is JSON null
         if (val.type == JsonBinary::TYPE_CODE_LITERAL)
         {
             UInt8 lit = JsonBinaryNavigator::getLiteral(val);
             if (lit == JsonBinary::LITERAL_NIL)
             {
-                nullable.insertDefault();
+                // Key present, value is JSON null: use null_map=2 sentinel.
+                // convertShreddedToJsonBinary emits the JSON null literal for these rows,
+                // so json_extract returns JSON null (not SQL NULL).
+                nullable.getNestedColumn().insertDefault();
+                nullable.getNullMapData().push_back(2);
                 continue;
             }
             // true/false for Bool type
