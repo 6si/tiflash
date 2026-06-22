@@ -16,6 +16,7 @@
 
 #include <Columns/ColumnConst.h>
 #include <Columns/countBytesInFilter.h>
+#include <Core/ColumnShreddedAttachment.h>
 #include <DataStreams/IBlockInputStream.h>
 #include <Storages/DeltaMerge/DeltaMergeHelpers.h>
 #include <Storages/DeltaMerge/RowKeyRange.h>
@@ -181,6 +182,13 @@ inline Block filterUnsorted(const RowKeyRanges & rowkey_ranges, Block && block, 
     for (auto & col : block)
     {
         col.column = col.column->filter(filter, passed_count);
+        if (col.shredded_attachment && !col.shredded_attachment->is_ngc
+            && col.column->size() != col.shredded_attachment->row_count)
+        {
+            auto new_attach = std::make_shared<DM::ColumnShreddedAttachment>(*col.shredded_attachment);
+            new_attach->mvcc_filter.assign(filter.begin(), filter.end());
+            col.shredded_attachment = std::move(new_attach);
+        }
     }
     if (block.segmentRowIdCol() != nullptr)
     {

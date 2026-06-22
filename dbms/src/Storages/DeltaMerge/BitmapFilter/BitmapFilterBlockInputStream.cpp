@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <Columns/countBytesInFilter.h>
+#include <Core/ColumnShreddedAttachment.h>
 #include <Storages/DeltaMerge/BitmapFilter/BitmapFilterBlockInputStream.h>
 #include <Storages/DeltaMerge/DeltaMergeHelpers.h>
 
@@ -44,6 +45,17 @@ Block BitmapFilterBlockInputStream::read()
     for (auto & col : block)
     {
         col.column = col.column->filter(filter, passed_count);
+
+        // When a sidecar attachment is present and the bitmap filter reduced the row
+        // count, create a new attachment carrying the filter bitmap so that FunctionsJson
+        // can select the correct sidecar rows (row_count still reflects the unfiltered size).
+        if (col.shredded_attachment && !col.shredded_attachment->is_ngc
+            && col.column->size() != col.shredded_attachment->row_count)
+        {
+            auto new_attach = std::make_shared<ColumnShreddedAttachment>(*col.shredded_attachment);
+            new_attach->mvcc_filter.assign(filter.begin(), filter.end());
+            col.shredded_attachment = std::move(new_attach);
+        }
     }
     return block;
 }
