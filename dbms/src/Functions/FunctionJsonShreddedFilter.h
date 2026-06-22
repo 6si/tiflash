@@ -25,10 +25,12 @@
 #include <DataTypes/DataTypesNumber.h>
 #include <Functions/FunctionHelpers.h>
 #include <Functions/IFunction.h>
+#include <Common/VectorWriter.h>
 #include <Storages/DeltaMerge/Encoded/EncodedFilter.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonShredder.h>
 #include <Storages/DeltaMerge/JsonShredding/JsonShreddedStore.h>
 #include <TiDB/Decode/JsonBinary.h>
+#include <TiDB/Decode/JsonPathExprRef.h>
 #include <common/logger_useful.h>
 
 namespace DB
@@ -114,10 +116,19 @@ public:
         // The attachment may be lost during pipeline cross-thread handoff (read thread → pipeline thread)
         // because block reconstruction in operator chains doesn't always preserve custom fields.
         DM::ColumnShreddedAttachmentPtr attach_ptr = json_col_ref.shredded_attachment;
+        // is_ngc sentinel means this column has real blob data — fall back to blob extraction.
+        if (attach_ptr && attach_ptr->is_ngc)
+        {
+            block.getByPosition(result).column = blobFallbackFilter(json_col_ref, path, op, value_binary_json, rows);
+            return;
+        }
         if (!attach_ptr)
         {
-            // Fallback: look up from global thread-safe cache by column name
+            // Fallback: look up from global thread-safe cache by column name.
             attach_ptr = DM::ShreddedAttachmentCache::instance().findByColName(json_col_ref.name);
+            // Ignore NGC sentinels from cache — they belong to a different DMFile's blob column.
+            if (attach_ptr && attach_ptr->is_ngc)
+                attach_ptr = nullptr;
         }
 
         if (!attach_ptr)
@@ -248,6 +259,78 @@ public:
     }
 
 private:
+    /// Fallback for NGC DMFile blocks (no sidecar): extract the JSON path from the real
+    /// blob column and compare row-by-row. Slower than sidecar path but always correct.
+    static ColumnPtr blobFallbackFilter(
+        const ColumnWithTypeAndName & json_col_ref,
+        const String & path,
+        const String & op,
+        const String & value_binary_json,
+        size_t rows)
+    {
+        auto result_data = ColumnUInt8::create(rows, 0);
+        auto result_null = ColumnUInt8::create(rows, 1); // default: null (no match)
+        auto & data = result_data->getData();
+        auto & nulls = result_null->getData();
+
+        String compare_value = decodeBinaryJsonToString(value_binary_json);
+
+        // Unwrap Nullable wrapper to get the raw string column
+        const IColumn * raw_col = json_col_ref.column.get();
+        const ColumnNullable * nullable_col = typeid_cast<const ColumnNullable *>(raw_col);
+        if (nullable_col)
+            raw_col = &nullable_col->getNestedColumn();
+        const auto * str_col = typeid_cast<const ColumnString *>(raw_col);
+        if (!str_col)
+            return ColumnNullable::create(std::move(result_data), std::move(result_null));
+
+        auto path_exprs = DB::buildPathExprContainer(StringRef(path.data(), path.size()));
+
+        for (size_t i = 0; i < rows; ++i)
+        {
+            if (nullable_col && nullable_col->isNullAt(i))
+                continue; // remains null
+
+            auto json_ref = str_col->getDataAt(i);
+            if (json_ref.size < 1)
+                continue;
+            JsonBinary json_bin(json_ref.data[0], StringRef(json_ref.data + 1, json_ref.size - 1));
+
+            ColumnString::Chars_t buf;
+            buf.reserve(64);
+            {
+                JsonBinary::JsonBinaryWriteBuffer json_write_buf(buf);
+                bool matched = json_bin.extract(path_exprs, json_write_buf);
+                if (!matched)
+                    continue; // null result — no match for eq
+            } // destructor trims buf to actual written size
+            if (buf.empty())
+                continue;
+
+            // buf contains binary JSON of the extracted value
+            String extracted(reinterpret_cast<const char *>(buf.data()), buf.size());
+            String extracted_str = decodeBinaryJsonToString(extracted);
+
+            nulls[i] = 0; // we have a real value
+            if (op == "eq")
+                data[i] = (extracted_str == compare_value) ? 1 : 0;
+            else if (op == "ne")
+                data[i] = (extracted_str != compare_value) ? 1 : 0;
+            else if (op == "gt")
+                data[i] = (jsonStringCompare(extracted_str, compare_value) > 0) ? 1 : 0;
+            else if (op == "ge")
+                data[i] = (jsonStringCompare(extracted_str, compare_value) >= 0) ? 1 : 0;
+            else if (op == "lt")
+                data[i] = (jsonStringCompare(extracted_str, compare_value) < 0) ? 1 : 0;
+            else if (op == "le")
+                data[i] = (jsonStringCompare(extracted_str, compare_value) <= 0) ? 1 : 0;
+            else
+                nulls[i] = 1; // unknown op
+        }
+
+        return ColumnNullable::create(std::move(result_data), std::move(result_null));
+    }
+
     static void setAllNull(Block & block, size_t result, size_t rows)
     {
         auto data_col = ColumnUInt8::create(rows, 0);

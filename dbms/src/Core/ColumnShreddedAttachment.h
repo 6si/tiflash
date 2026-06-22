@@ -83,6 +83,11 @@ struct ColumnShreddedAttachment
 
     /// Whether this attachment is in lazy mode (manifest loaded, data not loaded).
     bool isLazy() const { return !data && !dmfile_path.empty(); }
+
+    /// True when this column belongs to an NGC DMFile (no sidecar). Used as a sentinel
+    /// to block the findByColName() fallback in FunctionsJson/FunctionJsonShreddedFilter,
+    /// preventing stale sidecar attachments from poisoning real-blob column reads.
+    bool is_ngc = false;
 };
 
 using ColumnShreddedAttachmentPtr = std::shared_ptr<const ColumnShreddedAttachment>;

@@ -424,12 +424,18 @@ Block DMFileReader::readImpl(const ReadBlockInfo & read_info)
                     cd.name,
                     sidecar_attachment);
             }
-            // NOTE: Previously clearByColName() was called here for NGC DMFiles
-            // (no sidecar) to prevent stale cache hits. Removed because it races
-            // with in-flight sidecar blocks that lost their attachment during
-            // pipeline reconstruction, making those blocks fall back to blob parse
-            // on placeholder columns → NULLs. After full compaction (ALTER TABLE
-            // COMPACT) all DMFiles have sidecars, eliminating NGC DMFiles entirely.
+            else if (attach_shredded && cd.id != MutSup::extra_handle_id
+                     && cd.id != MutSup::delmark_col_id && cd.id != MutSup::version_col_id)
+            {
+                // NGC DMFile: no sidecar. Attach a sentinel (is_ngc=true) so that
+                // FunctionsJson/FunctionJsonShreddedFilter skip the findByColName()
+                // fallback and fall through to real blob extraction for this column.
+                // Without this, a stale sidecar attachment from a concurrently-read
+                // DMFile would be returned for this NGC column, producing wrong results.
+                auto ngc_sentinel = std::make_shared<DM::ColumnShreddedAttachment>();
+                ngc_sentinel->is_ngc = true;
+                inserted.shredded_attachment = ngc_sentinel;
+            }
         }
         catch (DB::Exception & e)
         {

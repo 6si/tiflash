@@ -143,8 +143,19 @@ public:
             // Try to get attachment: first from column, then from global cache.
             // The attachment may be lost during filtered reads or pipeline handoff.
             auto attach_ptr = json_col_ref.shredded_attachment;
-            if (!attach_ptr)
-                attach_ptr = DM::ShreddedAttachmentCache::instance().findByColName(json_col_ref.name);
+            // Skip cache fallback for NGC sentinels — the column has real blob data.
+            if (!attach_ptr || !attach_ptr->is_ngc)
+            {
+                if (!attach_ptr)
+                    attach_ptr = DM::ShreddedAttachmentCache::instance().findByColName(json_col_ref.name);
+                // Ignore NGC sentinels returned by cache (rare but possible during concurrent reads).
+                if (attach_ptr && attach_ptr->is_ngc)
+                    attach_ptr = nullptr;
+            }
+            else
+            {
+                attach_ptr = nullptr; // is_ngc sentinel — fall through to blob extraction
+            }
             if (attach_ptr
                 && (attach_ptr->isLazy()
                     || attach_ptr->data))
