@@ -200,6 +200,22 @@ public:
                                         sub_col = full_col;
                                     else if (full_col->size() >= attach.row_offset + attach.row_count)
                                         sub_col = full_col->cut(attach.row_offset, attach.row_count);
+                                    else if (full_col->size() > attach.row_offset)
+                                    {
+                                        // Sidecar has fewer rows than the multi-pack read batch expects.
+                                        // This happens when the last pack(s) in a DMFile contain all-null
+                                        // JSON blocks that were not appended to block_results during write
+                                        // (JsonShredder returns empty sub_columns for all-null blocks).
+                                        // Extract the available rows and pad the remainder with NULLs.
+                                        size_t available = full_col->size() - attach.row_offset;
+                                        auto partial = full_col->cut(attach.row_offset, available);
+                                        size_t missing = attach.row_count - available;
+                                        // Clone partial into a mutable column and append NULLs
+                                        auto mutable_col = partial->cloneFullColumn();
+                                        for (size_t mi = 0; mi < missing; ++mi)
+                                            mutable_col->insertDefault();
+                                        sub_col = std::move(mutable_col);
+                                    }
                                 }
                             }
                         }
@@ -213,6 +229,16 @@ public:
                                     sub_col = full_col;
                                 else if (full_col->size() >= attach.row_offset + attach.row_count)
                                     sub_col = full_col->cut(attach.row_offset, attach.row_count);
+                                else if (full_col->size() > attach.row_offset)
+                                {
+                                    size_t available = full_col->size() - attach.row_offset;
+                                    auto partial = full_col->cut(attach.row_offset, available);
+                                    size_t missing = attach.row_count - available;
+                                    auto mutable_col = partial->cloneFullColumn();
+                                    for (size_t mi = 0; mi < missing; ++mi)
+                                        mutable_col->insertDefault();
+                                    sub_col = std::move(mutable_col);
+                                }
                             }
                         }
 
