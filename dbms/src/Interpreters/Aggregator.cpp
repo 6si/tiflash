@@ -1242,6 +1242,21 @@ void Aggregator::AggProcessInfo::prepareForAgg()
             bool collation_safe = (collator == nullptr)
                 || collator->isBinary()
                 || collator->isPaddingBinary();
+
+            LOG_INFO(
+                aggregator->log,
+                "DICTKEY_DIAG init: keys_size={} key_type={} inner_type={} is_nullable={} "
+                "has_collator={} collation_safe={} isString={} block_rows={} col_name={}",
+                aggregator->params.keys_size,
+                key_type->getName(),
+                inner_type->getName(),
+                is_nullable,
+                collator != nullptr,
+                collation_safe,
+                inner_type->isString(),
+                block.rows(),
+                aggregator->params.src_header.safeGetByPosition(aggregator->params.keys[0]).name);
+
             if (inner_type->isString() && collation_safe)
             {
                 dks.id_to_value.reserve(Aggregator::DictKeyState::ACTIVATION_THRESHOLD);
@@ -1265,6 +1280,14 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                         inner_col = &nullable_col->getNestedColumn();
                 }
 
+                LOG_INFO(
+                    aggregator->log,
+                    "DICTKEY_DIAG col_check: inner_col_type={} isDictionary={} isString={} col_size={}",
+                    demangle(typeid(*inner_col).name()),
+                    typeid_cast<const ColumnDictionary *>(inner_col) != nullptr,
+                    typeid_cast<const ColumnString *>(inner_col) != nullptr,
+                    inner_col->size());
+
                 /// Check if the column is already ColumnDictionary (from encoded storage)
                 const auto * dict_col = typeid_cast<const ColumnDictionary *>(inner_col);
                 if (dict_col)
@@ -1283,9 +1306,17 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                         aggregator->key_sizes = {2};
                         LOG_INFO(
                             aggregator->log,
-                            "Activated dict-key fast path (ColumnDictionary{}): {} groups → key16 FixedHashMap",
+                            "DICTKEY_DIAG ACTIVATED (ColumnDictionary{}): {} groups -> key16 FixedHashMap",
                             is_nullable ? ", nullable" : "",
                             dict_size);
+                    }
+                    else
+                    {
+                        LOG_INFO(
+                            aggregator->log,
+                            "DICTKEY_DIAG SKIPPED: ColumnDictionary dict_size={} exceeds threshold={}",
+                            dict_size,
+                            Aggregator::DictKeyState::ACTIVATION_THRESHOLD);
                     }
                 }
                 else
@@ -1312,13 +1343,46 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                             aggregator->key_sizes = {2};
                             LOG_INFO(
                                 aggregator->log,
-                                "Activated dict-key fast path{}: {} distinct values → key16 FixedHashMap",
-                                is_nullable ? " (nullable)" : "",
+                                "DICTKEY_DIAG ACTIVATED (ColumnString{}): {} distinct values -> key16 FixedHashMap",
+                                is_nullable ? ", nullable" : "",
                                 dks.id_to_value.size());
                         }
+                        else
+                        {
+                            LOG_INFO(
+                                aggregator->log,
+                                "DICTKEY_DIAG SKIPPED: ColumnString too_many={} dict_size={} failed={}",
+                                too_many,
+                                dks.id_to_value.size(),
+                                dks.failed);
+                        }
+                    }
+                    else
+                    {
+                        LOG_INFO(
+                            aggregator->log,
+                            "DICTKEY_DIAG SKIPPED: inner_col is neither ColumnDictionary nor ColumnString, "
+                            "type={}",
+                            demangle(typeid(*inner_col).name()));
                     }
                 }
             }
+            else
+            {
+                LOG_INFO(
+                    aggregator->log,
+                    "DICTKEY_DIAG SKIPPED: type/collation check failed isString={} collation_safe={}",
+                    inner_type->isString(),
+                    collation_safe);
+            }
+        }
+        else
+        {
+            LOG_INFO(
+                aggregator->log,
+                "DICTKEY_DIAG SKIPPED: precondition failed keys_size={} header_columns={}",
+                aggregator->params.keys_size,
+                aggregator->params.src_header.columns());
         }
     });
 
