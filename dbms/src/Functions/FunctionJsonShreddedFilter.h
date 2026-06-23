@@ -120,20 +120,22 @@ public:
 
         if (!attach_ptr)
         {
-            setAllNull(block, result, rows);
+            // No sidecar available (delta data, non-JSON column, etc.) — fall back
+            // to row-by-row blob extraction. This is slower but always correct.
+            block.getByPosition(result).column = blobFallbackFilter(json_col_ref, path, op, value_binary_json, rows);
             return;
         }
 
         const auto & attach = *attach_ptr;
         if (!attach.isLazy() && !attach.data)
         {
-            setAllNull(block, result, rows);
+            block.getByPosition(result).column = blobFallbackFilter(json_col_ref, path, op, value_binary_json, rows);
             return;
         }
 
         if (!attach.hasPath(lookup_path))
         {
-            setAllNull(block, result, rows);
+            block.getByPosition(result).column = blobFallbackFilter(json_col_ref, path, op, value_binary_json, rows);
             return;
         }
 
