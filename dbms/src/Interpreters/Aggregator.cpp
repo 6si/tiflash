@@ -256,17 +256,19 @@ Block Aggregator::getInternalHeader(bool final) const
 
 UInt16 Aggregator::DictKeyState::getOrInsert(StringRef ref)
 {
+    StringRef normalized = normalizeKey(ref);
+
     // Fast path: read-only lookup
     {
         std::shared_lock<std::shared_mutex> rlock(dict_mutex);
-        auto it = value_to_id.find(ref);
+        auto it = value_to_id.find(normalized);
         if (it != value_to_id.end())
             return it->second;
     }
 
     // Slow path: insert new entry
     std::unique_lock<std::shared_mutex> wlock(dict_mutex);
-    auto it = value_to_id.find(ref);
+    auto it = value_to_id.find(normalized);
     if (it != value_to_id.end())
         return it->second;
 
@@ -277,14 +279,27 @@ UInt16 Aggregator::DictKeyState::getOrInsert(StringRef ref)
     }
 
     UInt16 id = static_cast<UInt16>(id_to_value.size());
-    id_to_value.emplace_back(ref.data, ref.size);
+    id_to_value.emplace_back(normalized.data, normalized.size);
     value_to_id.emplace(StringRef(id_to_value.back()), id);
     return id;
 }
 
+StringRef Aggregator::DictKeyState::normalizeKey(StringRef ref) const
+{
+    if (padding_binary)
+    {
+        // Strip trailing spaces for padding binary collations (UTF8MB4_BIN etc.)
+        size_t len = ref.size;
+        while (len > 0 && ref.data[len - 1] == ' ')
+            --len;
+        return StringRef(ref.data, len);
+    }
+    return ref;
+}
+
 UInt16 Aggregator::DictKeyState::lookupFrozen(StringRef ref) const
 {
-    auto it = value_to_id.find(ref);
+    auto it = value_to_id.find(normalizeKey(ref));
     if (likely(it != value_to_id.end()))
         return it->second;
     return static_cast<UInt16>(id_to_value.size()); // sentinel: unknown value
@@ -1211,6 +1226,7 @@ void Aggregator::AggProcessInfo::prepareForAgg()
             {
                 dks.id_to_value.reserve(Aggregator::DictKeyState::ACTIVATION_THRESHOLD);
                 dks.original_key_type = key_type;
+                dks.padding_binary = (collator != nullptr && collator->isPaddingBinary());
 
                 /// Check if the column is already ColumnDictionary (from encoded storage)
                 const auto * dict_col = typeid_cast<const ColumnDictionary *>(key_columns[0]);
@@ -2744,7 +2760,7 @@ MergingBucketsPtr Aggregator::mergeAndConvertToBlocks(
 
     if (has_at_least_one_two_level)
         for (auto & variant : non_empty_data)
-            if (!variant->isTwoLevel())
+            if (!variant->isTwoLevel() && variant->isConvertibleToTwoLevel())
                 variant->convertToTwoLevel();
 
     AggregatedDataVariantsPtr & first = non_empty_data[0];

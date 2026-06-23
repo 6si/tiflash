@@ -1044,7 +1044,7 @@ public:
     /// Merge several partially aggregated blocks into one.
     BlocksList vstackBlocks(BlocksList & blocks, bool final);
 
-    bool isConvertibleToTwoLevel() { return AggregatedDataVariants::isConvertibleToTwoLevel(method_chosen); }
+    bool isConvertibleToTwoLevel() { return AggregatedDataVariants::isConvertibleToTwoLevel(effective_method_chosen); }
     /** Split block with partially-aggregated data to many blocks, as if two-level method of aggregation was used.
       * This is needed to simplify merging of that data with other results, that are already two-level.
       */
@@ -1085,6 +1085,7 @@ public:
 
         bool active = false;
         bool failed = false;
+        bool padding_binary = false;
         std::atomic<bool> dictionary_frozen{false};
 
         std::vector<String> id_to_value;
@@ -1102,6 +1103,7 @@ public:
 
         UInt16 getOrInsert(StringRef ref);
         UInt16 lookupFrozen(StringRef ref) const;
+        StringRef normalizeKey(StringRef ref) const;
         void freezeDictionary();
         ColumnPtr decodeKeyColumn(const IColumn & uint16_col) const;
         bool isActive() const { return active && !failed; }
