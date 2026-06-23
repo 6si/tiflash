@@ -17,6 +17,7 @@
 #pragma once
 
 #include <Columns/ColumnAggregateFunction.h>
+#include <Columns/ColumnDictionary.h>
 #include <Columns/ColumnFixedString.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
@@ -994,6 +995,13 @@ public:
         size_t hit_row_cnt = 0;
         std::vector<UInt64> not_found_rows;
 
+        /// Visit-cache: when the single key column is ColumnDictionary, we save
+        /// dictionary entries and per-row IDs so the fast path can do K hash
+        /// lookups (K = dictionary size) instead of N (N = row count).
+        const PaddedPODArray<UInt32> * dict_ids = nullptr;
+        std::vector<StringRef> dict_entries_refs;
+        size_t dict_size = 0;
+
         void prepareForAgg();
         bool allBlockDataHandled() const
         {
@@ -1012,6 +1020,10 @@ public:
             hit_row_cnt = 0;
             not_found_rows.clear();
             not_found_rows.reserve(block_.rows() / 2);
+
+            dict_ids = nullptr;
+            dict_entries_refs.clear();
+            dict_size = 0;
         }
     };
 
@@ -1028,6 +1040,14 @@ public:
 
     template <bool collect_hit_rate, bool only_lookup>
     bool executeOnBlockImpl(AggProcessInfo & agg_process_info, AggregatedDataVariants & result, size_t thread_num);
+
+    /// Visit-cache fast path for dictionary-encoded key columns.
+    /// Does K hash lookups (K = dictionary size) instead of N (N = rows).
+    template <typename Method>
+    void executeDictionaryKeyFastPath(
+        Method & method,
+        AggregatedDataVariants & result,
+        AggProcessInfo & agg_process_info) const;
 
     /** Merge several aggregation data structures and output the MergingBucketsPtr used to merge.
       * Return nullptr if there are no non empty data_variant.

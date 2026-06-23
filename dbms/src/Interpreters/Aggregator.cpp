@@ -1110,8 +1110,9 @@ void Aggregator::AggProcessInfo::prepareForAgg()
 
     /** Constant columns are not supported directly during aggregation.
       * To make them work anyway, we materialize them.
-      * Dictionary-encoded columns are also materialized to full columns
-      * since the aggregator's hash methods expect concrete column types.
+      * Dictionary-encoded columns: if we have a single dictionary-encoded key
+      * (no collator), we save the dictionary info for the visit-cache fast path
+      * and then materialize the key column for the hash method's State init.
       */
     for (size_t i = 0; i < aggregator->params.keys_size; ++i)
     {
@@ -1122,6 +1123,27 @@ void Aggregator::AggProcessInfo::prepareForAgg()
             materialized_columns.push_back(converted);
             key_columns[i] = materialized_columns.back().get();
         }
+
+        /// Save dictionary info for visit-cache before materializing.
+        /// Conditions: single key, no collator, column is ColumnDictionary.
+        if (aggregator->params.keys_size == 1 && key_columns[i]->isDictionaryEncoded()
+            && (aggregator->params.collators.empty() || aggregator->params.collators[i] == nullptr))
+        {
+            const auto * dict_col = typeid_cast<const ColumnDictionary *>(key_columns[i]);
+            if (dict_col && dict_col->getDictionarySize() <= 65536)
+            {
+                dict_ids = &dict_col->getDictionaryIds();
+                dict_size = dict_col->getDictionarySize();
+                const auto & dict = dict_col->getDictionary();
+                dict_entries_refs.resize(dict_size);
+                for (size_t d = 0; d < dict_size; ++d)
+                {
+                    const auto & s = dict[d].get<String>();
+                    dict_entries_refs[d] = StringRef(s.data(), s.size());
+                }
+            }
+        }
+
         if (ColumnPtr converted = key_columns[i]->convertToFullColumnIfDictionary())
         {
             materialized_columns.push_back(converted);
@@ -1156,6 +1178,58 @@ bool Aggregator::executeOnBlockOnlyLookup(
     size_t thread_num)
 {
     return executeOnBlockImpl<false, true>(agg_process_info, result, thread_num);
+}
+
+template <typename Method>
+void Aggregator::executeDictionaryKeyFastPath(
+    Method & method,
+    AggregatedDataVariants & result,
+    AggProcessInfo & agg_process_info) const
+{
+    auto * pool = result.aggregates_pool;
+    const auto & dict_ids = *agg_process_info.dict_ids;
+    const auto & dict_refs = agg_process_info.dict_entries_refs;
+    const size_t dict_size = agg_process_info.dict_size;
+    const size_t rows = agg_process_info.end_row - agg_process_info.start_row;
+
+    /// Pass 1: look up each dictionary entry in the hash table (K lookups).
+    std::vector<AggregateDataPtr> visit_cache(dict_size, nullptr);
+    for (size_t i = 0; i < dict_size; ++i)
+    {
+        typename Method::Data::LookupResult lookup_result;
+        bool inserted = false;
+        method.data.emplace(ArenaKeyHolder{dict_refs[i], pool}, lookup_result, inserted);
+        if (inserted)
+        {
+            auto * place = pool->alignedAlloc(total_size_of_aggregate_states, align_aggregate_states);
+            createAggregateStates(place);
+            lookup_result->getMapped() = place;
+        }
+        visit_cache[i] = lookup_result->getMapped();
+    }
+
+    /// Pass 2: fill places array using dictionary IDs (N array lookups — no hashing).
+    auto places = std::unique_ptr<AggregateDataPtr[]>(new AggregateDataPtr[rows]);
+    for (size_t i = 0; i < rows; ++i)
+    {
+        UInt32 dict_id = dict_ids[agg_process_info.start_row + i];
+        places[i] = visit_cache[dict_id];
+    }
+
+    /// Pass 3: call aggregate functions with the places array.
+    for (AggregateFunctionInstruction * inst = agg_process_info.aggregate_functions_instructions.data(); inst->that;
+         ++inst)
+    {
+        inst->batch_that->addBatch(
+            agg_process_info.start_row,
+            rows,
+            places.get(),
+            inst->state_offset,
+            inst->batch_arguments,
+            pool);
+    }
+
+    agg_process_info.start_row = agg_process_info.end_row;
 }
 
 template <bool collect_hit_rate, bool only_lookup>
@@ -1204,6 +1278,25 @@ bool Aggregator::executeOnBlockImpl(
     }
     else
     {
+        /// Visit-cache fast path: when the key column was dictionary-encoded,
+        /// do K hash lookups instead of N. Only for key_string (single string key)
+        /// and only in the normal (non-lookup) path.
+        bool used_dict_fast_path = false;
+        if constexpr (!only_lookup)
+        {
+            if (agg_process_info.dict_ids != nullptr
+                && result.type == AggregatedDataVariants::Type::key_string)
+            {
+                executeDictionaryKeyFastPath(
+                    *ToAggregationMethodPtr(key_string, result.aggregation_method_impl),
+                    result,
+                    agg_process_info);
+                used_dict_fast_path = true;
+            }
+        }
+
+        if (!used_dict_fast_path)
+        {
 #define M(NAME, IS_TWO_LEVEL)                                              \
     case AggregationMethodType(NAME):                                      \
     {                                                                      \
@@ -1215,14 +1308,15 @@ bool Aggregator::executeOnBlockImpl(
         break;                                                             \
     }
 
-        switch (result.type)
-        {
-            APPLY_FOR_AGGREGATED_VARIANTS(M)
-        default:
-            break;
-        }
+            switch (result.type)
+            {
+                APPLY_FOR_AGGREGATED_VARIANTS(M)
+            default:
+                break;
+            }
 
 #undef M
+        }
     }
 
     size_t result_size = result.size();
