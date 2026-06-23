@@ -381,15 +381,17 @@ public:
         return lhs_val.compare(0, std::string::npos, rhs_ref.data, rhs_ref.size);
     }
 
-    void getPermutation(bool /*reverse*/, size_t /*limit*/, int /*nan_direction_hint*/, Permutation & /*res*/)
+    void getPermutation(bool reverse, size_t limit, int nan_direction_hint, Permutation & res)
         const override
     {
-        throw Exception("getPermutation not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        auto materialized = decode();
+        materialized->getPermutation(reverse, limit, nan_direction_hint, res);
     }
 
-    ColumnPtr replicateRange(size_t /*start_row*/, size_t /*end_row*/, const IColumn::Offsets & /*offsets*/) const override
+    ColumnPtr replicateRange(size_t start_row, size_t end_row, const IColumn::Offsets & offsets) const override
     {
-        throw Exception("replicateRange not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        auto materialized = decode();
+        return materialized->replicateRange(start_row, end_row, offsets);
     }
 
     MutableColumnPtr cloneResized(size_t new_size) const override
@@ -463,80 +465,80 @@ public:
 
     size_t serializeByteSize() const override
     {
-        throw Exception("serializeByteSize not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        return decode()->serializeByteSize();
     }
 
-    void countSerializeByteSize(PaddedPODArray<size_t> & /*byte_size*/) const override
+    void countSerializeByteSize(PaddedPODArray<size_t> & byte_size) const override
     {
-        throw Exception("countSerializeByteSize not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        decode()->countSerializeByteSize(byte_size);
     }
 
     void countSerializeByteSizeForCmp(
-        PaddedPODArray<size_t> & /*byte_size*/,
-        const NullMap * /*nullmap*/,
-        const TiDB::TiDBCollatorPtr & /*collator*/) const override
+        PaddedPODArray<size_t> & byte_size,
+        const NullMap * nullmap,
+        const TiDB::TiDBCollatorPtr & collator) const override
     {
-        throw Exception("countSerializeByteSizeForCmp not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        decode()->countSerializeByteSizeForCmp(byte_size, nullmap, collator);
     }
 
     void countSerializeByteSizeForColumnArray(
-        PaddedPODArray<size_t> & /*byte_size*/,
-        const Offsets & /*array_offsets*/) const override
+        PaddedPODArray<size_t> & byte_size,
+        const Offsets & array_offsets) const override
     {
-        throw Exception("countSerializeByteSizeForColumnArray not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        decode()->countSerializeByteSizeForColumnArray(byte_size, array_offsets);
     }
 
     void countSerializeByteSizeForCmpColumnArray(
-        PaddedPODArray<size_t> & /*byte_size*/,
-        const Offsets & /*array_offsets*/,
-        const NullMap * /*nullmap*/,
-        const TiDB::TiDBCollatorPtr & /*collator*/) const override
+        PaddedPODArray<size_t> & byte_size,
+        const Offsets & array_offsets,
+        const NullMap * nullmap,
+        const TiDB::TiDBCollatorPtr & collator) const override
     {
-        throw Exception("countSerializeByteSizeForCmpColumnArray not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        decode()->countSerializeByteSizeForCmpColumnArray(byte_size, array_offsets, nullmap, collator);
     }
 
     void serializeToPos(
-        PaddedPODArray<char *> & /*pos*/,
-        size_t /*start*/,
-        size_t /*length*/,
-        bool /*has_null*/) const override
+        PaddedPODArray<char *> & pos,
+        size_t start,
+        size_t length,
+        bool has_null) const override
     {
-        throw Exception("serializeToPos not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        decode()->serializeToPos(pos, start, length, has_null);
     }
 
     void serializeToPosForCmp(
-        PaddedPODArray<char *> & /*pos*/,
-        size_t /*start*/,
-        size_t /*length*/,
-        bool /*has_null*/,
-        const NullMap * /*nullmap*/,
-        const TiDB::TiDBCollatorPtr & /*collator*/,
-        String * /*sort_key_container*/) const override
+        PaddedPODArray<char *> & pos,
+        size_t start,
+        size_t length,
+        bool has_null,
+        const NullMap * nullmap,
+        const TiDB::TiDBCollatorPtr & collator,
+        String * sort_key_container) const override
     {
-        throw Exception("serializeToPosForCmp not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        decode()->serializeToPosForCmp(pos, start, length, has_null, nullmap, collator, sort_key_container);
     }
 
     void serializeToPosForColumnArray(
-        PaddedPODArray<char *> & /*pos*/,
-        size_t /*start*/,
-        size_t /*length*/,
-        bool /*has_null*/,
-        const Offsets & /*array_offsets*/) const override
+        PaddedPODArray<char *> & pos,
+        size_t start,
+        size_t length,
+        bool has_null,
+        const Offsets & array_offsets) const override
     {
-        throw Exception("serializeToPosForColumnArray not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        decode()->serializeToPosForColumnArray(pos, start, length, has_null, array_offsets);
     }
 
     void serializeToPosForCmpColumnArray(
-        PaddedPODArray<char *> & /*pos*/,
-        size_t /*start*/,
-        size_t /*length*/,
-        bool /*has_null*/,
-        const NullMap * /*nullmap*/,
-        const Offsets & /*array_offsets*/,
-        const TiDB::TiDBCollatorPtr & /*collator*/,
-        String * /*sort_key_container*/) const override
+        PaddedPODArray<char *> & pos,
+        size_t start,
+        size_t length,
+        bool has_null,
+        const NullMap * nullmap,
+        const Offsets & array_offsets,
+        const TiDB::TiDBCollatorPtr & collator,
+        String * sort_key_container) const override
     {
-        throw Exception("serializeToPosForCmpColumnArray not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        decode()->serializeToPosForCmpColumnArray(pos, start, length, has_null, nullmap, array_offsets, collator, sort_key_container);
     }
 
     void deserializeAndInsertFromPos(PaddedPODArray<char *> & /*pos*/, bool /*use_nt_align_buffer*/) override
@@ -554,16 +556,16 @@ public:
 
     void flushNTAlignBuffer() override {}
 
-    void deserializeAndAdvancePos(PaddedPODArray<char *> & /*pos*/) const override
+    void deserializeAndAdvancePos(PaddedPODArray<char *> & pos) const override
     {
-        throw Exception("deserializeAndAdvancePos not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        decode()->deserializeAndAdvancePos(pos);
     }
 
     void deserializeAndAdvancePosForColumnArray(
-        PaddedPODArray<char *> & /*pos*/,
-        const Offsets & /*array_offsets*/) const override
+        PaddedPODArray<char *> & pos,
+        const Offsets & array_offsets) const override
     {
-        throw Exception("deserializeAndAdvancePosForColumnArray not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        decode()->deserializeAndAdvancePosForColumnArray(pos, array_offsets);
     }
 
 private:
