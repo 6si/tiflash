@@ -256,6 +256,8 @@ bool IExecutableFunction::defaultImplementationForDictionaryColumns(
     // Only try if block is large enough to justify the O(N) scan.
     static constexpr size_t MIN_ROWS_FOR_AUTO_ENCODE = 256;
     static constexpr UInt32 MAX_DICT_SIZE_AUTO = 65536;
+    ColumnPtr original_string_col; // saved for restoration after auto-encode fast path
+    size_t auto_encoded_arg_idx = args.size(); // sentinel
     if (num_dict_cols == 0 && args.size() >= 2)
     {
         size_t string_arg_idx = args.size();
@@ -318,6 +320,10 @@ bool IExecutableFunction::defaultImplementationForDictionaryColumns(
                         std::move(dict_entries),
                         std::move(ids),
                         block.getByPosition(args[string_arg_idx]).type);
+                    // Save original column so we can restore it after the fast path
+                    // (the block may be used by subsequent operations that expect ColumnString)
+                    original_string_col = block.getByPosition(args[string_arg_idx]).column;
+                    auto_encoded_arg_idx = string_arg_idx;
                     block.getByPosition(args[string_arg_idx]).column = std::move(dict_col_ptr);
                     dict_arg_idx = string_arg_idx;
                     num_dict_cols = 1;
@@ -413,6 +419,9 @@ bool IExecutableFunction::defaultImplementationForDictionaryColumns(
             remapped->insertFrom(*dict_result_col, ids[i]);
 
         block.getByPosition(result).column = std::move(remapped);
+        // Restore original ColumnString if we auto-encoded it
+        if (original_string_col && auto_encoded_arg_idx < args.size())
+            block.getByPosition(args[auto_encoded_arg_idx]).column = original_string_col;
         return true;
     }
 
@@ -430,6 +439,9 @@ bool IExecutableFunction::defaultImplementationForDictionaryColumns(
 
     executeImpl(materialized_block, args, result);
     block.getByPosition(result).column = materialized_block.getByPosition(result).column;
+    // Restore original ColumnString if we auto-encoded it
+    if (original_string_col && auto_encoded_arg_idx < args.size())
+        block.getByPosition(args[auto_encoded_arg_idx]).column = original_string_col;
     return true;
 }
 
