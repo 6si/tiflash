@@ -79,9 +79,18 @@ protected:
       */
     virtual ColumnNumbers getArgumentsThatAreAlwaysConstant() const { return {}; }
 
+    /** If function arguments contain a single dictionary-encoded column and all other
+      * arguments are constants, execute the function on just the dictionary entries (K values)
+      * instead of N rows, then remap results via the original dictionary IDs.
+      * If there are multiple dictionary columns or unwrapping isn't possible,
+      * materializes dictionary columns to regular columns.
+      */
+    virtual bool useDefaultImplementationForDictionaryColumns() const { return true; }
+
 private:
     bool defaultImplementationForNulls(Block & block, const ColumnNumbers & args, size_t result) const;
     bool defaultImplementationForConstantArguments(Block & block, const ColumnNumbers & args, size_t result) const;
+    bool defaultImplementationForDictionaryColumns(Block & block, const ColumnNumbers & args, size_t result) const;
 };
 
 using ExecutableFunctionPtr = std::shared_ptr<IExecutableFunction>;

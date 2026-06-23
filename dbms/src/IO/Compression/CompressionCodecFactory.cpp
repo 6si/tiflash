@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <IO/Compression/CompressionCodecDeltaFOR.h>
+#include <IO/Compression/CompressionCodecDictionary.h>
 #include <IO/Compression/CompressionCodecFOR.h>
 #include <IO/Compression/CompressionCodecFactory.h>
 #include <IO/Compression/CompressionCodecLZ4.h>
@@ -178,6 +179,7 @@ CompressionCodecPtr CompressionCodecFactory::create(const CompressionSetting & s
         // If method_byte is Lightweight, use LZ4 codec for non-integral types
         // If method_byte is DeltaFOR/RunLength/FOR, since we do not support use these methods independently,
         // there must be another codec to compress data. Use that compress codec directly.
+        // Dictionary codec is specifically designed for String columns, so allow it through.
         if (!isInteger(setting.data_type))
         {
             if (setting.method_byte == CompressionMethodByte::Lightweight)
@@ -187,6 +189,12 @@ CompressionCodecPtr CompressionCodecFactory::create(const CompressionSetting & s
                 auto method = CompressionMethod::LZ4;
                 CompressionSetting setting(method, CompressionSetting::getDefaultLevel(method));
                 return getStaticCodec<CompressionCodecLZ4>(setting);
+            }
+            else if (setting.method_byte == CompressionMethodByte::Dictionary)
+            {
+                // Dictionary codec works with String data type
+                static auto dict_codec = std::make_shared<CompressionCodecDictionary>();
+                return dict_codec;
             }
             else
                 return nullptr;
@@ -204,6 +212,11 @@ CompressionCodecPtr CompressionCodecFactory::create(const CompressionSetting & s
         return getStaticCodec<CompressionCodecRunLength>(setting);
     case CompressionMethodByte::FOR:
         return getStaticCodec<CompressionCodecFOR>(setting);
+    case CompressionMethodByte::Dictionary:
+    {
+        static auto dict_codec = std::make_shared<CompressionCodecDictionary>();
+        return dict_codec;
+    }
     default:
         throw Exception(
             ErrorCodes::UNKNOWN_COMPRESSION_METHOD,

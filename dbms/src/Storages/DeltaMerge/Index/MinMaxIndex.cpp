@@ -106,6 +106,18 @@ ALWAYS_INLINE bool minIsNull(const DB::ColumnUInt8 & null_map, size_t i)
 
 void MinMaxIndex::addPack(const IColumn & column, const ColumnVector<UInt8> * del_mark)
 {
+    // If the column is dictionary-encoded, materialize it first since
+    // minmaxes storage is a regular ColumnString.
+    if (column.isDictionaryEncoded())
+    {
+        auto materialized = column.convertToFullColumnIfDictionary();
+        if (materialized)
+        {
+            addPack(*materialized, del_mark);
+            return;
+        }
+    }
+
     auto size = column.size();
     bool has_null = false;
 
