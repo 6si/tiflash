@@ -414,10 +414,26 @@ bool IExecutableFunction::defaultImplementationForDictionaryColumns(
 
         // Remap results: for each row, look up the pre-computed result using its dictionary ID
         const auto & dict_result_col = dict_block.getByPosition(dict_result).column;
-        auto remapped = dict_result_col->cloneEmpty();
-        remapped->reserve(num_rows);
-        for (size_t i = 0; i < num_rows; ++i)
-            remapped->insertFrom(*dict_result_col, ids[i]);
+        MutableColumnPtr remapped;
+
+        // Fast remap for UInt8 result (common for comparison/filter functions)
+        if (const auto * uint8_result = typeid_cast<const ColumnUInt8 *>(dict_result_col.get()))
+        {
+            auto uint8_remapped = ColumnUInt8::create();
+            auto & out_data = uint8_remapped->getData();
+            out_data.resize(num_rows);
+            const auto & src_data = uint8_result->getData();
+            for (size_t i = 0; i < num_rows; ++i)
+                out_data[i] = src_data[ids[i]];
+            remapped = std::move(uint8_remapped);
+        }
+        else
+        {
+            remapped = dict_result_col->cloneEmpty();
+            remapped->reserve(num_rows);
+            for (size_t i = 0; i < num_rows; ++i)
+                remapped->insertFrom(*dict_result_col, ids[i]);
+        }
 
         block.getByPosition(result).column = std::move(remapped);
         // Restore original ColumnString if we auto-encoded it
