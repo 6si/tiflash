@@ -100,8 +100,8 @@ TEST_F(CompressionCodecDictionaryTest, RoundTrip_LowCardinality)
 
     auto compressed = compressWithHeader(source);
 
-    // Verify index_width = 1 (UInt8) since NDV = 5
-    ASSERT_EQ(static_cast<UInt8>(*getPayload(compressed)), 1);
+    // Verify index_width = 3 (UInt8 + LZ4) since NDV = 5
+    ASSERT_EQ(static_cast<UInt8>(*getPayload(compressed)), 3);
 
     auto decompressed = decompressWithHeader(compressed, source_size);
     auto output = parseSizePrefixData(decompressed.data(), source_size);
@@ -123,8 +123,8 @@ TEST_F(CompressionCodecDictionaryTest, AdaptiveWidth_UInt16)
 
     auto compressed = compressWithHeader(source);
 
-    // Verify index_width = 2 (UInt16) since NDV = 300 > 256
-    ASSERT_EQ(static_cast<UInt8>(*getPayload(compressed)), 2);
+    // Verify index_width = 4 (UInt16 + LZ4) since NDV = 300 > 256
+    ASSERT_EQ(static_cast<UInt8>(*getPayload(compressed)), 4);
 
     auto decompressed = decompressWithHeader(compressed, source_size);
     auto output = parseSizePrefixData(decompressed.data(), source_size);

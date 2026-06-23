@@ -17,6 +17,7 @@
 #include <Common/Exception.h>
 #include <common/likely.h>
 #include <common/unaligned.h>
+#include <lz4.h>
 
 #include <string>
 #include <string_view>
@@ -37,26 +38,10 @@ UInt8 CompressionCodecDictionary::getMethodByte() const
     return static_cast<UInt8>(CompressionMethodByte::Dictionary);
 }
 
-/**
- * Compressed format (v2):
- *   [index_width: UInt8]  (1=UInt8, 2=UInt16, 0=raw fallback)
- *   If index_width > 0:
- *     [dict_size: UInt16]
- *     For each dict entry: [len: VarUInt][data: bytes]
- *     [num_rows: UInt32]
- *     [ids: UInt8*num_rows or UInt16*num_rows]
- *   If index_width == 0:
- *     [raw SizePrefix data copied verbatim]
- *
- * Input (source) is in TiFlash SizePrefix format:
- *   For each row: [len: VarUInt][data: bytes]
- */
 UInt32 CompressionCodecDictionary::doCompressData(const char * source, UInt32 source_size, char * dest) const
 {
-    // Parse source: VarUInt-prefixed strings.
-    // Keys in dict_map are string_views into the source buffer (which is stable).
     std::unordered_map<std::string_view, UInt16> dict_map;
-    std::vector<std::string_view> dict_entries; // views into source buffer
+    std::vector<std::string_view> dict_entries;
     std::vector<UInt16> ids;
 
     const char * pos = source;
@@ -76,7 +61,6 @@ UInt32 CompressionCodecDictionary::doCompressData(const char * source, UInt32 so
         {
             if (dict_entries.size() >= MAX_DICT_SIZE)
             {
-                // Too many distinct values — write raw fallback
                 char * out = dest;
                 *out = 0; // index_width = 0 = raw fallback
                 out += sizeof(UInt8);
@@ -85,7 +69,7 @@ UInt32 CompressionCodecDictionary::doCompressData(const char * source, UInt32 so
                 return static_cast<UInt32>(out - dest);
             }
             id = static_cast<UInt16>(dict_entries.size());
-            dict_entries.push_back(sv); // sv points into stable source buffer
+            dict_entries.push_back(sv);
             dict_map[sv] = id;
         }
         else
@@ -96,30 +80,43 @@ UInt32 CompressionCodecDictionary::doCompressData(const char * source, UInt32 so
         pos += str_len;
     }
 
-    // Determine index width
-    UInt8 index_width = (dict_entries.size() <= 256) ? 1 : 2;
+    // Determine base index width (1=UInt8, 2=UInt16)
+    UInt8 base_width = (dict_entries.size() <= 256) ? 1 : 2;
 
-    // Compute exact dictionary-encoded size to decide if it's worth it
+    // Build the raw ID array
+    size_t raw_ids_size = ids.size() * base_width;
+    std::vector<char> raw_ids(raw_ids_size);
+    if (base_width == 1)
+    {
+        for (size_t i = 0; i < ids.size(); ++i)
+            raw_ids[i] = static_cast<char>(static_cast<UInt8>(ids[i]));
+    }
+    else
+    {
+        for (size_t i = 0; i < ids.size(); ++i)
+            unalignedStore<UInt16>(&raw_ids[i * 2], ids[i]);
+    }
+
+    // LZ4-compress the ID array
+    int lz4_bound = LZ4_compressBound(static_cast<int>(raw_ids_size));
+    std::vector<char> lz4_ids(lz4_bound);
+    int lz4_size = LZ4_compress_fast(raw_ids.data(), lz4_ids.data(), static_cast<int>(raw_ids_size), lz4_bound, 1);
+
+    // Compute sizes: dict header + dict entries + num_rows + lz4 header + lz4 data
     size_t dict_header_size = sizeof(UInt8) + sizeof(UInt16); // index_width + dict_size
     size_t dict_entries_size = 0;
     for (const auto & entry : dict_entries)
     {
-        // VarUInt overhead: values < 128 need 1 byte, < 16384 need 2 bytes, etc.
         size_t varint_len = 1;
         UInt64 tmp = entry.size();
-        while (tmp >= 0x80)
-        {
-            ++varint_len;
-            tmp >>= 7;
-        }
+        while (tmp >= 0x80) { ++varint_len; tmp >>= 7; }
         dict_entries_size += varint_len + entry.size();
     }
-    size_t dict_total = dict_header_size + dict_entries_size + sizeof(UInt32) + ids.size() * index_width;
+    size_t dict_total = dict_header_size + dict_entries_size + sizeof(UInt32) + sizeof(UInt32) + lz4_size;
     size_t raw_total = sizeof(UInt8) + source_size;
 
     if (dict_total >= raw_total)
     {
-        // Dictionary encoding is not beneficial — use raw fallback
         char * out = dest;
         *out = 0;
         out += sizeof(UInt8);
@@ -128,10 +125,11 @@ UInt32 CompressionCodecDictionary::doCompressData(const char * source, UInt32 so
         return static_cast<UInt32>(out - dest);
     }
 
-    // Write compressed format
+    // Write v3 format: index_width 3 or 4 = LZ4-compressed IDs
     char * out = dest;
 
-    // index_width
+    // index_width: 3 = UInt8+LZ4, 4 = UInt16+LZ4
+    UInt8 index_width = (base_width == 1) ? 3 : 4;
     *out = index_width;
     out += sizeof(UInt8);
 
@@ -139,7 +137,7 @@ UInt32 CompressionCodecDictionary::doCompressData(const char * source, UInt32 so
     unalignedStore<UInt16>(out, static_cast<UInt16>(dict_entries.size()));
     out += sizeof(UInt16);
 
-    // dict entries: VarUInt length + bytes
+    // dict entries
     for (const auto & entry : dict_entries)
     {
         out = writeVarUInt(static_cast<UInt64>(entry.size()), out);
@@ -151,62 +149,26 @@ UInt32 CompressionCodecDictionary::doCompressData(const char * source, UInt32 so
     unalignedStore<UInt32>(out, static_cast<UInt32>(ids.size()));
     out += sizeof(UInt32);
 
-    // ids array
-    if (index_width == 1)
-    {
-        for (UInt16 id : ids)
-        {
-            *out = static_cast<UInt8>(id);
-            out += sizeof(UInt8);
-        }
-    }
-    else
-    {
-        for (UInt16 id : ids)
-        {
-            unalignedStore<UInt16>(out, id);
-            out += sizeof(UInt16);
-        }
-    }
+    // LZ4 compressed IDs: [lz4_compressed_size][lz4_data]
+    unalignedStore<UInt32>(out, static_cast<UInt32>(lz4_size));
+    out += sizeof(UInt32);
+    memcpy(out, lz4_ids.data(), lz4_size);
+    out += lz4_size;
 
     return static_cast<UInt32>(out - dest);
 }
 
-/**
- * Decompress back to SizePrefix format: [VarUInt len][bytes] per row.
- */
-void CompressionCodecDictionary::doDecompressData(
-    const char * source,
-    UInt32 source_size,
-    char * dest,
-    UInt32 uncompressed_size) const
+/// Helper: read dict entries and num_rows from a dictionary-encoded block.
+/// Returns (dict_entries, num_rows, updated pos).
+static std::tuple<std::vector<std::string>, UInt32, const char *> readDictHeader(
+    const char * pos,
+    const char * end)
 {
-    const char * pos = source;
-    const char * end = source + source_size;
-
-    // Read index_width
-    if (unlikely(pos + sizeof(UInt8) > end))
-        throw Exception("CompressionCodecDictionary: truncated header", ErrorCodes::CANNOT_DECOMPRESS);
-    UInt8 index_width = *pos;
-    pos += sizeof(UInt8);
-
-    if (index_width == 0)
-    {
-        // Raw fallback — just copy
-        UInt32 raw_size = source_size - sizeof(UInt8);
-        if (unlikely(raw_size != uncompressed_size))
-            throw Exception("CompressionCodecDictionary: raw fallback size mismatch", ErrorCodes::CANNOT_DECOMPRESS);
-        memcpy(dest, pos, raw_size);
-        return;
-    }
-
-    // Read dict_size
     if (unlikely(pos + sizeof(UInt16) > end))
         throw Exception("CompressionCodecDictionary: truncated dict_size", ErrorCodes::CANNOT_DECOMPRESS);
     UInt16 dict_size = unalignedLoad<UInt16>(pos);
     pos += sizeof(UInt16);
 
-    // Read dictionary entries
     std::vector<std::string> dict_entries(dict_size);
     for (UInt16 i = 0; i < dict_size; ++i)
     {
@@ -218,38 +180,122 @@ void CompressionCodecDictionary::doDecompressData(
         pos += entry_len;
     }
 
-    // Read num_rows
     if (unlikely(pos + sizeof(UInt32) > end))
         throw Exception("CompressionCodecDictionary: truncated num_rows", ErrorCodes::CANNOT_DECOMPRESS);
     UInt32 num_rows = unalignedLoad<UInt32>(pos);
     pos += sizeof(UInt32);
 
-    // Read IDs and write SizePrefix format to dest
-    char * out = dest;
-    char * out_end = dest + uncompressed_size;
+    return {std::move(dict_entries), num_rows, pos};
+}
 
+/// Helper: decode raw (uncompressed) ID array into per-row UInt16 ids.
+static void readRawIds(
+    const char *& pos,
+    const char * end,
+    UInt8 index_width,
+    UInt32 num_rows,
+    std::vector<UInt16> & ids)
+{
+    ids.resize(num_rows);
     for (UInt32 i = 0; i < num_rows; ++i)
     {
-        UInt16 id;
         if (index_width == 1)
         {
             if (unlikely(pos + sizeof(UInt8) > end))
-                throw Exception("CompressionCodecDictionary: truncated ids array", ErrorCodes::CANNOT_DECOMPRESS);
-            id = static_cast<UInt16>(*reinterpret_cast<const UInt8 *>(pos));
+                throw Exception("CompressionCodecDictionary: truncated ids", ErrorCodes::CANNOT_DECOMPRESS);
+            ids[i] = static_cast<UInt16>(*reinterpret_cast<const UInt8 *>(pos));
             pos += sizeof(UInt8);
         }
         else
         {
             if (unlikely(pos + sizeof(UInt16) > end))
-                throw Exception("CompressionCodecDictionary: truncated ids array", ErrorCodes::CANNOT_DECOMPRESS);
-            id = unalignedLoad<UInt16>(pos);
+                throw Exception("CompressionCodecDictionary: truncated ids", ErrorCodes::CANNOT_DECOMPRESS);
+            ids[i] = unalignedLoad<UInt16>(pos);
             pos += sizeof(UInt16);
         }
+    }
+}
 
-        if (unlikely(id >= dict_size))
+/// Helper: LZ4-decompress the ID array (v3 format).
+static void readLZ4Ids(
+    const char *& pos,
+    const char * end,
+    UInt8 base_width,
+    UInt32 num_rows,
+    std::vector<UInt16> & ids)
+{
+    if (unlikely(pos + sizeof(UInt32) > end))
+        throw Exception("CompressionCodecDictionary: truncated lz4 size", ErrorCodes::CANNOT_DECOMPRESS);
+    UInt32 lz4_size = unalignedLoad<UInt32>(pos);
+    pos += sizeof(UInt32);
+
+    if (unlikely(pos + lz4_size > end))
+        throw Exception("CompressionCodecDictionary: truncated lz4 data", ErrorCodes::CANNOT_DECOMPRESS);
+
+    size_t raw_ids_size = static_cast<size_t>(num_rows) * base_width;
+    std::vector<char> raw_ids(raw_ids_size);
+    if (unlikely(LZ4_decompress_safe(pos, raw_ids.data(), static_cast<int>(lz4_size), static_cast<int>(raw_ids_size)) < 0))
+        throw Exception("CompressionCodecDictionary: LZ4 decompression failed", ErrorCodes::CANNOT_DECOMPRESS);
+    pos += lz4_size;
+
+    ids.resize(num_rows);
+    if (base_width == 1)
+    {
+        for (UInt32 i = 0; i < num_rows; ++i)
+            ids[i] = static_cast<UInt16>(static_cast<UInt8>(raw_ids[i]));
+    }
+    else
+    {
+        for (UInt32 i = 0; i < num_rows; ++i)
+            ids[i] = unalignedLoad<UInt16>(&raw_ids[i * 2]);
+    }
+}
+
+void CompressionCodecDictionary::doDecompressData(
+    const char * source,
+    UInt32 source_size,
+    char * dest,
+    UInt32 uncompressed_size) const
+{
+    const char * pos = source;
+    const char * end = source + source_size;
+
+    if (unlikely(pos + sizeof(UInt8) > end))
+        throw Exception("CompressionCodecDictionary: truncated header", ErrorCodes::CANNOT_DECOMPRESS);
+    UInt8 index_width = *pos;
+    pos += sizeof(UInt8);
+
+    if (index_width == 0)
+    {
+        UInt32 raw_size = source_size - sizeof(UInt8);
+        if (unlikely(raw_size != uncompressed_size))
+            throw Exception("CompressionCodecDictionary: raw fallback size mismatch", ErrorCodes::CANNOT_DECOMPRESS);
+        memcpy(dest, pos, raw_size);
+        return;
+    }
+
+    auto [dict_entries, num_rows, new_pos] = readDictHeader(pos, end);
+    pos = new_pos;
+    UInt16 dict_size = static_cast<UInt16>(dict_entries.size());
+
+    std::vector<UInt16> ids;
+    if (index_width == 3 || index_width == 4)
+    {
+        UInt8 base_width = (index_width == 3) ? 1 : 2;
+        readLZ4Ids(pos, end, base_width, num_rows, ids);
+    }
+    else
+    {
+        readRawIds(pos, end, index_width, num_rows, ids);
+    }
+
+    char * out = dest;
+    char * out_end = dest + uncompressed_size;
+    for (UInt32 i = 0; i < num_rows; ++i)
+    {
+        if (unlikely(ids[i] >= dict_size))
             throw Exception("CompressionCodecDictionary: invalid dict ID", ErrorCodes::CANNOT_DECOMPRESS);
-
-        const std::string & entry = dict_entries[id];
+        const std::string & entry = dict_entries[ids[i]];
         out = writeVarUInt(static_cast<UInt64>(entry.size()), out);
         if (unlikely(out + entry.size() > out_end))
             throw Exception("CompressionCodecDictionary: output buffer overflow", ErrorCodes::CANNOT_DECOMPRESS);
@@ -267,74 +313,45 @@ ColumnPtr CompressionCodecDictionary::decompressAsColumnDictionary(
     const char * pos = source;
     const char * end = source + source_size;
 
-    // Read index_width
     if (unlikely(pos + sizeof(UInt8) > end))
         throw Exception("CompressionCodecDictionary: truncated header", ErrorCodes::CANNOT_DECOMPRESS);
     UInt8 index_width = *pos;
     pos += sizeof(UInt8);
 
     if (index_width == 0)
-        return nullptr; // raw fallback — caller must use standard decompress path
+        return nullptr;
 
-    // Read dict_size
-    if (unlikely(pos + sizeof(UInt16) > end))
-        throw Exception("CompressionCodecDictionary: truncated dict_size", ErrorCodes::CANNOT_DECOMPRESS);
-    UInt16 dict_size = unalignedLoad<UInt16>(pos);
-    pos += sizeof(UInt16);
+    auto [dict_entries_str, num_rows, new_pos] = readDictHeader(pos, end);
+    pos = new_pos;
 
-    // Read dictionary entries → Field vector
-    std::vector<Field> dictionary(dict_size);
-    for (UInt16 i = 0; i < dict_size; ++i)
+    std::vector<Field> dictionary(dict_entries_str.size());
+    for (size_t i = 0; i < dict_entries_str.size(); ++i)
+        dictionary[i] = std::move(dict_entries_str[i]);
+
+    std::vector<UInt16> ids16;
+    if (index_width == 3 || index_width == 4)
     {
-        UInt64 entry_len = 0;
-        pos = readVarUInt(entry_len, pos, end - pos);
-        if (unlikely(pos + entry_len > end))
-            throw Exception("CompressionCodecDictionary: truncated dict entry", ErrorCodes::CANNOT_DECOMPRESS);
-        dictionary[i] = String(pos, entry_len);
-        pos += entry_len;
+        UInt8 base_width = (index_width == 3) ? 1 : 2;
+        readLZ4Ids(pos, end, base_width, num_rows, ids16);
+    }
+    else
+    {
+        readRawIds(pos, end, index_width, num_rows, ids16);
     }
 
-    // Read num_rows
-    if (unlikely(pos + sizeof(UInt32) > end))
-        throw Exception("CompressionCodecDictionary: truncated num_rows", ErrorCodes::CANNOT_DECOMPRESS);
-    UInt32 num_rows = unalignedLoad<UInt32>(pos);
-    pos += sizeof(UInt32);
-
-    // Read IDs
     PaddedPODArray<UInt32> ids;
     ids.reserve(num_rows);
-    for (UInt32 i = 0; i < num_rows; ++i)
-    {
-        UInt16 id;
-        if (index_width == 1)
-        {
-            if (unlikely(pos + sizeof(UInt8) > end))
-                throw Exception("CompressionCodecDictionary: truncated ids", ErrorCodes::CANNOT_DECOMPRESS);
-            id = static_cast<UInt16>(*reinterpret_cast<const UInt8 *>(pos));
-            pos += sizeof(UInt8);
-        }
-        else
-        {
-            if (unlikely(pos + sizeof(UInt16) > end))
-                throw Exception("CompressionCodecDictionary: truncated ids", ErrorCodes::CANNOT_DECOMPRESS);
-            id = unalignedLoad<UInt16>(pos);
-            pos += sizeof(UInt16);
-        }
+    for (UInt16 id : ids16)
         ids.push_back(static_cast<UInt32>(id));
-    }
 
     return ColumnDictionary::createMutable(std::move(dictionary), std::move(ids), value_type);
 }
 
 UInt32 CompressionCodecDictionary::getMaxCompressedDataSize(UInt32 uncompressed_size) const
 {
-    // Worst case: dictionary format with all 1-byte rows (max row count = uncompressed_size),
-    // each row's UInt16 id = 2 bytes → up to uncompressed_size * 2 for ids.
-    // Plus dictionary entries (≤ uncompressed_size bytes) + 7 bytes overhead.
-    // Raw fallback is only uncompressed_size + 1.
-    // Since doCompressData falls back to raw when dictionary is larger,
-    // the actual output never exceeds raw_total. But the buffer must be
-    // large enough for the raw fallback path.
+    // Raw fallback: 1 byte header + uncompressed data.
+    // LZ4 bound on IDs could theoretically exceed input for incompressible data,
+    // but we fall back to raw if dictionary is larger. Buffer for raw fallback.
     return uncompressed_size + sizeof(UInt8);
 }
 

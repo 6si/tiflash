@@ -23,21 +23,27 @@ namespace DB
 /**
  * Dictionary compression codec for string columns with low cardinality.
  *
- * Compressed format (v2 — adaptive index width):
- *   [index_width: UInt8]   - 1=UInt8 ids, 2=UInt16 ids, 0=raw fallback
- *   If index_width > 0 (dictionary encoded):
- *     [dict_size: UInt16]                               - number of dictionary entries
- *     [entry_0_len: VarUInt][entry_0_data: bytes]...    - dictionary entries (length-prefixed)
- *     [num_rows: UInt32]                                - number of rows
- *     [ids: UInt8[num_rows] or UInt16[num_rows]]        - per-row dictionary IDs
- *   If index_width == 0 (raw fallback for high NDV):
+ * Compressed format (v3 — adaptive index width + LZ4 on IDs):
+ *   [index_width: UInt8]
+ *     0 = raw fallback (high NDV)
+ *     1 = UInt8 IDs, no LZ4 (legacy v2)
+ *     2 = UInt16 IDs, no LZ4 (legacy v2)
+ *     3 = UInt8 IDs, LZ4-compressed (v3)
+ *     4 = UInt16 IDs, LZ4-compressed (v3)
+ *   If index_width > 0:
+ *     [dict_size: UInt16]
+ *     For each entry: [len: VarUInt][data: bytes]
+ *     [num_rows: UInt32]
+ *     If index_width == 3 or 4 (LZ4):
+ *       [lz4_compressed_size: UInt32]
+ *       [lz4_compressed_ids: bytes]
+ *     Else (1 or 2, legacy):
+ *       [ids: UInt8[num_rows] or UInt16[num_rows]]
+ *   If index_width == 0:
  *     [raw SizePrefix data, unmodified]
  *
- * The uncompressed format (for standard decompression) is:
- *   TiFlash SizePrefix format: [VarUInt length][string bytes] per row
- *
- * This codec also supports decompressAsColumnDictionary() which produces
- * a ColumnDictionary directly without materializing strings.
+ * v3 applies LZ4 to the ID array, which for 100M rows × 5 NDV
+ * compresses ~100MB → ~1MB (vs v2's uncompressed 100MB on disk).
  */
 class CompressionCodecDictionary : public ICompressionCodec
 {
