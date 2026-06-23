@@ -1239,8 +1239,8 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                         for (size_t i = 0; i < dict.size(); ++i)
                         {
                             String val = dict[i].get<String>();
-                            dks.id_to_value.push_back(val);
-                            dks.value_to_id.emplace(StringRef(dks.id_to_value.back()), static_cast<UInt16>(i));
+                            // Use getOrInsert to apply padding normalization
+                            dks.getOrInsert(StringRef(val));
                         }
                         dks.active = true;
                         aggregator->effective_method_chosen = AggregatedDataVariants::Type::key16;
@@ -1290,15 +1290,29 @@ void Aggregator::AggProcessInfo::prepareForAgg()
         const auto * dict_col = typeid_cast<const ColumnDictionary *>(key_columns[0]);
         if (dict_col)
         {
-            /// ColumnDictionary → UInt16: just copy the IDs (they map 1:1 to our dictionary)
+            /// ColumnDictionary → UInt16: remap through our dictionary.
+            /// Different DMFile segments may have different dictionaries, so we
+            /// build a segment-local remap table and translate IDs per-row.
+            const auto & seg_dict = dict_col->getDictionary();
             const auto & dict_ids = dict_col->getDictionaryIds();
-            auto uint16_col = ColumnUInt16::create();
-            auto & data = uint16_col->getData();
-            data.resize(dict_ids.size());
-            for (size_t i = 0; i < dict_ids.size(); ++i)
-                data[i] = static_cast<UInt16>(dict_ids[i]);
-            materialized_columns.push_back(std::move(uint16_col));
-            key_columns[0] = materialized_columns.back().get();
+            std::vector<UInt16> remap(seg_dict.size());
+            for (size_t i = 0; i < seg_dict.size(); ++i)
+            {
+                String val = seg_dict[i].get<String>();
+                remap[i] = dks.getOrInsert(StringRef(val));
+                if (unlikely(dks.failed))
+                    break;
+            }
+            if (!dks.failed)
+            {
+                auto uint16_col = ColumnUInt16::create();
+                auto & data = uint16_col->getData();
+                data.resize(dict_ids.size());
+                for (size_t i = 0; i < dict_ids.size(); ++i)
+                    data[i] = remap[dict_ids[i]];
+                materialized_columns.push_back(std::move(uint16_col));
+                key_columns[0] = materialized_columns.back().get();
+            }
         }
         else
         {
