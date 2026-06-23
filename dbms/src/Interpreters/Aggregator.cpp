@@ -1128,9 +1128,9 @@ void Aggregator::AggProcessInfo::prepareForAgg()
 
         /// Visit-cache: try to extract or build dictionary info for the key
         /// column so the fast path can do K hash lookups instead of N.
-        /// Conditions: single key, no collator.
-        if (aggregator->params.keys_size == 1
-            && (aggregator->params.collators.empty() || aggregator->params.collators[i] == nullptr))
+        /// Conditions: single key. Collators are supported — sortKey() is
+        /// applied to each dictionary entry in executeDictionaryKeyFastPath.
+        if (aggregator->params.keys_size == 1)
         {
             // Case 1: key is already ColumnDictionary (e.g., from storage)
             if (key_columns[i]->isDictionaryEncoded())
@@ -1213,6 +1213,15 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                     }
                 }
             }
+
+            // Store the collator for the fast path (applied to K dict entries,
+            // not N rows — huge win when collator->sortKey() is non-trivial).
+            if (dict_ids != nullptr
+                && !aggregator->params.collators.empty()
+                && aggregator->params.collators[i] != nullptr)
+            {
+                dict_collator = aggregator->params.collators[i];
+            }
         }
 
         if (ColumnPtr converted = key_columns[i]->convertToFullColumnIfDictionary())
@@ -1262,14 +1271,23 @@ void Aggregator::executeDictionaryKeyFastPath(
     const auto & dict_refs = agg_process_info.dict_entries_refs;
     const size_t dict_size = agg_process_info.dict_size;
     const size_t rows = agg_process_info.end_row - agg_process_info.start_row;
+    const auto collator = agg_process_info.dict_collator;
 
     /// Pass 1: look up each dictionary entry in the hash table (K lookups).
+    /// When a collator is present, apply sortKey() to each entry first so that
+    /// collation-aware grouping is correct (e.g. utf8mb4_bin trailing-space trim).
+    /// This is still only K sortKey calls instead of N — the whole point.
+    std::string sort_key_container;
     std::vector<AggregateDataPtr> visit_cache(dict_size, nullptr);
     for (size_t i = 0; i < dict_size; ++i)
     {
+        StringRef key = dict_refs[i];
+        if (collator)
+            key = collator->sortKey(key.data, key.size, sort_key_container);
+
         typename Method::Data::LookupResult lookup_result;
         bool inserted = false;
-        method.data.emplace(ArenaKeyHolder{dict_refs[i], pool}, lookup_result, inserted);
+        method.data.emplace(ArenaKeyHolder{key, pool}, lookup_result, inserted);
         if (inserted)
         {
             auto * place = pool->alignedAlloc(total_size_of_aggregate_states, align_aggregate_states);

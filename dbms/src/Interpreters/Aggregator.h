@@ -1008,6 +1008,11 @@ public:
         /// Holds the auto-encoded ColumnDictionary when we build one on-the-fly
         /// from a low-cardinality ColumnString key. Prevents dangling pointers.
         ColumnPtr auto_encoded_dict_col;
+        /// Collator for the dictionary key column. When non-null,
+        /// executeDictionaryKeyFastPath applies sortKey() to each dictionary
+        /// entry before hash-table insertion so that collation-aware grouping
+        /// is correct (e.g. utf8mb4_bin trailing-space trimming).
+        TiDB::TiDBCollatorPtr dict_collator = nullptr;
 
         void prepareForAgg();
         bool allBlockDataHandled() const

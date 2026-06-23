@@ -26,6 +26,7 @@
 #include <IO/FileProvider/FileProvider.h>
 #include <Interpreters/Aggregator.h>
 #include <Interpreters/Context.h>
+#include <TiDB/Collation/Collator.h>
 #include <TestUtils/TiFlashTestBasic.h>
 #include <gtest/gtest.h>
 
@@ -174,6 +175,46 @@ protected:
             }
         }
         return counts;
+    }
+
+    /// Create Aggregator with a collator for: SELECT key, COUNT(val) FROM ... GROUP BY key
+    std::unique_ptr<Aggregator> createCountAggregatorWithCollator(
+        const Block & header,
+        TiDB::TiDBCollatorPtr collator)
+    {
+        auto data_type_uint64 = std::make_shared<DataTypeUInt64>();
+        AggregateDescriptions agg_descs{
+            {.function = AggregateFunctionFactory::instance().get(*context, "count", {data_type_uint64}, {}, 0, false),
+             .parameters = {},
+             .arguments = {1},
+             .argument_names = {"val"},
+             .column_name = "count(val)"},
+        };
+
+        ColumnNumbers keys = {0};
+        KeyRefAggFuncMap key_ref_agg_func;
+        AggFuncRefKeyMap agg_func_ref_key;
+
+        TiDB::TiDBCollators collators;
+        collators.push_back(collator);
+
+        Aggregator::Params params(
+            header,
+            keys,
+            key_ref_agg_func,
+            agg_func_ref_key,
+            agg_descs,
+            0,
+            0,
+            0,
+            false,
+            *spill_config,
+            8192,
+            false,
+            collators);
+
+        RegisterOperatorSpillContext no_spill = [](const OperatorSpillContextPtr &) {};
+        return std::make_unique<Aggregator>(params, "test", /*concurrency=*/1, no_spill, false, false);
     }
 
     std::shared_ptr<Context> context;
@@ -330,6 +371,88 @@ try
     ASSERT_EQ(counts["key_2"], 500u);
     ASSERT_EQ(counts["key_3"], 200u);
     ASSERT_EQ(counts["key_4"], 200u);
+}
+CATCH
+
+/// Verify visit-cache activates WITH a collator (previously blocked by collator check)
+TEST_F(AggregatorDictionaryVisitCacheTest, VisitCacheActivatesWithCollator)
+try
+{
+    auto collator = TiDB::ITiDBCollator::getCollator(TiDB::ITiDBCollator::UTF8MB4_BIN);
+    ASSERT_NE(collator, nullptr);
+
+    auto string_block = buildStringBlock(512, 3);
+    auto aggregator = createCountAggregatorWithCollator(string_block, collator);
+    Aggregator::AggProcessInfo info(aggregator.get());
+    info.resetBlock(string_block);
+    info.prepareForAgg();
+
+    ASSERT_NE(info.dict_ids, nullptr) << "visit_cache should activate even with utf8mb4_bin collator";
+    ASSERT_EQ(info.dict_size, 3u);
+    ASSERT_EQ(info.dict_collator, collator) << "dict_collator should be stored for fast path";
+}
+CATCH
+
+/// Verify GROUP BY correctness with collator + visit_cache
+TEST_F(AggregatorDictionaryVisitCacheTest, CorrectCountWithCollator)
+try
+{
+    auto collator = TiDB::ITiDBCollator::getCollator(TiDB::ITiDBCollator::UTF8MB4_BIN);
+    ASSERT_NE(collator, nullptr);
+
+    const size_t num_rows = 1000;
+    const size_t num_distinct = 5;
+
+    auto string_block = buildStringBlock(num_rows, num_distinct);
+
+    auto collect = [](Aggregator & agg, const Block & block) {
+        auto result = std::make_shared<AggregatedDataVariants>();
+        Aggregator::AggProcessInfo info(&agg);
+        info.resetBlock(block);
+        agg.executeOnBlock(info, *result, 0);
+
+        ManyAggregatedDataVariants variants;
+        variants.push_back(result);
+        auto merged = agg.mergeAndConvertToBlocks(variants, true, 1);
+
+        std::map<String, UInt64> counts;
+        if (!merged)
+            return counts;
+        for (size_t ci = 0; ci < merged->getConcurrency(); ++ci)
+        {
+            auto output_block = merged->getData(ci);
+            if (!output_block)
+                continue;
+            size_t rows = output_block.rows();
+            if (rows == 0)
+                continue;
+            const auto & key_col = output_block.getByPosition(0).column;
+            const auto & cnt_col = output_block.getByPosition(1).column;
+            for (size_t i = 0; i < rows; ++i)
+            {
+                String key = key_col->getDataAt(i).toString();
+                UInt64 count = cnt_col->getUInt(i);
+                counts[key] += count;
+            }
+        }
+        return counts;
+    };
+
+    auto aggregator_with = createCountAggregatorWithCollator(string_block, collator);
+    auto counts_with = collect(*aggregator_with, string_block);
+
+    auto aggregator_without = createCountAggregator(string_block);
+    auto counts_without = collect(*aggregator_without, string_block);
+
+    ASSERT_EQ(counts_with.size(), num_distinct);
+    ASSERT_EQ(counts_without.size(), num_distinct);
+
+    for (size_t i = 0; i < num_distinct; ++i)
+    {
+        String key = "key_" + std::to_string(i);
+        ASSERT_EQ(counts_with[key], num_rows / num_distinct) << "Collator path mismatch for key: " << key;
+        ASSERT_EQ(counts_with[key], counts_without[key]) << "Collator vs no-collator mismatch for key: " << key;
+    }
 }
 CATCH
 
