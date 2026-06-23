@@ -13,6 +13,8 @@
 // limitations under the License.
 
 #include <IO/Compression/CompressedReadBufferFromFile.h>
+#include <IO/Compression/CompressionCodecDictionary.h>
+#include <IO/Compression/CompressionMethod.h>
 
 namespace DB
 {
@@ -134,6 +136,49 @@ size_t CompressedReadBufferFromFileImpl<has_legacy_checksum>::readBig(char * to,
     }
 
     return bytes_read;
+}
+
+template <bool has_legacy_checksum>
+ColumnPtr CompressedReadBufferFromFileImpl<has_legacy_checksum>::tryReadBlockAsColumnDictionary(
+    const DataTypePtr & value_type)
+{
+    size_t size_decompressed;
+    size_t size_compressed_without_checksum;
+    size_t new_size_compressed = this->readCompressedData(size_decompressed, size_compressed_without_checksum);
+    if (!new_size_compressed)
+        return nullptr;
+
+    // Check if this block uses the Dictionary codec
+    UInt8 method_byte = ICompressionCodec::readMethod(this->compressed_buffer);
+    if (method_byte == static_cast<UInt8>(CompressionMethodByte::Dictionary))
+    {
+        constexpr UInt8 header_size = ICompressionCodec::getHeaderSize();
+        const char * data = this->compressed_buffer + header_size;
+        UInt32 data_size = static_cast<UInt32>(size_compressed_without_checksum - header_size);
+
+        auto result = CompressionCodecDictionary::decompressToColumnDictionary(data, data_size, value_type);
+        if (result)
+        {
+            // Block consumed as ColumnDictionary. Set empty working_buffer so the next
+            // ReadBuffer::read() triggers nextImpl() to advance to the next block.
+            size_compressed = new_size_compressed;
+            memory.resize(0);
+            working_buffer = Buffer(memory.data(), memory.data());
+            pos = working_buffer.begin();
+            return result;
+        }
+        // decompressToColumnDictionary returned nullptr (e.g. fallback marker or non-string).
+        // Fall through to decompress normally.
+    }
+
+    // Not dictionary-encoded (or fallback): decompress into working_buffer
+    // so the caller can proceed with normal deserialization.
+    assert(size_decompressed > 0);
+    memory.resize(size_decompressed);
+    working_buffer = Buffer(&memory[0], &memory[size_decompressed]);
+    this->decompress(working_buffer.begin(), size_decompressed, size_compressed_without_checksum);
+    size_compressed = new_size_compressed;
+    return nullptr;
 }
 
 template class CompressedReadBufferFromFileImpl<true>;

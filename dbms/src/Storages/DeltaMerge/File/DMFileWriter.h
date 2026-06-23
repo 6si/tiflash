@@ -106,9 +106,20 @@ public:
         {
             // Force use Lightweight compression for string sizes, since the string sizes almost always small.
             // Performance of LZ4 to decompress such integers is not good.
-            return isStringSizes(type, file_base_name)
-                ? CompressionSetting{CompressionMethod::Lightweight, CompressionDataType::Int64}
-                : CompressionSetting::create<>(setting.method, setting.level, *type);
+            if (isStringSizes(type, file_base_name))
+                return CompressionSetting{CompressionMethod::Lightweight, CompressionDataType::Int64};
+
+            auto s = CompressionSetting::create<>(setting.method, setting.level, *type);
+
+            // Use Dictionary codec for String data streams (SizePrefix format).
+            // The codec falls back to uncompressed storage when cardinality is too high,
+            // so this is safe for all string columns.
+            if (s.data_type == CompressionDataType::String)
+            {
+                s.method = CompressionMethod::Dictionary;
+                s.method_byte = CompressionMethodByte::Dictionary;
+            }
+            return s;
         }
 
         // compressed_buf -> plain_file
@@ -188,6 +199,10 @@ private:
     Options options;
 
     ColumnStreams column_streams;
+
+    /// Per-column type overrides used for serialization (e.g. String→SizePrefix for Dictionary codec).
+    /// Columns not in this map use cd.type as-is.
+    std::unordered_map<ColId, DataTypePtr> write_type_overrides;
 
     FileProviderPtr file_provider;
     WriteLimiterPtr write_limiter;

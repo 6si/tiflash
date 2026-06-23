@@ -15,11 +15,16 @@
 #pragma once
 
 #include <Columns/IColumn.h>
+#include <Common/Arena.h>
+#include <Common/HashTable/Hash.h>
 #include <Common/PODArray.h>
+#include <Common/SipHash.h>
+#include <Common/WeakHash.h>
 #include <Common/typeid_cast.h>
 #include <Core/Field.h>
 #include <DataTypes/IDataType.h>
 #include <common/StringRef.h>
+#include <common/likely.h>
 
 #include <cassert>
 #include <vector>
@@ -111,72 +116,173 @@ public:
         res = dictionary[ids[n]];
     }
 
-    StringRef getDataAt(size_t /*n*/) const override
+    StringRef getDataAt(size_t n) const override
     {
-        throw Exception("getDataAt not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        assert(n < ids.size());
+        const auto & val = dictionary[ids[n]];
+        const auto & s = val.get<String>();
+        return StringRef(s.data(), s.size());
     }
 
-    void insertData(const char * /*pos*/, size_t /*length*/) override
+    void insertData(const char * pos, size_t length) override
     {
-        throw Exception("insertData not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        String val(pos, length);
+        UInt32 id = findOrAddEntry(Field(std::move(val)));
+        ids.push_back(id);
     }
 
-    void insert(const Field & /*x*/) override
+    void insert(const Field & x) override
     {
-        throw Exception("insert not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        UInt32 id = findOrAddEntry(x);
+        ids.push_back(id);
     }
 
     void insertDefault() override { ids.push_back(0); }
 
-    void insertFrom(const IColumn & /*src*/, size_t /*n*/) override
+    void insertFrom(const IColumn & src, size_t n) override
     {
-        throw Exception("insertFrom not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        const auto * src_dict = typeid_cast<const ColumnDictionary *>(&src);
+        if (src_dict)
+        {
+            Field val = src_dict->getDictionary()[src_dict->getDictionaryIds()[n]];
+            UInt32 id = findOrAddEntry(val);
+            ids.push_back(id);
+        }
+        else
+        {
+            Field val;
+            src.get(n, val);
+            UInt32 id = findOrAddEntry(val);
+            ids.push_back(id);
+        }
     }
 
     void popBack(size_t n) override { ids.resize_assume_reserved(ids.size() - n); }
 
     StringRef serializeValueIntoArena(
-        size_t /*n*/,
-        Arena & /*arena*/,
-        char const *& /*begin*/,
-        const TiDB::TiDBCollatorPtr & /*collator*/,
-        String & /*sort_key_container*/) const override
+        size_t n,
+        Arena & arena,
+        char const *& begin,
+        const TiDB::TiDBCollatorPtr & collator,
+        String & sort_key_container) const override
     {
-        throw Exception("serializeValueIntoArena not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        assert(n < ids.size());
+        const auto & s = dictionary[ids[n]].get<String>();
+        const void * src = s.data();
+        size_t string_size = s.size() + 1; // include trailing zero like ColumnString
+
+        StringRef res;
+        if (likely(collator != nullptr))
+        {
+            auto sort_key = collator->sortKeyFastPath(s.data(), s.size(), sort_key_container);
+            string_size = sort_key.size;
+            src = sort_key.data;
+        }
+        res.size = sizeof(string_size) + string_size;
+        char * pos = arena.allocContinue(res.size, begin);
+        std::memcpy(pos, &string_size, sizeof(string_size));
+        if (string_size > 0)
+            std::memcpy(pos + sizeof(string_size), src, string_size);
+        res.data = pos;
+        return res;
     }
 
-    const char * deserializeAndInsertFromArena(const char * /*pos*/, const TiDB::TiDBCollatorPtr &) override
+    const char * deserializeAndInsertFromArena(const char * pos, const TiDB::TiDBCollatorPtr &) override
     {
-        throw Exception(
-            "deserializeAndInsertFromArena not supported for ColumnDictionary",
-            ErrorCodes::NOT_IMPLEMENTED);
+        const size_t string_size = *reinterpret_cast<const size_t *>(pos);
+        pos += sizeof(string_size);
+        insertData(pos, string_size);
+        return pos + string_size;
     }
 
-    void updateHashWithValue(size_t /*n*/, SipHash & /*hash*/, const TiDB::TiDBCollatorPtr &, String &) const override
+    void updateHashWithValue(
+        size_t n,
+        SipHash & hash,
+        const TiDB::TiDBCollatorPtr & collator,
+        String & sort_key_container) const override
     {
-        throw Exception("updateHashWithValue not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        assert(n < ids.size());
+        const auto & s = dictionary[ids[n]].get<String>();
+        if (likely(collator != nullptr))
+        {
+            auto sort_key = collator->sortKeyFastPath(s.data(), s.size(), sort_key_container);
+            size_t key_size = sort_key.size;
+            hash.update(reinterpret_cast<const char *>(&key_size), sizeof(key_size));
+            hash.update(sort_key.data, sort_key.size);
+        }
+        else
+        {
+            size_t str_size = s.size() + 1; // trailing zero
+            hash.update(reinterpret_cast<const char *>(&str_size), sizeof(str_size));
+            hash.update(s.data(), s.size() + 1);
+        }
     }
 
     void updateHashWithValues(
-        IColumn::HashValues & /*hash_values*/,
-        const TiDB::TiDBCollatorPtr &,
-        String &) const override
+        IColumn::HashValues & hash_values,
+        const TiDB::TiDBCollatorPtr & collator,
+        String & sort_key_container) const override
     {
-        throw Exception("updateHashWithValues not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
-    }
-
-    void updateWeakHash32(WeakHash32 & /*hash*/, const TiDB::TiDBCollatorPtr &, String &) const override
-    {
-        throw Exception("updateWeakHash32 not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        for (size_t i = 0; i < ids.size(); ++i)
+            updateHashWithValue(i, hash_values[i], collator, sort_key_container);
     }
 
     void updateWeakHash32(
-        WeakHash32 & /*hash*/,
-        const TiDB::TiDBCollatorPtr &,
-        String &,
-        const BlockSelective &) const override
+        WeakHash32 & hash,
+        const TiDB::TiDBCollatorPtr & collator,
+        String & sort_key_container) const override
     {
-        throw Exception("updateWeakHash32 not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        auto & hash_data = hash.getData();
+        for (size_t i = 0; i < ids.size(); ++i)
+        {
+            const auto & s = dictionary[ids[i]].get<String>();
+            if (likely(collator != nullptr))
+            {
+                auto sort_key = collator->sortKeyFastPath(s.data(), s.size(), sort_key_container);
+                hash_data[i] = ::updateWeakHash32(
+                    reinterpret_cast<const UInt8 *>(sort_key.data),
+                    sort_key.size,
+                    hash_data[i]);
+            }
+            else
+            {
+                // Match ColumnString: hash without trailing zero
+                hash_data[i] = ::updateWeakHash32(
+                    reinterpret_cast<const UInt8 *>(s.data()),
+                    s.size(),
+                    hash_data[i]);
+            }
+        }
+    }
+
+    void updateWeakHash32(
+        WeakHash32 & hash,
+        const TiDB::TiDBCollatorPtr & collator,
+        String & sort_key_container,
+        const BlockSelective & selective) const override
+    {
+        auto & hash_data = hash.getData();
+        for (size_t idx = 0; idx < selective.size(); ++idx)
+        {
+            size_t i = selective[idx];
+            const auto & s = dictionary[ids[i]].get<String>();
+            if (likely(collator != nullptr))
+            {
+                auto sort_key = collator->sortKeyFastPath(s.data(), s.size(), sort_key_container);
+                hash_data[idx] = ::updateWeakHash32(
+                    reinterpret_cast<const UInt8 *>(sort_key.data),
+                    sort_key.size,
+                    hash_data[idx]);
+            }
+            else
+            {
+                // Match ColumnString: hash without trailing zero
+                hash_data[idx] = ::updateWeakHash32(
+                    reinterpret_cast<const UInt8 *>(s.data()),
+                    s.size(),
+                    hash_data[idx]);
+            }
+        }
     }
 
     void insertRangeFrom(const IColumn & src, size_t start, size_t length) override
@@ -399,6 +505,18 @@ public:
         const Offsets & /*array_offsets*/) const override
     {
         throw Exception("deserializeAndAdvancePosForColumnArray not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+    }
+
+private:
+    UInt32 findOrAddEntry(const Field & val)
+    {
+        for (UInt32 i = 0; i < dictionary.size(); ++i)
+        {
+            if (dictionary[i] == val)
+                return i;
+        }
+        dictionary.push_back(val);
+        return static_cast<UInt32>(dictionary.size() - 1);
     }
 };
 

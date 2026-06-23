@@ -71,9 +71,8 @@ CompressionSetting CompressionSetting::create(T method, int level, const IDataTy
         setting.data_type = CompressionDataType::Float32;
     else if (type.isFloatingPoint() && type.getSizeOfValueInMemory() == 8)
         setting.data_type = CompressionDataType::Float64;
-    // TODO: support String
-    // else if (type.isStringOrFixedString())
-    //     setting.data_type = CompressionDataType::String;
+    else if (type.isString())
+        setting.data_type = CompressionDataType::String;
     else
         setting.data_type = CompressionDataType::Unknown;
     setting.level = level;

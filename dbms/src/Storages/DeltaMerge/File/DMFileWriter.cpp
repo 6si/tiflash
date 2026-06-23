@@ -13,6 +13,8 @@
 // limitations under the License.
 
 #include <Common/TiFlashException.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeString.h>
 #include <IO/FileProvider/WriteBufferFromWritableFileBuilder.h>
 #include <Storages/DeltaMerge/DeltaMergeHelpers.h>
 #include <Storages/DeltaMerge/File/DMFileWriter.h>
@@ -64,12 +66,29 @@ DMFileWriter::DMFileWriter(
         auto type = removeNullable(cd.type);
         bool do_index = cd.id == MutSup::extra_handle_id || type->isInteger() || type->isDateOrDateTime();
 
-        addStreams(cd.id, cd.type, do_index);
+        // For String columns, force SizePrefix serialization so the Dictionary
+        // codec can operate on [4-byte len][data] entries.  SizePrefix produces a
+        // single stream (vs V2's two streams), which the ColumnDictionary read path
+        // can parse directly.
+        auto write_type = cd.type;
+        if (type->isString())
+        {
+            auto sp_string = std::make_shared<DataTypeString>(DataTypeString::SerdesFormat::SizePrefix);
+            if (cd.type->isNullable())
+                write_type = makeNullable(sp_string);
+            else
+                write_type = sp_string;
+        }
+
+        if (write_type != cd.type)
+            write_type_overrides[cd.id] = write_type;
+
+        addStreams(cd.id, write_type, do_index);
         dmfile->meta->getColumnStats().emplace(
             cd.id,
             ColumnStat{
                 .col_id = cd.id,
-                .type = cd.type,
+                .type = write_type,
                 .avg_size = 0,
                 // ... here ignore some fields with default initializers
                 .indexes = {},
@@ -150,7 +169,9 @@ void DMFileWriter::write(const Block & block, const BlockProperty & block_proper
     for (auto & cd : write_columns)
     {
         const auto & col = getByColumnId(block, cd.id).column;
-        writeColumn(cd.id, *cd.type, *col, del_mark);
+        auto it = write_type_overrides.find(cd.id);
+        const auto & wtype = (it != write_type_overrides.end()) ? *it->second : *cd.type;
+        writeColumn(cd.id, wtype, *col, del_mark);
 
         if (cd.id == MutSup::version_col_id)
             stat.first_version = col->get64(0);
@@ -172,7 +193,8 @@ void DMFileWriter::finalize()
     // Some fields of ColumnStat is set in `finalizeColumn`
     for (auto & cd : write_columns)
     {
-        finalizeColumn(cd.id, cd.type);
+        auto it = write_type_overrides.find(cd.id);
+        finalizeColumn(cd.id, (it != write_type_overrides.end()) ? it->second : cd.type);
     }
     if (dmfile->useMetaV2())
     {

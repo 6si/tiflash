@@ -14,9 +14,12 @@
 
 #include <IO/Compression/CompressionCodecDictionary.h>
 
+#include <Columns/ColumnDictionary.h>
 #include <Common/BitpackingPrimitives.h>
 #include <Common/Exception.h>
+#include <Core/Field.h>
 #include <IO/Compression/CompressionInfo.h>
+#include <IO/VarInt.h>
 #include <common/unaligned.h>
 
 #include <algorithm>
@@ -112,13 +115,15 @@ bool CompressionCodecDictionary::isDataSuitableForDictionary(
     }
     case CompressionDataType::String:
     {
-        // For string data, count distinct values by scanning length-prefixed entries
+        // For string data, count distinct values by scanning VarUInt-prefixed entries
         std::unordered_map<std::string_view, bool> seen;
         size_t offset = 0;
-        while (offset + 4 <= source_size && seen.size() <= DICTIONARY_ENCODING_MAX_CARDINALITY)
+        while (offset < source_size && seen.size() <= DICTIONARY_ENCODING_MAX_CARDINALITY)
         {
-            uint32_t len = unalignedLoad<uint32_t>(source + offset);
-            offset += 4;
+            UInt64 len64 = 0;
+            const char * after = readVarUInt(len64, source + offset, source_size - offset);
+            offset = static_cast<size_t>(after - source);
+            auto len = static_cast<uint32_t>(len64);
             if (offset + len > source_size)
                 break;
             seen[std::string_view(source + offset, len)] = true;
@@ -276,16 +281,18 @@ void CompressionCodecDictionary::decompressDataInteger(
 
 UInt32 CompressionCodecDictionary::compressDataString(const char * source, UInt32 source_size, char * dest) const
 {
-    // Parse length-prefixed strings and build dictionary
+    // Parse VarUInt-prefixed strings (SizePrefix serialization format) and build dictionary
     std::unordered_map<std::string, uint32_t> value_to_id;
     std::vector<std::string> dictionary;
     std::vector<uint32_t> ids;
 
     size_t offset = 0;
-    while (offset + 4 <= source_size)
+    while (offset < source_size)
     {
-        uint32_t len = unalignedLoad<uint32_t>(source + offset);
-        offset += 4;
+        UInt64 len64 = 0;
+        const char * after = readVarUInt(len64, source + offset, source_size - offset);
+        offset = static_cast<size_t>(after - source);
+        auto len = static_cast<uint32_t>(len64);
         if (offset + len > source_size)
             break;
 
@@ -392,7 +399,7 @@ void CompressionCodecDictionary::decompressDataString(
         num_values,
         bit_width);
 
-    // Write output: [4-byte len][data] per value
+    // Write output: [VarUInt len][data] per value (matching SizePrefix serialization format)
     char * out = dest;
     for (uint32_t i = 0; i < num_values; ++i)
     {
@@ -403,11 +410,9 @@ void CompressionCodecDictionary::decompressDataString(
                 ids[i],
                 dict_size);
         const auto & entry = dictionary[ids[i]];
-        uint32_t entry_len = static_cast<uint32_t>(entry.size());
-        unalignedStore<uint32_t>(out, entry_len);
-        out += 4;
-        std::memcpy(out, entry.data(), entry_len);
-        out += entry_len;
+        out = writeVarUInt(static_cast<UInt64>(entry.size()), out);
+        std::memcpy(out, entry.data(), entry.size());
+        out += entry.size();
     }
 }
 
@@ -483,6 +488,52 @@ void CompressionCodecDictionary::doDecompressData(
         break;
     }
     }
+}
+
+ColumnPtr CompressionCodecDictionary::decompressToColumnDictionary(
+    const char * source,
+    UInt32 source_size,
+    const DataTypePtr & value_type)
+{
+    if (source_size < DICT_HEADER_SIZE)
+        return nullptr;
+
+    const char * src = source;
+
+    uint8_t bit_width = static_cast<uint8_t>(src[0]);
+    uint32_t dict_size = unalignedLoad<uint32_t>(src + 1);
+    uint32_t num_values = unalignedLoad<uint32_t>(src + 5);
+    uint8_t dt_byte = static_cast<uint8_t>(src[9]);
+    src += DICT_HEADER_SIZE;
+
+    if (bit_width == DICT_FALLBACK_MARKER)
+        return nullptr;
+
+    auto stored_type = static_cast<CompressionDataType>(dt_byte);
+    if (stored_type != CompressionDataType::String)
+        return nullptr;
+
+    // Read dictionary entries as Field values
+    std::vector<Field> dictionary(dict_size);
+    for (uint32_t i = 0; i < dict_size; ++i)
+    {
+        uint32_t entry_len = unalignedLoad<uint32_t>(src);
+        src += 4;
+        dictionary[i] = String(src, entry_len);
+        src += entry_len;
+    }
+
+    // Unpack IDs
+    auto round_count = BitpackingPrimitives::roundUpToAlgorithmGroupSize(num_values);
+    PaddedPODArray<UInt32> ids(round_count, 0);
+    BitpackingPrimitives::unPackBuffer<uint32_t>(
+        reinterpret_cast<unsigned char *>(ids.data()),
+        reinterpret_cast<const unsigned char *>(src),
+        num_values,
+        bit_width);
+    ids.resize(num_values);
+
+    return ColumnDictionary::createMutable(std::move(dictionary), std::move(ids), value_type);
 }
 
 // Explicit template instantiations

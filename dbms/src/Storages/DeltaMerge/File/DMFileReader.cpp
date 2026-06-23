@@ -688,6 +688,31 @@ ColumnPtr DMFileReader::readFromDisk(
         stream_name);
 #endif
     auto & top_stream = iter->second;
+
+    // Try zero-overhead ColumnDictionary path for SizePrefix-format String columns.
+    // SizePrefix format has getName()=="String" (vs "StringV2" for separate-streams).
+    // Only attempt when the pack starts at a compressed block boundary.
+    if (type_on_disk->isString() && type_on_disk->getName() == "String")
+    {
+        auto & sub_stream = column_streams.at(stream_name);
+        const auto offset_in_file = sub_stream->getOffsetInFile(start_pack_id);
+        const auto offset_in_decompressed_block = sub_stream->getOffsetInDecompressedBlock(start_pack_id);
+
+        if (offset_in_decompressed_block == 0)
+        {
+            sub_stream->buf->seek(offset_in_file, 0);
+            auto dict_col = sub_stream->buf->tryReadBlockAsColumnDictionary(type_on_disk);
+            if (dict_col && dict_col->size() == read_rows)
+            {
+                return dict_col;
+            }
+            // tryReadBlockAsColumnDictionary either returned nullptr (non-dictionary block,
+            // working_buffer populated for fallback) or size mismatch (multi-block pack).
+            // Fall through to normal deserialization; the seek below will reuse the
+            // already-decompressed block from the working_buffer.
+        }
+    }
+
     auto mutable_col = type_on_disk->createColumn();
     type_on_disk->deserializeBinaryBulkWithMultipleStreams( //
         *mutable_col,

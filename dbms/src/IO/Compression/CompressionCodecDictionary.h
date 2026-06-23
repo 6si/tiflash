@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <Columns/ColumnDictionary.h>
 #include <IO/Compression/ICompressionCodec.h>
 
 #include <cstdint>
@@ -60,6 +61,17 @@ public:
     /// Check if data is suitable for dictionary encoding (low cardinality).
     /// Returns true if the distinct count <= DICTIONARY_ENCODING_MAX_CARDINALITY.
     static bool isDataSuitableForDictionary(const char * source, UInt32 source_size, CompressionDataType data_type);
+
+    /// Decompress a dictionary-compressed block directly into a ColumnDictionary,
+    /// bypassing the string-rebuild step. Returns nullptr if the block uses the
+    /// fallback marker (non-dictionary data) or is not String-typed.
+    /// @param source     compressed data AFTER the ICompressionCodec 9-byte header
+    /// @param source_size  size of that data
+    /// @param value_type   DataType for the ColumnDictionary entries
+    static ColumnPtr decompressToColumnDictionary(
+        const char * source,
+        UInt32 source_size,
+        const DataTypePtr & value_type);
 
 protected:
     UInt32 doCompressData(const char * source, UInt32 source_size, char * dest) const override;

@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include <Columns/IColumn.h>
+#include <DataTypes/IDataType.h>
 #include <IO/Buffer/ReadBufferFromFileBase.h>
 #include <IO/Compression/CompressedReadBufferBase.h>
 
@@ -30,6 +32,17 @@ struct CompressedSeekableReaderBuffer : public BufferWithOwnMemory<ReadBuffer>
         = 0;
 
     virtual void seek(size_t offset_in_compressed_file, size_t offset_in_decompressed_block) = 0;
+
+    /// Try to read the next compressed block as a ColumnDictionary.
+    /// If the block is dictionary-encoded (method byte == Dictionary), parse the
+    /// dictionary and bit-packed IDs into a ColumnDictionary and return it.
+    /// If the block is NOT dictionary-encoded, decompress it normally into the
+    /// working buffer (so the fallback deserialization path can proceed) and return nullptr.
+    /// Returns nullptr without consuming any data when at EOF.
+    virtual ColumnPtr tryReadBlockAsColumnDictionary(const DataTypePtr & /*value_type*/)
+    {
+        return nullptr;
+    }
 
     CompressedSeekableReaderBuffer()
         : BufferWithOwnMemory<ReadBuffer>(0)
@@ -48,6 +61,8 @@ public:
     void seek(size_t offset_in_compressed_file, size_t offset_in_decompressed_block) override;
 
     size_t readBig(char * to, size_t n) override;
+
+    ColumnPtr tryReadBlockAsColumnDictionary(const DataTypePtr & value_type) override;
 
     void setProfileCallback(const ReadBufferFromFileBase::ProfileCallback & profile_callback_, clockid_t clock_type_)
         override
