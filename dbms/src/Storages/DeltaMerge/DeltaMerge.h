@@ -570,10 +570,18 @@ private:
                     output_columns[column_id]->reserve(max_block_size);
             }
             for (size_t column_id = 0; column_id < num_columns; ++column_id)
-                output_columns[column_id]->insertRangeFrom(
-                    *cur_stable_block_columns[column_id],
-                    final_offset,
-                    final_limit);
+            {
+                const auto & src_col = cur_stable_block_columns[column_id];
+                if (src_col->isDictionaryEncoded())
+                {
+                    auto materialized = src_col->convertToFullColumnIfDictionary();
+                    output_columns[column_id]->insertRangeFrom(*materialized, final_offset, final_limit);
+                }
+                else
+                {
+                    output_columns[column_id]->insertRangeFrom(*src_col, final_offset, final_limit);
+                }
+            }
 
             output_write_limit -= std::min(final_limit, output_write_limit);
         }
