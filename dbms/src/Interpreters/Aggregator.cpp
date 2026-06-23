@@ -282,6 +282,19 @@ UInt16 Aggregator::DictKeyState::getOrInsert(StringRef ref)
     return id;
 }
 
+UInt16 Aggregator::DictKeyState::lookupFrozen(StringRef ref) const
+{
+    auto it = value_to_id.find(ref);
+    if (likely(it != value_to_id.end()))
+        return it->second;
+    return static_cast<UInt16>(id_to_value.size()); // sentinel: unknown value
+}
+
+void Aggregator::DictKeyState::freezeDictionary()
+{
+    dictionary_frozen.store(true, std::memory_order_release);
+}
+
 ColumnPtr Aggregator::DictKeyState::decodeKeyColumn(const IColumn & uint16_col) const
 {
     const auto & data = static_cast<const ColumnUInt16 &>(uint16_col).getData();
@@ -1279,19 +1292,47 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                 auto uint16_col = ColumnUInt16::create();
                 auto & data = uint16_col->getData();
                 data.resize(str_col->size());
-                for (size_t i = 0; i < str_col->size(); ++i)
+                const bool frozen = dks.dictionary_frozen.load(std::memory_order_acquire);
+                if (frozen)
                 {
-                    auto ref = str_col->getDataAt(i);
-                    data[i] = dks.getOrInsert(ref);
-                    if (unlikely(dks.failed))
+                    for (size_t i = 0; i < str_col->size(); ++i)
                     {
-                        LOG_WARNING(
-                            aggregator->log,
-                            "Dict-key fast path failed: cardinality exceeded {} at row {}",
-                            Aggregator::DictKeyState::ABSOLUTE_MAX,
-                            i);
-                        break;
+                        UInt16 id = dks.lookupFrozen(str_col->getDataAt(i));
+                        if (unlikely(id >= dks.id_to_value.size()))
+                        {
+                            // New value seen after freeze — fall back to locked path
+                            // and unfreeze for future blocks.
+                            dks.dictionary_frozen.store(false, std::memory_order_release);
+                            for (size_t j = 0; j < str_col->size(); ++j)
+                            {
+                                data[j] = dks.getOrInsert(str_col->getDataAt(j));
+                                if (unlikely(dks.failed))
+                                    break;
+                            }
+                            break;
+                        }
+                        data[i] = id;
                     }
+                }
+                else
+                {
+                    const size_t prev_dict_size = dks.id_to_value.size();
+                    for (size_t i = 0; i < str_col->size(); ++i)
+                    {
+                        data[i] = dks.getOrInsert(str_col->getDataAt(i));
+                        if (unlikely(dks.failed))
+                        {
+                            LOG_WARNING(
+                                aggregator->log,
+                                "Dict-key fast path failed: cardinality exceeded {} at row {}",
+                                Aggregator::DictKeyState::ABSOLUTE_MAX,
+                                i);
+                            break;
+                        }
+                    }
+                    // Freeze if no new entries were added during this block
+                    if (!dks.failed && dks.id_to_value.size() == prev_dict_size)
+                        dks.freezeDictionary();
                 }
                 if (!dks.failed)
                 {

@@ -536,4 +536,82 @@ try
 }
 CATCH
 
+TEST_F(AggregatorDictKeyTest, FrozenDictionary_MultipleBlocks)
+try
+{
+    auto block1 = makeStringKeyBlock(
+        {"US", "UK", "DE", "FR", "JP"},
+        {10, 20, 30, 40, 50});
+
+    auto block2 = makeStringKeyBlock(
+        {"US", "JP", "DE", "UK", "FR", "US", "US", "DE", "JP", "FR"},
+        {100, 200, 300, 400, 500, 600, 700, 800, 900, 1000});
+
+    auto context = TiFlashTestEnv::getContext();
+    ColumnNumbers keys = {0};
+    AggregateDescriptions agg_descs;
+    AggregateDescription desc;
+    desc.column_name = "sum_val";
+    desc.arguments = {1};
+    DataTypes arg_types = {std::make_shared<DataTypeInt64>()};
+    desc.function = AggregateFunctionFactory::instance().get(*context, "sum", arg_types);
+    desc.parameters = Array();
+    agg_descs.push_back(desc);
+
+    Aggregator::Params params(
+        block1.cloneEmpty(),
+        keys,
+        /*key_ref_agg_func=*/{},
+        /*agg_func_ref_key=*/{},
+        agg_descs,
+        /*group_by_two_level_threshold=*/0,
+        /*group_by_two_level_threshold_bytes=*/0,
+        /*max_bytes_before_external_group_by=*/0,
+        /*empty_result_for_aggregation_by_empty_set=*/false,
+        SpillConfig("/tmp/tiflash_test_spill", "test", 0, 0, 0, nullptr),
+        /*max_block_size=*/65536,
+        /*use_magic_hash=*/false);
+
+    auto aggregator = std::make_unique<Aggregator>(
+        params,
+        "test",
+        /*concurrency=*/1,
+        /*register_operator_spill_context=*/nullptr,
+        /*is_auto_pass_through=*/false,
+        /*use_magic_hash=*/false);
+
+    auto data = std::make_shared<AggregatedDataVariants>();
+    Aggregator::AggProcessInfo info(aggregator.get());
+
+    // Block 1: populates dictionary, should NOT freeze (new entries added)
+    info.resetBlock(block1);
+    aggregator->executeOnBlock(info, *data, 0);
+    EXPECT_TRUE(aggregator->dict_key_state.isActive());
+    EXPECT_EQ(aggregator->dict_key_state.id_to_value.size(), 5u);
+
+    // Block 2: all values already in dictionary, should trigger freeze
+    info.resetBlock(block2);
+    aggregator->executeOnBlock(info, *data, 0);
+    EXPECT_TRUE(aggregator->dict_key_state.isActive());
+    EXPECT_TRUE(aggregator->dict_key_state.dictionary_frozen.load());
+
+    // Verify result via merge
+    ManyAggregatedDataVariants many_data;
+    many_data.push_back(std::move(data));
+    auto merging = aggregator->mergeAndConvertToBlocks(many_data, /*final=*/true, /*max_threads=*/1);
+    size_t total_rows = 0;
+    if (merging)
+    {
+        while (true)
+        {
+            Block out = merging->getData(0);
+            if (!out)
+                break;
+            total_rows += out.rows();
+        }
+    }
+    EXPECT_EQ(total_rows, 5u);
+}
+CATCH
+
 } // namespace DB::tests

@@ -1085,6 +1085,7 @@ public:
 
         bool active = false;
         bool failed = false;
+        std::atomic<bool> dictionary_frozen{false};
 
         std::vector<String> id_to_value;
 
@@ -1100,6 +1101,8 @@ public:
         DataTypePtr original_key_type;
 
         UInt16 getOrInsert(StringRef ref);
+        UInt16 lookupFrozen(StringRef ref) const;
+        void freezeDictionary();
         ColumnPtr decodeKeyColumn(const IColumn & uint16_col) const;
         bool isActive() const { return active && !failed; }
     };
