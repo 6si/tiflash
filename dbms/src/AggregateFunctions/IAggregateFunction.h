@@ -210,6 +210,20 @@ public:
         Arena * arena) const
         = 0;
 
+    /** The case when the aggregation key is UInt16 (dict-key fast path)
+      * and pointers to aggregation states are stored in AggregateDataPtr[65536] lookup table.
+      */
+    virtual void addBatchLookupTable16(
+        size_t start_offset,
+        size_t batch_size,
+        AggregateDataPtr * places,
+        size_t place_offset,
+        std::function<void(AggregateDataPtr &)> init,
+        const UInt16 * key,
+        const IColumn ** columns,
+        Arena * arena) const
+        = 0;
+
     /** This is used for runtime code generation to determine, which header files to include in generated source.
       * Always implement it as
       * const char * getHeaderFilePath() const override { return __FILE__; }
@@ -351,6 +365,46 @@ public:
         size_t place_offset,
         std::function<void(AggregateDataPtr &)> init,
         const UInt8 * key,
+        const IColumn ** columns,
+        Arena * arena) const override
+    {
+        static constexpr size_t UNROLL_COUNT = 8;
+
+        size_t i = start_offset;
+
+        size_t batch_size_unrolled = batch_size / UNROLL_COUNT * UNROLL_COUNT;
+        for (; i < start_offset + batch_size_unrolled; i += UNROLL_COUNT)
+        {
+            AggregateDataPtr places[UNROLL_COUNT];
+            for (size_t j = 0; j < UNROLL_COUNT; ++j)
+            {
+                AggregateDataPtr & place = map[key[i + j]];
+                if (unlikely(!place))
+                    init(place);
+
+                places[j] = place;
+            }
+
+            for (size_t j = 0; j < UNROLL_COUNT; ++j)
+                static_cast<const Derived *>(this)->add(places[j] + place_offset, columns, i + j, arena);
+        }
+
+        for (; i < start_offset + batch_size; ++i)
+        {
+            AggregateDataPtr & place = map[key[i]];
+            if (unlikely(!place))
+                init(place);
+            static_cast<const Derived *>(this)->add(place + place_offset, columns, i, arena);
+        }
+    }
+
+    void addBatchLookupTable16(
+        size_t start_offset,
+        size_t batch_size,
+        AggregateDataPtr * map,
+        size_t place_offset,
+        std::function<void(AggregateDataPtr &)> init,
+        const UInt16 * key,
         const IColumn ** columns,
         Arena * arena) const override
     {
@@ -531,6 +585,27 @@ public:
 
     /// NOTE: Currently not used (structures with aggregation state are put without alignment).
     size_t alignOfData() const override { return alignof(Data); }
+
+    void addBatchLookupTable16(
+        size_t start_offset,
+        size_t batch_size,
+        AggregateDataPtr * map,
+        size_t place_offset,
+        std::function<void(AggregateDataPtr &)> init,
+        const UInt16 * key,
+        const IColumn ** columns,
+        Arena * arena) const override
+    {
+        IAggregateFunctionHelper<Derived>::addBatchLookupTable16(
+            start_offset,
+            batch_size,
+            map,
+            place_offset,
+            init,
+            key,
+            columns,
+            arena);
+    }
 
     void addBatchLookupTable8(
         size_t start_offset,

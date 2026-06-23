@@ -484,6 +484,10 @@ public:
     size_t size() const { return this->getSize(buf, *this, NUM_CELLS); }
     bool empty() const { return this->isEmpty(buf, *this, NUM_CELLS); }
 
+    /// Adjust the stored size counter by `n` entries. Used when cells are
+    /// populated directly (bypassing emplace) via addBatchLookupTable.
+    void adjustSize(size_t n) { this->setSize(this->getSize(buf, *this, NUM_CELLS) + n); }
+
     void clear()
     {
         destroyElements();

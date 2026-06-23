@@ -939,6 +939,54 @@ ALWAYS_INLINE void Aggregator::executeImplBatch(
         return;
     }
 
+    /// Optimization for special case when aggregating by 16bit key (dict-key fast path).
+    /// Same as key8 but with UInt16 keys and 65536-entry lookup table.
+    if constexpr (std::is_same_v<Method, AggregatedDataVariants::AggregationMethod_key16>)
+    {
+        size_t rows = agg_process_info.end_row - agg_process_info.start_row;
+        fiu_do_on(FailPoints::force_agg_on_partial_block, {
+            if (rows > 0 && agg_process_info.start_row == 0)
+                rows = std::max(rows / 2, 1);
+        });
+
+        /// addBatchLookupTable16 writes directly to the FixedHashMap buffer,
+        /// bypassing emplace(). For FixedHashTableStoredSize (used by key16),
+        /// the internal size counter is NOT updated by direct writes.
+        /// Track new entries and update the size counter afterward.
+        size_t new_entries = 0;
+        for (AggregateFunctionInstruction * inst = agg_process_info.aggregate_functions_instructions.data(); inst->that;
+             ++inst)
+        {
+            inst->batch_that->addBatchLookupTable16(
+                agg_process_info.start_row,
+                rows,
+                reinterpret_cast<AggregateDataPtr *>(method.data.data()),
+                inst->state_offset,
+                [&](AggregateDataPtr & aggregate_data) {
+                    aggregate_data
+                        = aggregates_pool->alignedAlloc(total_size_of_aggregate_states, align_aggregate_states);
+                    createAggregateStates(aggregate_data);
+                    ++new_entries;
+                },
+                state.getKeyData(),
+                inst->batch_arguments,
+                aggregates_pool);
+        }
+        /// Update the stored size counter to reflect newly initialized cells.
+        /// Only the first aggregate function creates new entries; subsequent
+        /// functions reuse the same cells (init is only called when place == nullptr).
+        method.data.adjustSize(new_entries);
+
+        agg_process_info.start_row += rows;
+
+        if constexpr (collect_hit_rate)
+            agg_process_info.hit_row_cnt = rows;
+
+        if constexpr (only_lookup)
+            RUNTIME_CHECK_MSG(false, "Aggregator only_lookup should be false for AggregationMethod_key16");
+        return;
+    }
+
     /// Generic case.
     return handleOneBatch<
         collect_hit_rate,
