@@ -271,4 +271,73 @@ TEST_F(ColumnDictionaryTest, TryAutoEncodeNullable)
     ASSERT_EQ(result->size(), 300);
 }
 
+TEST_F(ColumnDictionaryTest, MaterializeBeforeInsertRangeFrom)
+{
+    // Simulates the DeltaMerge interleave scenario:
+    // output is ColumnString (from header.cloneEmpty()), source is ColumnDictionary.
+    // ColumnString::insertRangeFrom does static_cast<ColumnString&> which crashes
+    // on ColumnDictionary. The fix: materialize via convertToFullColumnIfDictionary().
+    auto dict_col = createTestColumn();
+    ASSERT_TRUE(dict_col->isDictionaryEncoded());
+
+    // Materialize and verify insertRangeFrom works
+    auto materialized = dict_col->convertToFullColumnIfDictionary();
+    ASSERT_FALSE(materialized->isDictionaryEncoded());
+
+    auto output = ColumnString::create();
+    output->insertRangeFrom(*materialized, 0, materialized->size());
+    ASSERT_EQ(output->size(), dict_col->size());
+
+    // Verify values match
+    for (size_t i = 0; i < output->size(); ++i)
+    {
+        Field dict_val, out_val;
+        dict_col->get(i, dict_val);
+        output->get(i, out_val);
+        ASSERT_EQ(dict_val, out_val);
+    }
+}
+
+TEST_F(ColumnDictionaryTest, FilterPreservesDictionary)
+{
+    // Verifies that filter() on ColumnDictionary returns ColumnDictionary
+    // (used by MVCC filter, RowKey filter in the pipeline)
+    auto col = createTestColumn();
+    size_t n = col->size();
+
+    IColumn::Filter filt(n, 0);
+    size_t passed = 0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        if (i % 2 == 0)
+        {
+            filt[i] = 1;
+            ++passed;
+        }
+    }
+
+    auto filtered = col->filter(filt, passed);
+    ASSERT_TRUE(filtered->isDictionaryEncoded());
+    ASSERT_EQ(filtered->size(), passed);
+
+    // Verify filtered values are correct (every other row)
+    for (size_t i = 0; i < passed; ++i)
+    {
+        Field orig_val, filt_val;
+        col->get(i * 2, orig_val);
+        filtered->get(i, filt_val);
+        ASSERT_EQ(orig_val, filt_val);
+    }
+}
+
+TEST_F(ColumnDictionaryTest, ConvertToFullColumnIfDictionaryNonDict)
+{
+    // Non-dictionary column should return itself
+    auto str_col = ColumnString::create();
+    str_col->insert(Field(String("hello")));
+    ColumnPtr ptr = std::move(str_col);
+    auto result = ptr->convertToFullColumnIfDictionary();
+    ASSERT_EQ(result.get(), ptr.get());
+}
+
 } // namespace DB::tests
