@@ -2216,11 +2216,20 @@ Block Aggregator::prepareBlockAndFill(
 
     Block header = getHeader(final);
 
+    const bool dict_key_active = dict_key_state.isActive() && convert_key_size > 0;
+    Block fill_header = header;
+    if (dict_key_active)
+    {
+        auto & key_col_with_type = fill_header.getByPosition(0);
+        key_col_with_type.type = std::make_shared<DataTypeUInt16>();
+        key_col_with_type.column = ColumnUInt16::create();
+    }
+
     for (size_t i = 0; i < convert_key_size; ++i)
     {
-        key_columns[i] = header.safeGetByPosition(i).type->createColumn();
+        key_columns[i] = fill_header.safeGetByPosition(i).type->createColumn();
         key_columns[i]->reserve(rows);
-        new_key_sizes.push_back(key_sizes[i]);
+        new_key_sizes.push_back(dict_key_active ? Sizes{2}[0] : key_sizes[i]);
     }
 
     for (size_t i = 0; i < params.aggregates_size; ++i)
@@ -2260,7 +2269,12 @@ Block Aggregator::prepareBlockAndFill(
     Block res = header.cloneEmpty();
 
     for (size_t i = 0; i < convert_key_size; ++i)
-        res.getByPosition(i).column = std::move(key_columns[i]);
+    {
+        if (dict_key_active && i == 0)
+            res.getByPosition(i).column = dict_key_state.decodeKeyColumn(*key_columns[i]);
+        else
+            res.getByPosition(i).column = std::move(key_columns[i]);
+    }
 
     for (size_t i = 0; i < params.aggregates_size; ++i)
     {
