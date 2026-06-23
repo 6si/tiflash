@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <Columns/ColumnDictionary.h>
+#include <Columns/ColumnNullable.h>
 #include <Columns/countBytesInFilter.h>
 #include <Common/Exception.h>
 #include <Common/MemoryTracker.h>
@@ -539,7 +540,28 @@ ColumnPtr DMFileReader::maybeAutoEncodeColumn(const ColumnPtr & column, const Co
     if (!inner_type || inner_type->getTypeId() != TypeIndex::String)
         return column;
 
-    return ColumnDictionary::tryAutoEncode(column);
+    auto result = ColumnDictionary::tryAutoEncode(column);
+    if (result.get() != column.get() && scan_context)
+    {
+        // Column was auto-encoded — record stats
+        scan_context->dict_encoded_columns += 1;
+        scan_context->dict_total_rows_encoded += result->size();
+        const auto * dict_col = typeid_cast<const ColumnDictionary *>(result.get());
+        if (!dict_col)
+        {
+            // Nullable wrapping — get nested dictionary
+            if (const auto * nullable = typeid_cast<const ColumnNullable *>(result.get()))
+                dict_col = typeid_cast<const ColumnDictionary *>(nullable->getNestedColumnPtr().get());
+        }
+        if (dict_col)
+        {
+            auto card = dict_col->getDictionarySize();
+            uint64_t prev = scan_context->dict_max_cardinality.load();
+            while (card > prev && !scan_context->dict_max_cardinality.compare_exchange_weak(prev, card))
+                ;
+        }
+    }
+    return result;
 }
 
 ColumnPtr DMFileReader::readFromDisk(
