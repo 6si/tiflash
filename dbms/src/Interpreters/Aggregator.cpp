@@ -25,6 +25,7 @@
 #include <DataStreams/materializeBlock.h>
 #include <DataTypes/DataTypeAggregateFunction.h>
 #include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeString.h>
 #include <Interpreters/Aggregator.h>
 
 #include <array>
@@ -1124,22 +1125,86 @@ void Aggregator::AggProcessInfo::prepareForAgg()
             key_columns[i] = materialized_columns.back().get();
         }
 
-        /// Save dictionary info for visit-cache before materializing.
-        /// Conditions: single key, no collator, column is ColumnDictionary.
-        if (aggregator->params.keys_size == 1 && key_columns[i]->isDictionaryEncoded()
+        /// Visit-cache: try to extract or build dictionary info for the key
+        /// column so the fast path can do K hash lookups instead of N.
+        /// Conditions: single key, no collator.
+        if (aggregator->params.keys_size == 1
             && (aggregator->params.collators.empty() || aggregator->params.collators[i] == nullptr))
         {
-            const auto * dict_col = typeid_cast<const ColumnDictionary *>(key_columns[i]);
-            if (dict_col && dict_col->getDictionarySize() <= 65536)
+            // Case 1: key is already ColumnDictionary (e.g., from storage)
+            if (key_columns[i]->isDictionaryEncoded())
             {
-                dict_ids = &dict_col->getDictionaryIds();
-                dict_size = dict_col->getDictionarySize();
-                const auto & dict = dict_col->getDictionary();
-                dict_entries_refs.resize(dict_size);
-                for (size_t d = 0; d < dict_size; ++d)
+                const auto * dict_col = typeid_cast<const ColumnDictionary *>(key_columns[i]);
+                if (dict_col && dict_col->getDictionarySize() <= 65536)
                 {
-                    const auto & s = dict[d].get<String>();
-                    dict_entries_refs[d] = StringRef(s.data(), s.size());
+                    dict_ids = &dict_col->getDictionaryIds();
+                    dict_size = dict_col->getDictionarySize();
+                    const auto & dict = dict_col->getDictionary();
+                    dict_entries_refs.resize(dict_size);
+                    for (size_t d = 0; d < dict_size; ++d)
+                    {
+                        const auto & s = dict[d].get<String>();
+                        dict_entries_refs[d] = StringRef(s.data(), s.size());
+                    }
+                }
+            }
+            // Case 2: key is ColumnString — auto-encode if low cardinality
+            else if (const auto * col_str = typeid_cast<const ColumnString *>(key_columns[i]))
+            {
+                static constexpr size_t MIN_ROWS_FOR_AUTO_ENCODE = 256;
+                static constexpr UInt32 MAX_DICT_SIZE_AUTO = 65536;
+                const size_t num_rows = col_str->size();
+                if (num_rows >= MIN_ROWS_FOR_AUTO_ENCODE)
+                {
+                    // Use String keys (not StringRef) to avoid dangling pointers
+                    // when dict_entries vector reallocates.
+                    std::vector<Field> dict_entries;
+                    std::unordered_map<String, UInt32> dict_map;
+                    PaddedPODArray<UInt32> ids;
+                    ids.reserve(num_rows);
+                    bool success = true;
+
+                    for (size_t r = 0; r < num_rows; ++r)
+                    {
+                        StringRef ref = col_str->getDataAt(r);
+                        String key(ref.data, ref.size);
+                        auto it = dict_map.find(key);
+                        if (it != dict_map.end())
+                        {
+                            ids.push_back(it->second);
+                        }
+                        else
+                        {
+                            if (dict_entries.size() >= MAX_DICT_SIZE_AUTO)
+                            {
+                                success = false;
+                                break;
+                            }
+                            UInt32 new_id = static_cast<UInt32>(dict_entries.size());
+                            dict_map[key] = new_id;
+                            dict_entries.emplace_back(std::move(key));
+                            ids.push_back(new_id);
+                        }
+                    }
+
+                    if (success)
+                    {
+                        auto dict_col_ptr = ColumnDictionary::createMutable(
+                            std::move(dict_entries),
+                            std::move(ids),
+                            std::make_shared<DataTypeString>());
+                        const auto * dict_col = typeid_cast<const ColumnDictionary *>(dict_col_ptr.get());
+                        dict_ids = &dict_col->getDictionaryIds();
+                        dict_size = dict_col->getDictionarySize();
+                        const auto & dict = dict_col->getDictionary();
+                        dict_entries_refs.resize(dict_size);
+                        for (size_t d = 0; d < dict_size; ++d)
+                        {
+                            const auto & s = dict[d].get<String>();
+                            dict_entries_refs[d] = StringRef(s.data(), s.size());
+                        }
+                        auto_encoded_dict_col = std::move(dict_col_ptr);
+                    }
                 }
             }
         }

@@ -225,8 +225,8 @@ try
 }
 CATCH
 
-/// Verify visit-cache does NOT activate for ColumnString (standard path)
-TEST_F(AggregatorDictionaryVisitCacheTest, NoVisitCacheForColumnString)
+/// Verify visit-cache auto-encodes low-cardinality ColumnString
+TEST_F(AggregatorDictionaryVisitCacheTest, AutoEncodeColumnString)
 try
 {
     auto string_block = buildStringBlock(512, 3);
@@ -235,7 +235,23 @@ try
     info.resetBlock(string_block);
     info.prepareForAgg();
 
-    ASSERT_EQ(info.dict_ids, nullptr) << "dict_ids should be null for ColumnString key";
+    ASSERT_NE(info.dict_ids, nullptr) << "dict_ids should be set for auto-encoded low-cardinality ColumnString";
+    ASSERT_EQ(info.dict_size, 3u);
+    ASSERT_NE(info.auto_encoded_dict_col, nullptr) << "auto_encoded_dict_col should hold the temporary ColumnDictionary";
+}
+CATCH
+
+/// Verify visit-cache does NOT activate for small blocks (below MIN_ROWS_FOR_AUTO_ENCODE)
+TEST_F(AggregatorDictionaryVisitCacheTest, NoAutoEncodeForSmallBlock)
+try
+{
+    auto string_block = buildStringBlock(100, 3);
+    auto aggregator = createCountAggregator(string_block);
+    Aggregator::AggProcessInfo info(aggregator.get());
+    info.resetBlock(string_block);
+    info.prepareForAgg();
+
+    ASSERT_EQ(info.dict_ids, nullptr) << "dict_ids should be null for small block";
     ASSERT_EQ(info.dict_size, 0u);
 }
 CATCH

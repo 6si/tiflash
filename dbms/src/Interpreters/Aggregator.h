@@ -995,12 +995,16 @@ public:
         size_t hit_row_cnt = 0;
         std::vector<UInt64> not_found_rows;
 
-        /// Visit-cache: when the single key column is ColumnDictionary, we save
-        /// dictionary entries and per-row IDs so the fast path can do K hash
-        /// lookups (K = dictionary size) instead of N (N = row count).
+        /// Visit-cache: when the single key column is ColumnDictionary (or a
+        /// low-cardinality ColumnString that we auto-encode), we save dictionary
+        /// entries and per-row IDs so the fast path can do K hash lookups
+        /// (K = dictionary size) instead of N (N = row count).
         const PaddedPODArray<UInt32> * dict_ids = nullptr;
         std::vector<StringRef> dict_entries_refs;
         size_t dict_size = 0;
+        /// Holds the auto-encoded ColumnDictionary when we build one on-the-fly
+        /// from a low-cardinality ColumnString key. Prevents dangling pointers.
+        ColumnPtr auto_encoded_dict_col;
 
         void prepareForAgg();
         bool allBlockDataHandled() const
@@ -1024,6 +1028,7 @@ public:
             dict_ids = nullptr;
             dict_entries_refs.clear();
             dict_size = 0;
+            auto_encoded_dict_col = nullptr;
         }
     };
 
