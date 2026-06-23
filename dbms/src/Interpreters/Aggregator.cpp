@@ -16,6 +16,7 @@
 
 #include <AggregateFunctions/AggregateFunctionArray.h>
 #include <AggregateFunctions/AggregateFunctionState.h>
+#include <Columns/ColumnDictionary.h>
 #include <Common/FailPoint.h>
 #include <Common/Stopwatch.h>
 #include <Common/ThresholdUtils.h>
@@ -1067,6 +1068,11 @@ void Aggregator::prepareAggregateInstructions(
                 materialized_columns.push_back(converted);
                 aggregate_columns[i][j] = materialized_columns.back().get();
             }
+            if (ColumnPtr converted = aggregate_columns[i][j]->convertToFullColumnIfDictionary())
+            {
+                materialized_columns.push_back(converted);
+                aggregate_columns[i][j] = materialized_columns.back().get();
+            }
         }
 
         aggregate_functions_instructions[i].arguments = aggregate_columns[i].data();
@@ -1104,6 +1110,8 @@ void Aggregator::AggProcessInfo::prepareForAgg()
 
     /** Constant columns are not supported directly during aggregation.
       * To make them work anyway, we materialize them.
+      * Dictionary-encoded columns are also materialized to full columns
+      * since the aggregator's hash methods expect concrete column types.
       */
     for (size_t i = 0; i < aggregator->params.keys_size; ++i)
     {
@@ -1111,6 +1119,11 @@ void Aggregator::AggProcessInfo::prepareForAgg()
         if (ColumnPtr converted = key_columns[i]->convertToFullColumnIfConst())
         {
             /// Remember the columns we will work with
+            materialized_columns.push_back(converted);
+            key_columns[i] = materialized_columns.back().get();
+        }
+        if (ColumnPtr converted = key_columns[i]->convertToFullColumnIfDictionary())
+        {
             materialized_columns.push_back(converted);
             key_columns[i] = materialized_columns.back().get();
         }
