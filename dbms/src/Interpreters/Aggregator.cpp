@@ -1148,7 +1148,11 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                     }
                 }
             }
-            // Case 2: key is ColumnString — auto-encode if low cardinality
+            // Case 2: key is ColumnString — auto-encode if low cardinality.
+            // NOTE: Nullable<ColumnString> is NOT handled here because the visit_cache
+            // fast path does not check the null map. Null rows would be incorrectly
+            // grouped. Nullable support requires adding null-map handling to
+            // executeDictionaryKeyFastPath (future improvement).
             else if (const auto * col_str = typeid_cast<const ColumnString *>(key_columns[i]))
             {
                 static constexpr size_t MIN_ROWS_FOR_AUTO_ENCODE = 256;
