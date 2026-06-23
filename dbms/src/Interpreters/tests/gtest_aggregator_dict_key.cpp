@@ -614,6 +614,109 @@ try
 }
 CATCH
 
+/// Test that dict-key activates and produces correct results with multi-thread concurrency
+TEST_F(AggregatorDictKeyTest, MultiThread_Concurrent)
+try
+{
+    auto block1 = makeStringKeyBlock(
+        {"US", "UK", "DE", "FR", "JP"},
+        {10, 20, 30, 40, 50});
+
+    auto block2 = makeStringKeyBlock(
+        {"US", "JP", "DE"},
+        {100, 200, 300});
+
+    auto block3 = makeStringKeyBlock(
+        {"UK", "FR", "US", "DE"},
+        {400, 500, 600, 700});
+
+    auto context = TiFlashTestEnv::getContext();
+    ColumnNumbers keys = {0};
+    AggregateDescriptions agg_descs;
+    AggregateDescription desc;
+    desc.column_name = "sum_val";
+    desc.arguments = {1};
+    DataTypes arg_types = {std::make_shared<DataTypeInt64>()};
+    desc.function = AggregateFunctionFactory::instance().get(*context, "sum", arg_types);
+    desc.parameters = Array();
+    agg_descs.push_back(desc);
+
+    size_t concurrency = 3;
+    Aggregator::Params params(
+        block1.cloneEmpty(),
+        keys,
+        /*key_ref_agg_func=*/{},
+        /*agg_func_ref_key=*/{},
+        agg_descs,
+        /*group_by_two_level_threshold=*/0,
+        /*group_by_two_level_threshold_bytes=*/0,
+        /*max_bytes_before_external_group_by=*/0,
+        /*empty_result_for_aggregation_by_empty_set=*/false,
+        SpillConfig("/tmp/tiflash_test_spill", "test", 0, 0, 0, nullptr),
+        /*max_block_size=*/65536,
+        /*use_magic_hash=*/false);
+
+    auto aggregator = std::make_unique<Aggregator>(
+        params,
+        "test",
+        /*concurrency=*/concurrency,
+        /*register_operator_spill_context=*/nullptr,
+        /*is_auto_pass_through=*/false,
+        /*use_magic_hash=*/false);
+
+    // Each thread gets its own AggregatedDataVariants
+    std::vector<std::shared_ptr<AggregatedDataVariants>> thread_data(concurrency);
+    for (size_t i = 0; i < concurrency; ++i)
+        thread_data[i] = std::make_shared<AggregatedDataVariants>();
+
+    // Process blocks on separate threads
+    std::vector<Block> blocks = {block1, block2, block3};
+    std::vector<std::thread> threads;
+    for (size_t i = 0; i < concurrency; ++i)
+    {
+        threads.emplace_back([&, i]() {
+            Aggregator::AggProcessInfo info(aggregator.get());
+            info.resetBlock(blocks[i]);
+            aggregator->executeOnBlock(info, *thread_data[i], i);
+        });
+    }
+    for (auto & t : threads)
+        t.join();
+
+    EXPECT_TRUE(aggregator->dict_key_state.isActive());
+    EXPECT_EQ(aggregator->dict_key_state.id_to_value.size(), 5u);
+
+    // Merge all thread results
+    ManyAggregatedDataVariants many_data;
+    for (auto & d : thread_data)
+        many_data.push_back(d);
+    auto merging = aggregator->mergeAndConvertToBlocks(many_data, /*final=*/true, /*max_threads=*/1);
+    std::map<String, Int64> results;
+    if (merging)
+    {
+        while (true)
+        {
+            Block out = merging->getData(0);
+            if (!out)
+                break;
+            auto & key_col = typeid_cast<const ColumnString &>(*out.getByName("key").column);
+            auto & sum_col = typeid_cast<const ColumnVector<Int64> &>(*out.getByName("sum_val").column);
+            for (size_t i = 0; i < out.rows(); ++i)
+                results[key_col.getDataAt(i).toString()] += sum_col.getData()[i];
+        }
+    }
+    // Thread 1: US=10, UK=20, DE=30, FR=40, JP=50
+    // Thread 2: US=100, JP=200, DE=300
+    // Thread 3: UK=400, FR=500, US=600, DE=700
+    EXPECT_EQ(results.size(), 5u);
+    EXPECT_EQ(results["US"], 710);  // 10+100+600
+    EXPECT_EQ(results["UK"], 420);  // 20+400
+    EXPECT_EQ(results["DE"], 1030); // 30+300+700
+    EXPECT_EQ(results["FR"], 540);  // 40+500
+    EXPECT_EQ(results["JP"], 250);  // 50+200
+}
+CATCH
+
 /// Test that padding-binary collation (utf8mb4_bin) correctly normalizes trailing spaces
 TEST_F(AggregatorDictKeyTest, PaddingBinary_TrailingSpacesNormalized)
 try
