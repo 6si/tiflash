@@ -18,6 +18,7 @@
 
 #include <Columns/ColumnArray.h>
 #include <Columns/ColumnConst.h>
+#include <Columns/ColumnDictionary.h>
 #include <Columns/ColumnFixedString.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnTuple.h>
@@ -1385,12 +1386,83 @@ public:
                 ErrorCodes::LOGICAL_ERROR);
     }
 
+    /// Dictionary-encoded fast path: pre-compute comparison for each dictionary entry,
+    /// then look up the pre-computed result per row using dictionary IDs.
+    /// O(dict_size) comparisons instead of O(num_rows).
+    bool tryExecuteColumnDictionary(Block & block, size_t result, const IColumn * c0, const IColumn * c1) const
+    {
+        const ColumnDictionary * dict_col = nullptr;
+        const ColumnConst * const_col = nullptr;
+        bool dict_is_left = false;
+
+        if (const auto * d = typeid_cast<const ColumnDictionary *>(c0))
+        {
+            dict_col = d;
+            const_col = typeid_cast<const ColumnConst *>(c1);
+            dict_is_left = true;
+        }
+        else if (const auto * d2 = typeid_cast<const ColumnDictionary *>(c1))
+        {
+            dict_col = d2;
+            const_col = typeid_cast<const ColumnConst *>(c0);
+            dict_is_left = false;
+        }
+
+        if (!dict_col || !const_col)
+            return false;
+
+        const auto & dictionary = dict_col->getDictionary();
+        const auto & ids = dict_col->getDictionaryIds();
+
+        Field const_field = (*const_col)[0];
+        String const_str;
+        if (const_field.getType() == Field::Types::String)
+            const_str = const_field.get<String>();
+        else
+            return false;
+
+        // Pre-compute comparison result for each dictionary entry
+        std::vector<UInt8> dict_results(dictionary.size());
+        for (size_t i = 0; i < dictionary.size(); ++i)
+        {
+            const auto & entry = dictionary[i];
+            if (entry.getType() != Field::Types::String)
+                return false;
+            const auto & entry_str = entry.get<String>();
+            int cmp;
+            if (collator != nullptr)
+            {
+                cmp = collator->compare(entry_str.data(), entry_str.size(), const_str.data(), const_str.size());
+            }
+            else
+            {
+                cmp = entry_str.compare(const_str);
+            }
+            if (!dict_is_left)
+                cmp = -cmp;
+            dict_results[i] = Op<int, int>::apply(cmp, 0) ? 1 : 0;
+        }
+
+        // Apply pre-computed results per row
+        auto c_res = ColumnUInt8::create(ids.size());
+        auto & data = c_res->getData();
+        for (size_t i = 0; i < ids.size(); ++i)
+            data[i] = dict_results[ids[i]];
+
+        block.getByPosition(result).column = std::move(c_res);
+        return true;
+    }
+
     void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result) const override
     {
         const auto & col_with_type_and_name_left = block.getByPosition(arguments[0]);
         const auto & col_with_type_and_name_right = block.getByPosition(arguments[1]);
         const IColumn * col_left_untyped = col_with_type_and_name_left.column.get();
         const IColumn * col_right_untyped = col_with_type_and_name_right.column.get();
+
+        // Dictionary-encoded fast path: O(dict_size) instead of O(num_rows) comparisons
+        if (tryExecuteColumnDictionary(block, result, col_left_untyped, col_right_untyped))
+            return;
 
         const bool left_is_num = col_left_untyped->isNumeric();
         const bool right_is_num = col_right_untyped->isNumeric();

@@ -287,25 +287,60 @@ public:
 
     void insertRangeFrom(const IColumn & src, size_t start, size_t length) override
     {
-        const auto & src_dict = static_cast<const ColumnDictionary &>(src);
-        const auto & src_ids = src_dict.getDictionaryIds();
-        ids.insert(src_ids.begin() + start, src_ids.begin() + start + length);
+        const auto * src_dict = typeid_cast<const ColumnDictionary *>(&src);
+        if (src_dict && &src_dict->getDictionary() == &dictionary)
+        {
+            const auto & src_ids = src_dict->getDictionaryIds();
+            ids.insert(src_ids.begin() + start, src_ids.begin() + start + length);
+        }
+        else
+        {
+            for (size_t i = start; i < start + length; ++i)
+            {
+                Field val;
+                src.get(i, val);
+                ids.push_back(findOrAddEntry(val));
+            }
+        }
     }
 
     void insertManyFrom(const IColumn & src, size_t position, size_t length) override
     {
-        const auto & src_dict = static_cast<const ColumnDictionary &>(src);
-        UInt32 id_val = src_dict.getDictionaryIds()[position];
-        for (size_t i = 0; i < length; ++i)
-            ids.push_back(id_val);
+        const auto * src_dict = typeid_cast<const ColumnDictionary *>(&src);
+        if (src_dict && &src_dict->getDictionary() == &dictionary)
+        {
+            UInt32 id_val = src_dict->getDictionaryIds()[position];
+            for (size_t i = 0; i < length; ++i)
+                ids.push_back(id_val);
+        }
+        else
+        {
+            Field val;
+            src.get(position, val);
+            UInt32 id = findOrAddEntry(val);
+            for (size_t i = 0; i < length; ++i)
+                ids.push_back(id);
+        }
     }
 
     void insertDisjunctFrom(const IColumn & src, const std::vector<size_t> & position_vec)
     {
-        const auto & src_dict = static_cast<const ColumnDictionary &>(src);
-        const auto & src_ids = src_dict.getDictionaryIds();
-        for (auto pos : position_vec)
-            ids.push_back(src_ids[pos]);
+        const auto * src_dict = typeid_cast<const ColumnDictionary *>(&src);
+        if (src_dict && &src_dict->getDictionary() == &dictionary)
+        {
+            const auto & src_ids = src_dict->getDictionaryIds();
+            for (auto pos : position_vec)
+                ids.push_back(src_ids[pos]);
+        }
+        else
+        {
+            for (auto pos : position_vec)
+            {
+                Field val;
+                src.get(pos, val);
+                ids.push_back(findOrAddEntry(val));
+            }
+        }
     }
 
     void insertManyDefaults(size_t length) override
@@ -317,9 +352,17 @@ public:
     ColumnPtr filter(const Filter & filt, ssize_t result_size_hint) const override;
     ColumnPtr permute(const Permutation & perm, size_t limit) const override;
 
-    int compareAt(size_t /*n*/, size_t /*m*/, const IColumn & /*rhs*/, int /*nan_direction_hint*/) const override
+    int compareAt(size_t n, size_t m, const IColumn & rhs, int /*nan_direction_hint*/) const override
     {
-        throw Exception("compareAt not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        const auto & lhs_val = dictionary[ids[n]].get<String>();
+        const auto * rhs_dict = typeid_cast<const ColumnDictionary *>(&rhs);
+        if (rhs_dict)
+        {
+            const auto & rhs_val = rhs_dict->getDictionary()[rhs_dict->getDictionaryIds()[m]].get<String>();
+            return lhs_val.compare(rhs_val);
+        }
+        StringRef rhs_ref = rhs.getDataAt(m);
+        return lhs_val.compare(0, std::string::npos, rhs_ref.data, rhs_ref.size);
     }
 
     void getPermutation(bool /*reverse*/, size_t /*limit*/, int /*nan_direction_hint*/, Permutation & /*res*/)
