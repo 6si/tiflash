@@ -13,7 +13,9 @@
 // limitations under the License.
 
 #include <Columns/ColumnDictionary.h>
+#include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
+#include <Columns/ColumnVector.h>
 #include <DataTypes/DataTypeString.h>
 #include <gtest/gtest.h>
 
@@ -180,6 +182,93 @@ TEST_F(ColumnDictionaryTest, PopBack)
     auto col = createTestColumn();
     col->popBack(3);
     ASSERT_EQ(col->size(), 7);
+}
+
+TEST_F(ColumnDictionaryTest, TryAutoEncodeBasic)
+{
+    // Build a ColumnString with low cardinality (3 distinct values, 300 rows)
+    auto str_col = ColumnString::create();
+    const std::vector<String> values = {"active", "inactive", "pending"};
+    for (size_t i = 0; i < 300; ++i)
+        str_col->insert(Field(values[i % 3]));
+
+    ColumnPtr input = std::move(str_col);
+    auto result = ColumnDictionary::tryAutoEncode(input, 256, 65536);
+
+    // Should be encoded since 300 >= 256 and 3 <= 65536
+    ASSERT_TRUE(result->isDictionaryEncoded());
+    ASSERT_EQ(result->size(), 300);
+
+    const auto * dict_col = typeid_cast<const ColumnDictionary *>(result.get());
+    ASSERT_NE(dict_col, nullptr);
+    ASSERT_EQ(dict_col->getDictionarySize(), 3);
+
+    // Verify values are preserved
+    for (size_t i = 0; i < 300; ++i)
+    {
+        StringRef ref = result->getDataAt(i);
+        ASSERT_EQ(ref.toString(), values[i % 3]);
+    }
+}
+
+TEST_F(ColumnDictionaryTest, TryAutoEncodeTooFewRows)
+{
+    auto str_col = ColumnString::create();
+    for (size_t i = 0; i < 100; ++i)
+        str_col->insert(Field(String("val")));
+
+    ColumnPtr input = std::move(str_col);
+    auto result = ColumnDictionary::tryAutoEncode(input, 256, 65536);
+
+    // Should NOT be encoded (100 < 256 min_rows)
+    ASSERT_FALSE(result->isDictionaryEncoded());
+    ASSERT_EQ(result.get(), input.get()); // same pointer
+}
+
+TEST_F(ColumnDictionaryTest, TryAutoEncodeHighCardinality)
+{
+    auto str_col = ColumnString::create();
+    // 500 rows with 500 distinct values — exceeds max_dict_size=100
+    for (size_t i = 0; i < 500; ++i)
+        str_col->insert(Field(String("val_" + std::to_string(i))));
+
+    ColumnPtr input = std::move(str_col);
+    auto result = ColumnDictionary::tryAutoEncode(input, 256, 100);
+
+    // Should NOT be encoded (500 distinct > 100 max)
+    ASSERT_FALSE(result->isDictionaryEncoded());
+    ASSERT_EQ(result.get(), input.get());
+}
+
+TEST_F(ColumnDictionaryTest, TryAutoEncodeAlreadyEncoded)
+{
+    auto col = createTestColumn();
+    ColumnPtr input = std::move(col);
+    auto result = ColumnDictionary::tryAutoEncode(input, 1, 65536);
+
+    // Already encoded — should return same pointer
+    ASSERT_TRUE(result->isDictionaryEncoded());
+    ASSERT_EQ(result.get(), input.get());
+}
+
+TEST_F(ColumnDictionaryTest, TryAutoEncodeNullable)
+{
+    auto str_col = ColumnString::create();
+    auto null_map = ColumnUInt8::create();
+    for (size_t i = 0; i < 300; ++i)
+    {
+        str_col->insert(Field(String(i % 5 == 0 ? "null_val" : "regular")));
+        null_map->insert(Field(static_cast<UInt64>(i % 5 == 0 ? 1 : 0)));
+    }
+    auto nullable = ColumnNullable::create(std::move(str_col), std::move(null_map));
+    ColumnPtr input = std::move(nullable);
+    auto result = ColumnDictionary::tryAutoEncode(input, 256, 65536);
+
+    // Nested should be encoded, wrapped in Nullable
+    const auto * result_nullable = typeid_cast<const ColumnNullable *>(result.get());
+    ASSERT_NE(result_nullable, nullptr);
+    ASSERT_TRUE(result_nullable->getNestedColumnPtr()->isDictionaryEncoded());
+    ASSERT_EQ(result->size(), 300);
 }
 
 } // namespace DB::tests

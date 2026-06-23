@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <Columns/ColumnDictionary.h>
 #include <Columns/countBytesInFilter.h>
 #include <Common/Exception.h>
 #include <Common/MemoryTracker.h>
 #include <Common/Stopwatch.h>
 #include <Common/TiFlashMetrics.h>
 #include <Common/escapeForFileName.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/IDataType.h>
 #include <Storages/DeltaMerge/DeltaMergeDefines.h>
 #include <Storages/DeltaMerge/File/ColumnCacheLongTerm.h>
@@ -488,7 +490,8 @@ ColumnPtr DMFileReader::readColumn(const ColumnDefine & cd, size_t start_pack_id
 
         auto column = column_all_data->cut(pack_offset[start_pack_id], read_rows);
         // Cast column's data from DataType in disk to what we need now
-        return convertColumnByColumnDefineIfNeed(type_on_disk, std::move(column), cd);
+        auto result = convertColumnByColumnDefineIfNeed(type_on_disk, std::move(column), cd);
+        return maybeAutoEncodeColumn(result, cd);
     }
 
     // Not cached
@@ -496,7 +499,8 @@ ColumnPtr DMFileReader::readColumn(const ColumnDefine & cd, size_t start_pack_id
     {
         auto column = readFromDiskOrSharingCache(cd, type_on_disk, start_pack_id, pack_count, read_rows);
         // Cast column's data from DataType in disk to what we need now
-        return convertColumnByColumnDefineIfNeed(type_on_disk, std::move(column), cd);
+        auto result = convertColumnByColumnDefineIfNeed(type_on_disk, std::move(column), cd);
+        return maybeAutoEncodeColumn(result, cd);
     }
 
     // enable_column_cache && isCacheableColumn(cd)
@@ -519,7 +523,23 @@ ColumnPtr DMFileReader::readColumn(const ColumnDefine & cd, size_t start_pack_id
     // add column to cache
     addColumnToCache(column_cache, cd.id, start_pack_id, pack_count, column);
     // Cast column's data from DataType in disk to what we need now
-    return convertColumnByColumnDefineIfNeed(type_on_disk, std::move(column), cd);
+    auto result = convertColumnByColumnDefineIfNeed(type_on_disk, std::move(column), cd);
+    return maybeAutoEncodeColumn(result, cd);
+}
+
+ColumnPtr DMFileReader::maybeAutoEncodeColumn(const ColumnPtr & column, const ColumnDefine & cd) const
+{
+    // Only auto-encode during query reads — compaction/internal reads must
+    // produce regular columns for merge compatibility.
+    if (read_tag != ReadTag::Query && read_tag != ReadTag::LMFilter)
+        return column;
+
+    // Check if the column type is String or Nullable(String)
+    auto inner_type = removeNullable(cd.type);
+    if (!inner_type || inner_type->getTypeId() != TypeIndex::String)
+        return column;
+
+    return ColumnDictionary::tryAutoEncode(column);
 }
 
 ColumnPtr DMFileReader::readFromDisk(

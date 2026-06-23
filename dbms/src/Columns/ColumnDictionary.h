@@ -111,6 +111,14 @@ public:
     /// Decode this column into a regular column with all values materialized
     ColumnPtr decode() const;
 
+    /// Try to auto-encode a ColumnString into a ColumnDictionary.
+    /// Returns ColumnDictionary if cardinality <= max_dict_size, otherwise returns
+    /// the original column unchanged. Handles Nullable(ColumnString) too.
+    static ColumnPtr tryAutoEncode(
+        const ColumnPtr & column,
+        size_t min_rows = 256,
+        UInt32 max_dict_size = 65536);
+
     /// IColumn interface implementation
     Field operator[](size_t n) const override
     {

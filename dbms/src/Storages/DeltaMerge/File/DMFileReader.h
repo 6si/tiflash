@@ -125,6 +125,7 @@ private:
         size_t pack_count,
         size_t read_rows);
     ColumnPtr readColumn(const ColumnDefine & cd, size_t start_pack_id, size_t pack_count, size_t read_rows);
+    ColumnPtr maybeAutoEncodeColumn(const ColumnPtr & column, const ColumnDefine & cd) const;
     ColumnPtr cleanRead(
         const ColumnDefine & cd,
         size_t rows_count,
