@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <Columns/ColumnDictionary.h>
+#include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
@@ -160,6 +161,92 @@ TEST_F(FunctionDictionaryEncodingTest, ConvertToFullColumnIfDictionary)
     {
         ASSERT_EQ(full->getDataAt(i), dict_col->getDataAt(i));
     }
+}
+
+TEST_F(FunctionDictionaryEncodingTest, NullableStringAutoEncoding)
+{
+    // Nullable(String) columns should still benefit from auto-encoding.
+    // defaultImplementationForNulls unwraps Nullable first, then the recursive
+    // execute() call hits defaultImplementationForDictionaryColumns on the
+    // inner ColumnString.
+    std::vector<std::optional<String>> data;
+    data.reserve(512);
+    for (size_t i = 0; i < 512; ++i)
+    {
+        if (i % 7 == 0)
+            data.push_back(std::nullopt);
+        else
+            switch (i % 3)
+            {
+            case 0:
+                data.push_back("active");
+                break;
+            case 1:
+                data.push_back("inactive");
+                break;
+            case 2:
+                data.push_back("pending");
+                break;
+            }
+    }
+
+    ColumnWithTypeAndName input_col;
+    ColumnWithTypeAndName const_col;
+    ColumnWithTypeAndName result;
+    try
+    {
+        input_col = createColumn<Nullable<String>>(data);
+        const_col = createConstColumn<Nullable<String>>(512, "active");
+        result = executeFunction("equals", input_col, const_col);
+    }
+    catch (const DB::Exception & e)
+    {
+        FAIL() << "DB::Exception: " << e.displayText() << "\n" << e.getStackTrace().toString();
+    }
+    catch (const std::exception & e)
+    {
+        FAIL() << "std::exception: " << e.what();
+    }
+    auto result_col = result.column;
+    ASSERT_EQ(result_col->size(), 512);
+    const auto * nullable_col = typeid_cast<const ColumnNullable *>(result_col.get());
+    ASSERT_TRUE(nullable_col != nullptr) << "Result should be Nullable";
+    const auto & nested = nullable_col->getNestedColumn();
+    const auto & null_map = nullable_col->getNullMapData();
+    for (size_t i = 0; i < 512; ++i)
+    {
+        if (i % 7 == 0)
+        {
+            ASSERT_EQ(null_map[i], 1) << "Row " << i << " should be NULL";
+        }
+        else
+        {
+            ASSERT_EQ(null_map[i], 0) << "Row " << i << " should not be NULL";
+            UInt64 expected = (i % 3 == 0) ? 1 : 0;
+            ASSERT_EQ(nested.getUInt(i), expected) << "Mismatch at row " << i;
+        }
+    }
+}
+
+TEST_F(FunctionDictionaryEncodingTest, BlockRestoredAfterAutoEncoding)
+{
+    // Verify the block's original ColumnString is restored after auto-encoding
+    // (not left as ColumnDictionary which would break downstream operations).
+    auto data = createLowCardinalityData();
+    auto col_str = createColumn<String>(data);
+    auto col_const = createConstColumn<String>(512, "active");
+
+    // Get the raw ColumnString pointer before function execution
+    const auto * original_col = col_str.column.get();
+
+    // Execute a function that triggers auto-encoding
+    auto result = executeFunction("equals", col_str, col_const);
+
+    // After execution, col_str should still hold ColumnString (not ColumnDictionary)
+    ASSERT_FALSE(col_str.column->isDictionaryEncoded())
+        << "Block column should be ColumnString, not ColumnDictionary after auto-encoding";
+    ASSERT_EQ(col_str.column.get(), original_col)
+        << "Block column pointer should be restored to original ColumnString";
 }
 
 } // namespace DB::tests
