@@ -16,6 +16,7 @@
 
 #include <AggregateFunctions/AggregateFunctionArray.h>
 #include <AggregateFunctions/AggregateFunctionState.h>
+#include <Columns/ColumnDictionary.h>
 #include <Common/FailPoint.h>
 #include <Common/Stopwatch.h>
 #include <Common/ThresholdUtils.h>
@@ -241,6 +242,67 @@ Block Aggregator::getHeader(bool final) const
     return params.getHeader(final);
 }
 
+Block Aggregator::getInternalHeader(bool final) const
+{
+    Block header = params.getHeader(final);
+    if (dict_key_state.isActive() && header.columns() > 0)
+    {
+        auto & key_col_with_type = header.getByPosition(0);
+        key_col_with_type.type = std::make_shared<DataTypeUInt16>();
+        key_col_with_type.column = ColumnUInt16::create();
+    }
+    return header;
+}
+
+UInt16 Aggregator::DictKeyState::getOrInsert(StringRef ref)
+{
+    // Fast path: read-only lookup
+    {
+        std::shared_lock<std::shared_mutex> rlock(dict_mutex);
+        auto it = value_to_id.find(ref);
+        if (it != value_to_id.end())
+            return it->second;
+    }
+
+    // Slow path: insert new entry
+    std::unique_lock<std::shared_mutex> wlock(dict_mutex);
+    auto it = value_to_id.find(ref);
+    if (it != value_to_id.end())
+        return it->second;
+
+    if (id_to_value.size() >= ABSOLUTE_MAX)
+    {
+        failed = true;
+        return 0;
+    }
+
+    UInt16 id = static_cast<UInt16>(id_to_value.size());
+    id_to_value.emplace_back(ref.data, ref.size);
+    value_to_id.emplace(StringRef(id_to_value.back()), id);
+    return id;
+}
+
+ColumnPtr Aggregator::DictKeyState::decodeKeyColumn(const IColumn & uint16_col) const
+{
+    const auto & data = static_cast<const ColumnUInt16 &>(uint16_col).getData();
+    auto str_col = ColumnString::create();
+    str_col->reserve(data.size());
+    for (size_t i = 0; i < data.size(); ++i)
+    {
+        UInt16 id = data[i];
+        if (likely(id < id_to_value.size()))
+        {
+            const auto & str = id_to_value[id];
+            str_col->insertData(str.data(), str.size());
+        }
+        else
+        {
+            str_col->insertDefault();
+        }
+    }
+    return std::move(str_col);
+}
+
 /// when there is no input data and current aggregation still need to generate a result(for example,
 /// select count(*) from t need to return 0 even if there is no data) the aggregator will use this
 /// source header block as the fake input of aggregation
@@ -343,6 +405,7 @@ Aggregator::Aggregator(
     }
 
     method_chosen = chooseAggregationMethod();
+    effective_method_chosen = method_chosen;
     RUNTIME_CHECK_MSG(method_chosen != AggregatedDataVariants::Type::EMPTY, "Invalid aggregation method");
     agg_spill_context = std::make_shared<AggSpillContext>(
         concurrency,
@@ -1116,6 +1179,125 @@ void Aggregator::AggProcessInfo::prepareForAgg()
         }
     }
 
+    /// Try dictionary-encoded key fast path for single string group-by key.
+    /// On first block from any thread, check if the key column is low-cardinality
+    /// string and activate the key16 FixedHashMap path.
+    auto & dks = aggregator->dict_key_state;
+    std::call_once(dks.init_flag, [&]() {
+        if (aggregator->params.keys_size == 1 && aggregator->params.src_header.columns() > 0)
+        {
+            const auto & key_type
+                = aggregator->params.src_header.safeGetByPosition(aggregator->params.keys[0]).type;
+            bool has_collation = !aggregator->params.collators.empty()
+                && aggregator->params.collators[0] != nullptr;
+            if (key_type->isString() && !has_collation)
+            {
+                dks.id_to_value.reserve(Aggregator::DictKeyState::ACTIVATION_THRESHOLD);
+                dks.original_key_type = key_type;
+
+                /// Check if the column is already ColumnDictionary (from encoded storage)
+                const auto * dict_col = typeid_cast<const ColumnDictionary *>(key_columns[0]);
+                if (dict_col)
+                {
+                    size_t dict_size = dict_col->getDictionarySize();
+                    if (dict_size <= Aggregator::DictKeyState::ACTIVATION_THRESHOLD)
+                    {
+                        const auto & dict = dict_col->getDictionary();
+                        for (size_t i = 0; i < dict.size(); ++i)
+                        {
+                            String val = dict[i].get<String>();
+                            dks.id_to_value.push_back(val);
+                            dks.value_to_id.emplace(StringRef(dks.id_to_value.back()), static_cast<UInt16>(i));
+                        }
+                        dks.active = true;
+                        aggregator->effective_method_chosen = AggregatedDataVariants::Type::key16;
+                        aggregator->key_sizes = {2};
+                        LOG_INFO(
+                            aggregator->log,
+                            "Activated dict-key fast path (ColumnDictionary): {} groups → key16 FixedHashMap",
+                            dict_size);
+                    }
+                }
+                else
+                {
+                    const auto * str_col = typeid_cast<const ColumnString *>(key_columns[0]);
+                    if (str_col)
+                    {
+                        bool too_many = false;
+                        for (size_t i = 0; i < str_col->size(); ++i)
+                        {
+                            auto ref = str_col->getDataAt(i);
+                            dks.getOrInsert(ref);
+                            if (dks.failed)
+                            {
+                                too_many = true;
+                                break;
+                            }
+                        }
+                        if (!too_many
+                            && dks.id_to_value.size() <= Aggregator::DictKeyState::ACTIVATION_THRESHOLD)
+                        {
+                            dks.active = true;
+                            aggregator->effective_method_chosen = AggregatedDataVariants::Type::key16;
+                            aggregator->key_sizes = {2};
+                            LOG_INFO(
+                                aggregator->log,
+                                "Activated dict-key fast path: {} distinct values → key16 FixedHashMap",
+                                dks.id_to_value.size());
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    /// If dict-key fast path is active, convert key column to UInt16 IDs
+    if (dks.isActive())
+    {
+        const auto * dict_col = typeid_cast<const ColumnDictionary *>(key_columns[0]);
+        if (dict_col)
+        {
+            /// ColumnDictionary → UInt16: just copy the IDs (they map 1:1 to our dictionary)
+            const auto & dict_ids = dict_col->getDictionaryIds();
+            auto uint16_col = ColumnUInt16::create();
+            auto & data = uint16_col->getData();
+            data.resize(dict_ids.size());
+            for (size_t i = 0; i < dict_ids.size(); ++i)
+                data[i] = static_cast<UInt16>(dict_ids[i]);
+            materialized_columns.push_back(std::move(uint16_col));
+            key_columns[0] = materialized_columns.back().get();
+        }
+        else
+        {
+            const auto * str_col = typeid_cast<const ColumnString *>(key_columns[0]);
+            if (str_col)
+            {
+                auto uint16_col = ColumnUInt16::create();
+                auto & data = uint16_col->getData();
+                data.resize(str_col->size());
+                for (size_t i = 0; i < str_col->size(); ++i)
+                {
+                    auto ref = str_col->getDataAt(i);
+                    data[i] = dks.getOrInsert(ref);
+                    if (unlikely(dks.failed))
+                    {
+                        LOG_WARNING(
+                            aggregator->log,
+                            "Dict-key fast path failed: cardinality exceeded {} at row {}",
+                            Aggregator::DictKeyState::ABSOLUTE_MAX,
+                            i);
+                        break;
+                    }
+                }
+                if (!dks.failed)
+                {
+                    materialized_columns.push_back(std::move(uint16_col));
+                    key_columns[0] = materialized_columns.back().get();
+                }
+            }
+        }
+    }
+
     aggregator->prepareAggregateInstructions(
         input_columns,
         aggregate_columns,
@@ -1159,16 +1341,21 @@ bool Aggregator::executeOnBlockImpl(
     /// `result` will destroy the states of aggregate functions in the destructor
     result.aggregator = this;
 
+    /// Prepare BEFORE init to detect dictionary-encodable keys
+    agg_process_info.prepareForAgg();
+
     /// How to perform the aggregation?
     if (!result.inited())
     {
-        result.init(method_chosen);
+        result.init(effective_method_chosen);
         result.keys_size = params.keys_size;
-        result.key_sizes = key_sizes;
-        LOG_TRACE(log, "Aggregation method: `{}`", result.getMethodName());
+        result.key_sizes = dict_key_state.isActive() ? Sizes{2} : key_sizes;
+        LOG_TRACE(
+            log,
+            "Aggregation method: `{}`{}",
+            result.getMethodName(),
+            dict_key_state.isActive() ? " (dict-key fast path)" : "");
     }
-
-    agg_process_info.prepareForAgg();
 
     if (is_cancelled())
         return true;
@@ -2099,6 +2286,17 @@ BlocksList Aggregator::prepareBlocksAndFill(
 {
     Block header = getHeader(final);
 
+    /// When dict-key fast path is active, use UInt16 for the key column
+    /// during fill, then decode back to String afterward.
+    const bool dict_key_active = dict_key_state.isActive() && convert_key_size > 0;
+    Block fill_header = header;
+    if (dict_key_active)
+    {
+        auto & key_col_with_type = fill_header.getByPosition(0);
+        key_col_with_type.type = std::make_shared<DataTypeUInt16>();
+        key_col_with_type.column = ColumnUInt16::create();
+    }
+
     size_t block_count = (rows + params.max_block_size - 1) / params.max_block_size;
     std::vector<MutableColumns> key_columns_vec;
     std::vector<AggregateColumnsData> aggregate_columns_data_vec;
@@ -2109,7 +2307,7 @@ BlocksList Aggregator::prepareBlocksAndFill(
     new_key_sizes.reserve(convert_key_size);
     for (size_t i = 0; i < convert_key_size; ++i)
     {
-        new_key_sizes.push_back(key_sizes[i]);
+        new_key_sizes.push_back(dict_key_active ? Sizes{2}[0] : key_sizes[i]);
     }
 
     size_t block_rows = params.max_block_size;
@@ -2133,7 +2331,7 @@ BlocksList Aggregator::prepareBlocksAndFill(
 
         for (size_t i = 0; i < convert_key_size; ++i)
         {
-            key_columns[i] = header.safeGetByPosition(i).type->createColumn();
+            key_columns[i] = fill_header.safeGetByPosition(i).type->createColumn();
             key_columns[i]->reserve(block_rows);
         }
 
@@ -2179,7 +2377,17 @@ BlocksList Aggregator::prepareBlocksAndFill(
         Block res = header.cloneEmpty();
 
         for (size_t i = 0; i < convert_key_size; ++i)
-            res.getByPosition(i).column = std::move(key_columns_vec[j][i]);
+        {
+            if (dict_key_active && i == 0)
+            {
+                /// Decode UInt16 dictionary IDs back to original string values
+                res.getByPosition(i).column = dict_key_state.decodeKeyColumn(*key_columns_vec[j][i]);
+            }
+            else
+            {
+                res.getByPosition(i).column = std::move(key_columns_vec[j][i]);
+            }
+        }
 
         for (size_t i = 0; i < params.aggregates_size; ++i)
         {

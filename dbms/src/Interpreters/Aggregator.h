@@ -31,6 +31,7 @@
 #include <Common/HashTable/TwoLevelStringHashMap.h>
 #include <Common/Logger.h>
 #include <DataStreams/IBlockInputStream.h>
+#include <DataTypes/DataTypesNumber.h>
 #include <Interpreters/AggSpillContext.h>
 #include <Interpreters/AggregateDescription.h>
 #include <Interpreters/AggregationCommon.h>
@@ -41,6 +42,9 @@
 
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
 
 
 namespace DB
@@ -1061,9 +1065,45 @@ public:
 
     /// Get data structure of the result.
     Block getHeader(bool final) const;
+    /// Get internal header (may use UInt16 for dict-encoded keys).
+    Block getInternalHeader(bool final) const;
     Block getSourceHeader() const;
 
     const Params & getParams() const { return params; }
+
+    /// Dictionary key encoding state for encoded GROUP BY fast path.
+    /// When a single string group-by key has low cardinality, we replace it
+    /// with UInt16 dictionary IDs and use the key16 FixedHashMap for O(1)
+    /// array-indexed aggregation instead of string hashing.
+    struct DictKeyState
+    {
+        static constexpr size_t ACTIVATION_THRESHOLD = 4096;
+        static constexpr size_t ABSOLUTE_MAX = 65535; // UInt16 max
+
+        std::once_flag init_flag;
+        mutable std::shared_mutex dict_mutex;
+
+        bool active = false;
+        bool failed = false;
+
+        std::vector<String> id_to_value;
+
+        struct StringRefHasher
+        {
+            size_t operator()(StringRef ref) const
+            {
+                return CityHash_v1_0_2::CityHash64(ref.data, ref.size);
+            }
+        };
+        std::unordered_map<StringRef, UInt16, StringRefHasher> value_to_id;
+
+        DataTypePtr original_key_type;
+
+        UInt16 getOrInsert(StringRef ref);
+        ColumnPtr decodeKeyColumn(const IColumn & uint16_col) const;
+        bool isActive() const { return active && !failed; }
+    };
+    DictKeyState dict_key_state;
 
 protected:
     friend struct AggregatedDataVariants;
@@ -1072,6 +1112,7 @@ protected:
     Params params;
 
     AggregatedDataVariants::Type method_chosen;
+    AggregatedDataVariants::Type effective_method_chosen; // may differ from method_chosen when dict key is active
 
 
     Sizes key_sizes;
