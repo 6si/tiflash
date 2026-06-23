@@ -110,6 +110,40 @@ protected:
         return block;
     }
 
+    /// Create a block with Nullable<ColumnDictionary> key column.
+    Block makeNullableDictKeyBlock(
+        const std::vector<String> & dict_values,
+        const std::vector<UInt32> & id_vec,
+        const std::vector<Int64> & values,
+        const std::vector<size_t> & null_indices = {})
+    {
+        std::vector<Field> dict;
+        for (const auto & v : dict_values)
+            dict.emplace_back(v);
+        PaddedPODArray<UInt32> id_array;
+        for (auto id : id_vec)
+            id_array.push_back(id);
+        auto dict_col
+            = ColumnDictionary::createMutable(std::move(dict), std::move(id_array), std::make_shared<DataTypeString>());
+
+        auto null_map = ColumnUInt8::create();
+        for (size_t i = 0; i < id_vec.size(); ++i)
+        {
+            bool is_null = std::find(null_indices.begin(), null_indices.end(), i) != null_indices.end();
+            null_map->getData().push_back(is_null ? 1 : 0);
+        }
+        auto nullable_col = ColumnNullable::create(std::move(dict_col), std::move(null_map));
+
+        auto val_col = ColumnVector<Int64>::create();
+        for (auto v : values)
+            val_col->getData().push_back(v);
+
+        Block block;
+        block.insert({std::move(nullable_col), makeNullable(std::make_shared<DataTypeString>()), "key"});
+        block.insert({std::move(val_col), std::make_shared<DataTypeInt64>(), "val"});
+        return block;
+    }
+
     /// Collect SUM results handling Nullable key column (NULL key → "__NULL__")
     std::map<String, Int64> collectNullableSumResults(const BlocksList & blocks)
     {
@@ -266,8 +300,29 @@ protected:
     }
 };
 
-/// Verify that low-cardinality string key activates dict-key fast path
-TEST_F(AggregatorDictKeyTest, StringKeyLowCardinality_ActivatesDictKeyPath)
+/// Verify that ColumnDictionary input activates dict-key fast path
+TEST_F(AggregatorDictKeyTest, DictKeyLowCardinality_ActivatesDictKeyPath)
+try
+{
+    auto block = makeDictKeyBlock(
+        {"US", "UK", "DE", "FR", "JP"},
+        {0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1},
+        {10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120});
+
+    auto aggregator = makeSumAggregator(block.cloneEmpty());
+
+    auto data = std::make_shared<AggregatedDataVariants>();
+    Aggregator::AggProcessInfo info(aggregator.get());
+    info.resetBlock(block);
+    aggregator->executeOnBlock(info, *data, 0);
+
+    EXPECT_TRUE(aggregator->dict_key_state.isActive());
+    EXPECT_EQ(aggregator->dict_key_state.id_to_value.size(), 5u);
+}
+CATCH
+
+/// Verify that ColumnString input does NOT activate dict-key (uses standard HashAgg)
+TEST_F(AggregatorDictKeyTest, StringKey_DoesNotActivateDictKey)
 try
 {
     auto block = makeStringKeyBlock(
@@ -281,8 +336,8 @@ try
     info.resetBlock(block);
     aggregator->executeOnBlock(info, *data, 0);
 
-    EXPECT_TRUE(aggregator->dict_key_state.isActive());
-    EXPECT_EQ(aggregator->dict_key_state.id_to_value.size(), 5u);
+    EXPECT_FALSE(aggregator->dict_key_state.isActive())
+        << "Dict-key should NOT activate for ColumnString input (standard HashAgg is faster)";
 }
 CATCH
 
@@ -412,17 +467,20 @@ TEST_F(AggregatorDictKeyTest, SingleGroup)
     EXPECT_EQ(results.size(), 1u);
 }
 
-/// 100 distinct keys — still below threshold (4096)
+/// 100 distinct keys via ColumnDictionary — still below threshold (4096)
 TEST_F(AggregatorDictKeyTest, ManyGroups_StillActivates)
 {
-    std::vector<String> keys;
+    std::vector<String> dict_values;
+    for (int i = 0; i < 100; ++i)
+        dict_values.push_back("group_" + std::to_string(i));
+    std::vector<UInt32> ids;
     std::vector<Int64> values;
     for (int i = 0; i < 1000; ++i)
     {
-        keys.push_back("group_" + std::to_string(i % 100));
+        ids.push_back(static_cast<UInt32>(i % 100));
         values.push_back(i);
     }
-    auto block = makeStringKeyBlock(keys, values);
+    auto block = makeDictKeyBlock(dict_values, ids, values);
 
     auto aggregator = makeSumAggregator(block.cloneEmpty());
 
@@ -534,8 +592,9 @@ TEST_F(AggregatorDictKeyTest, DictKeyState_GetOrInsert)
 TEST_F(AggregatorDictKeyTest, BinaryCollation_StillActivates)
 try
 {
-    auto block = makeStringKeyBlock(
-        {"US", "UK", "DE", "FR", "JP", "US", "UK", "DE", "FR", "JP"},
+    auto block = makeDictKeyBlock(
+        {"US", "UK", "DE", "FR", "JP"},
+        {0, 1, 2, 3, 4, 0, 1, 2, 3, 4},
         {10, 20, 30, 40, 50, 60, 70, 80, 90, 100});
 
     auto context = TiFlashTestEnv::getContext();
@@ -646,12 +705,14 @@ CATCH
 TEST_F(AggregatorDictKeyTest, FrozenDictionary_MultipleBlocks)
 try
 {
-    auto block1 = makeStringKeyBlock(
+    auto block1 = makeDictKeyBlock(
         {"US", "UK", "DE", "FR", "JP"},
+        {0, 1, 2, 3, 4},
         {10, 20, 30, 40, 50});
 
-    auto block2 = makeStringKeyBlock(
-        {"US", "JP", "DE", "UK", "FR", "US", "US", "DE", "JP", "FR"},
+    auto block2 = makeDictKeyBlock(
+        {"US", "UK", "DE", "FR", "JP"},
+        {0, 4, 2, 1, 3, 0, 0, 2, 4, 3},
         {100, 200, 300, 400, 500, 600, 700, 800, 900, 1000});
 
     auto context = TiFlashTestEnv::getContext();
@@ -725,16 +786,19 @@ CATCH
 TEST_F(AggregatorDictKeyTest, MultiThread_Concurrent)
 try
 {
-    auto block1 = makeStringKeyBlock(
+    auto block1 = makeDictKeyBlock(
         {"US", "UK", "DE", "FR", "JP"},
+        {0, 1, 2, 3, 4},
         {10, 20, 30, 40, 50});
 
-    auto block2 = makeStringKeyBlock(
-        {"US", "JP", "DE"},
+    auto block2 = makeDictKeyBlock(
+        {"US", "UK", "DE", "FR", "JP"},
+        {0, 4, 2},
         {100, 200, 300});
 
-    auto block3 = makeStringKeyBlock(
-        {"UK", "FR", "US", "DE"},
+    auto block3 = makeDictKeyBlock(
+        {"US", "UK", "DE", "FR", "JP"},
+        {1, 3, 0, 2},
         {400, 500, 600, 700});
 
     auto context = TiFlashTestEnv::getContext();
@@ -824,13 +888,14 @@ try
 }
 CATCH
 
-/// Test that padding-binary collation (utf8mb4_bin) correctly normalizes trailing spaces
-TEST_F(AggregatorDictKeyTest, PaddingBinary_TrailingSpacesNormalized)
+/// Test ColumnDictionary with padding-binary collation (utf8mb4_bin)
+TEST_F(AggregatorDictKeyTest, PaddingBinary_DictColumnActivates)
 try
 {
-    // "US", "US " (1 space), "US  " (2 spaces) should all map to same dict ID
-    auto block = makeStringKeyBlock(
-        {"US", "US ", "US  ", "UK", "UK "},
+    // Dictionary already has normalized entries (no trailing spaces)
+    auto block = makeDictKeyBlock(
+        {"US", "UK"},
+        {0, 0, 0, 1, 1},
         {10, 20, 30, 40, 50});
 
     auto context = TiFlashTestEnv::getContext();
@@ -844,7 +909,6 @@ try
     desc.parameters = Array();
     agg_descs.push_back(desc);
 
-    // utf8mb4_bin collation (padding binary — strips trailing spaces)
     auto collator = TiDB::ITiDBCollator::getCollator("utf8mb4_bin");
     TiDB::TiDBCollators collators = {collator};
 
@@ -877,12 +941,8 @@ try
     aggregator->executeOnBlock(info, *data, 0);
 
     EXPECT_TRUE(aggregator->dict_key_state.isActive());
-    EXPECT_TRUE(aggregator->dict_key_state.padding_binary);
-    // "US", "US ", "US  " should all normalize to "US" → 2 distinct groups, not 4
-    EXPECT_EQ(aggregator->dict_key_state.id_to_value.size(), 2u)
-        << "Trailing spaces should be normalized for padding-binary collation";
+    EXPECT_EQ(aggregator->dict_key_state.id_to_value.size(), 2u);
 
-    // Verify sums: US group = 10+20+30=60, UK group = 40+50=90
     ManyAggregatedDataVariants many_data;
     many_data.push_back(std::move(data));
     auto merging = aggregator->mergeAndConvertToBlocks(many_data, /*final=*/true, /*max_threads=*/1);
@@ -902,17 +962,18 @@ try
         }
     }
     EXPECT_EQ(total_rows, 2u);
-    EXPECT_EQ(total_sum, 150); // 60 + 90
+    EXPECT_EQ(total_sum, 150); // US=60, UK=90
 }
 CATCH
 
-/// Test that pure BINARY collation does NOT normalize trailing spaces
-TEST_F(AggregatorDictKeyTest, PureBinary_TrailingSpacesPreserved)
+/// Test ColumnDictionary with pure BINARY collation
+TEST_F(AggregatorDictKeyTest, PureBinary_DictColumnActivates)
 try
 {
-    // With pure BINARY collation, "US" and "US " are DIFFERENT keys
-    auto block = makeStringKeyBlock(
+    // Dictionary has entries including one with trailing space (treated as distinct under BINARY)
+    auto block = makeDictKeyBlock(
         {"US", "US ", "UK"},
+        {0, 1, 2},
         {10, 20, 30});
 
     auto context = TiFlashTestEnv::getContext();
@@ -926,7 +987,6 @@ try
     desc.parameters = Array();
     agg_descs.push_back(desc);
 
-    // Pure BINARY collation (no padding — exact byte comparison)
     auto collator = TiDB::ITiDBCollator::getCollator("binary");
     TiDB::TiDBCollators collators = {collator};
 
@@ -960,19 +1020,19 @@ try
 
     EXPECT_TRUE(aggregator->dict_key_state.isActive());
     EXPECT_FALSE(aggregator->dict_key_state.padding_binary);
-    // "US" and "US " are different keys under pure BINARY → 3 distinct groups
     EXPECT_EQ(aggregator->dict_key_state.id_to_value.size(), 3u)
         << "Trailing spaces should be preserved for pure BINARY collation";
 }
 CATCH
 
-/// Nullable<String> key — dict-key should activate and handle NULL values correctly
-TEST_F(AggregatorDictKeyTest, NullableString_ActivatesAndHandlesNulls)
+/// Nullable<ColumnDictionary> key — dict-key should activate and handle NULL values
+TEST_F(AggregatorDictKeyTest, NullableDictKey_ActivatesAndHandlesNulls)
 try
 {
     // Rows: US(10), NULL(20), UK(30), NULL(40), US(50)
-    auto block = makeNullableStringKeyBlock(
-        {"US", "", "UK", "", "US"},
+    auto block = makeNullableDictKeyBlock(
+        {"US", "UK"},
+        {0, 0, 1, 0, 0}, // dict IDs (NULL rows still need an ID placeholder)
         {10, 20, 30, 40, 50},
         {1, 3}); // indices 1 and 3 are NULL
 
@@ -980,7 +1040,7 @@ try
     auto results_blocks = runAggregation(*aggregator, {block});
 
     EXPECT_TRUE(aggregator->dict_key_state.isActive())
-        << "Dict-key should activate for Nullable<String> key";
+        << "Dict-key should activate for Nullable<ColumnDictionary> key";
     EXPECT_TRUE(aggregator->dict_key_state.nullable_key);
 
     auto results = collectNullableSumResults(results_blocks);
@@ -991,12 +1051,13 @@ try
 }
 CATCH
 
-/// Nullable<String> key with no actual NULLs — should still activate
-TEST_F(AggregatorDictKeyTest, NullableString_NoNulls_StillActivates)
+/// Nullable<ColumnDictionary> key with no actual NULLs — should still activate
+TEST_F(AggregatorDictKeyTest, NullableDictKey_NoNulls_StillActivates)
 try
 {
-    auto block = makeNullableStringKeyBlock(
+    auto block = makeNullableDictKeyBlock(
         {"US", "UK", "DE"},
+        {0, 1, 2},
         {10, 20, 30},
         {}); // no nulls
 
@@ -1014,17 +1075,19 @@ try
 }
 CATCH
 
-/// Nullable<String> multi-block with NULLs in different blocks
-TEST_F(AggregatorDictKeyTest, NullableString_MultiBlock_NullsAcrossBlocks)
+/// Nullable<ColumnDictionary> multi-block with NULLs in different blocks
+TEST_F(AggregatorDictKeyTest, NullableDictKey_MultiBlock_NullsAcrossBlocks)
 try
 {
-    auto block1 = makeNullableStringKeyBlock(
-        {"US", "UK", "US"},
+    auto block1 = makeNullableDictKeyBlock(
+        {"US", "UK"},
+        {0, 1, 0},
         {10, 20, 30},
         {}); // no nulls in block 1
 
-    auto block2 = makeNullableStringKeyBlock(
-        {"UK", "", "US", ""},
+    auto block2 = makeNullableDictKeyBlock(
+        {"US", "UK"},
+        {1, 0, 0, 0}, // IDs don't matter for NULL rows, using 0 as placeholder
         {100, 200, 300, 400},
         {1, 3}); // indices 1 and 3 are NULL in block 2
 

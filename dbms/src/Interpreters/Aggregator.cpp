@@ -1360,48 +1360,15 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                 }
                 else
                 {
-                    const auto * str_col = typeid_cast<const ColumnString *>(inner_col);
-                    if (str_col)
-                    {
-                        bool too_many = false;
-                        for (size_t i = 0; i < str_col->size(); ++i)
-                        {
-                            auto ref = str_col->getDataAt(i);
-                            dks.getOrInsert(ref);
-                            if (dks.failed)
-                            {
-                                too_many = true;
-                                break;
-                            }
-                        }
-                        if (!too_many
-                            && dks.id_to_value.size() <= Aggregator::DictKeyState::ACTIVATION_THRESHOLD)
-                        {
-                            dks.active = true;
-                            aggregator->effective_method_chosen = AggregatedDataVariants::Type::key16;
-                            aggregator->key_sizes = {2};
-                            LOG_INFO(
-                                aggregator->log,
-                                "Dict-key activated (ColumnString{}): {} distinct values -> key16 FixedHashMap",
-                                is_nullable ? ", nullable" : "",
-                                dks.id_to_value.size());
-                        }
-                        else
-                        {
-                            LOG_DEBUG(
-                                aggregator->log,
-                                "Dict-key skipped: ColumnString too_many={} dict_size={} failed={}",
-                                too_many,
-                                dks.id_to_value.size(),
-                                dks.failed);
-                        }
-                    }
-                    else
-                    {
-                        LOG_DEBUG(
-                            aggregator->log,
-                            "Dict-key skipped: inner_col is neither ColumnDictionary nor ColumnString");
-                    }
+                    /// Dict-key on ColumnString is disabled: benchmarks show it's
+                    /// 3-4x SLOWER than standard HashAgg because prepareForAgg
+                    /// iterates all rows building a dictionary (O(N) string hashing)
+                    /// — the same work standard aggregation does, plus extra
+                    /// FixedHashMap indirection. Dict-key only helps when the
+                    /// column is already ColumnDictionary from the storage layer.
+                    LOG_DEBUG(
+                        aggregator->log,
+                        "Dict-key skipped: ColumnString input (dict-key only benefits ColumnDictionary)");
                 }
             }
             else
@@ -1444,6 +1411,7 @@ void Aggregator::AggProcessInfo::prepareForAgg()
             /// build a segment-local remap table and translate IDs per-row.
             const auto & seg_dict = dict_col->getDictionary();
             const auto & dict_ids = dict_col->getDictionaryIds();
+            const size_t prev_dict_size = dks.id_to_value.size();
             std::vector<UInt16> remap(seg_dict.size());
             for (size_t i = 0; i < seg_dict.size(); ++i)
             {
@@ -1454,6 +1422,8 @@ void Aggregator::AggProcessInfo::prepareForAgg()
             }
             if (!dks.failed)
             {
+                if (dks.id_to_value.size() == prev_dict_size)
+                    dks.freezeDictionary();
                 auto uint16_col = ColumnUInt16::create();
                 auto & data = uint16_col->getData();
                 data.resize(dict_ids.size());
