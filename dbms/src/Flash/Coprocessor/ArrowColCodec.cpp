@@ -17,6 +17,7 @@
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnVector.h>
+#include <Columns/IColumn.h>
 #include <Common/TiFlashException.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDecimal.h>
@@ -398,6 +399,7 @@ void flashColToArrowCol(
     size_t end_index)
 {
     auto column = flash_col.column->isColumnConst() ? flash_col.column->convertToFullColumnIfConst() : flash_col.column;
+    column = column->convertToFullColumnIfDictionary();
     const IColumn * col = column.get();
     const IDataType * type = flash_col.type.get();
     const TiDB::ColumnInfo tidb_column_info = TiDB::fieldTypeToColumnInfo(field_type);

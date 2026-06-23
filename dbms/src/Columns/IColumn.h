@@ -73,9 +73,9 @@ public:
     virtual Ptr convertToFullColumnIfConst() const { return {}; }
 
     /** If column is dictionary-encoded, materializes it to a regular column.
-      * Returns nullptr if column is not dictionary-encoded.
+      * Returns the column itself if not dictionary-encoded.
       */
-    virtual Ptr convertToFullColumnIfDictionary() const { return {}; }
+    virtual Ptr convertToFullColumnIfDictionary() const { return getPtr(); }
 
     /// Returns true if this column is dictionary-encoded
     virtual bool isDictionaryEncoded() const { return false; }

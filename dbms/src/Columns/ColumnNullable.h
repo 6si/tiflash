@@ -230,6 +230,16 @@ public:
     }
 
     bool isColumnNullable() const override { return true; }
+
+    IColumn::Ptr convertToFullColumnIfDictionary() const override
+    {
+        if (nested_column->isDictionaryEncoded())
+        {
+            auto materialized = nested_column->convertToFullColumnIfDictionary();
+            return ColumnNullable::create(materialized->assumeMutable(), null_map->assumeMutable());
+        }
+        return getPtr();
+    }
     bool isFixedAndContiguous() const override { return false; }
     bool valuesHaveFixedSize() const override { return nested_column->valuesHaveFixedSize(); }
     size_t sizeOfValueIfFixed() const override
