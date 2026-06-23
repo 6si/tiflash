@@ -15,10 +15,12 @@
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <AggregateFunctions/registerAggregateFunctions.h>
 #include <Columns/ColumnDictionary.h>
+#include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnVector.h>
 #include <Common/typeid_cast.h>
 #include <Core/SpillConfig.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Debug/TiFlashTestEnv.h>
@@ -79,6 +81,52 @@ protected:
         block.insert({std::move(dict_col), std::make_shared<DataTypeString>(), "key"});
         block.insert({std::move(val_col), std::make_shared<DataTypeInt64>(), "val"});
         return block;
+    }
+
+    /// Create a block with Nullable<String> key column.
+    /// null_indices specifies which positions should be NULL.
+    Block makeNullableStringKeyBlock(
+        const std::vector<String> & keys,
+        const std::vector<Int64> & values,
+        const std::vector<size_t> & null_indices = {})
+    {
+        auto key_col = ColumnString::create();
+        auto null_map = ColumnUInt8::create();
+        for (size_t i = 0; i < keys.size(); ++i)
+        {
+            key_col->insertData(keys[i].data(), keys[i].size());
+            bool is_null = std::find(null_indices.begin(), null_indices.end(), i) != null_indices.end();
+            null_map->getData().push_back(is_null ? 1 : 0);
+        }
+        auto nullable_col = ColumnNullable::create(std::move(key_col), std::move(null_map));
+
+        auto val_col = ColumnVector<Int64>::create();
+        for (auto v : values)
+            val_col->getData().push_back(v);
+
+        Block block;
+        block.insert({std::move(nullable_col), makeNullable(std::make_shared<DataTypeString>()), "key"});
+        block.insert({std::move(val_col), std::make_shared<DataTypeInt64>(), "val"});
+        return block;
+    }
+
+    /// Collect SUM results handling Nullable key column (NULL key → "__NULL__")
+    std::map<String, Int64> collectNullableSumResults(const BlocksList & blocks)
+    {
+        std::map<String, Int64> results;
+        for (const auto & block : blocks)
+        {
+            const auto & key_col = block.getByPosition(0).column;
+            const auto & val_col = block.getByName("sum_val").column;
+            for (size_t i = 0; i < block.rows(); ++i)
+            {
+                if (key_col->isNullAt(i))
+                    results["__NULL__"] += val_col->getInt(i);
+                else
+                    results[key_col->getDataAt(i).toString()] += val_col->getInt(i);
+            }
+        }
+        return results;
     }
 
     std::unique_ptr<Aggregator> makeSumAggregator(const Block & header)
@@ -915,6 +963,81 @@ try
     // "US" and "US " are different keys under pure BINARY → 3 distinct groups
     EXPECT_EQ(aggregator->dict_key_state.id_to_value.size(), 3u)
         << "Trailing spaces should be preserved for pure BINARY collation";
+}
+CATCH
+
+/// Nullable<String> key — dict-key should activate and handle NULL values correctly
+TEST_F(AggregatorDictKeyTest, NullableString_ActivatesAndHandlesNulls)
+try
+{
+    // Rows: US(10), NULL(20), UK(30), NULL(40), US(50)
+    auto block = makeNullableStringKeyBlock(
+        {"US", "", "UK", "", "US"},
+        {10, 20, 30, 40, 50},
+        {1, 3}); // indices 1 and 3 are NULL
+
+    auto aggregator = makeSumAggregator(block.cloneEmpty());
+    auto results_blocks = runAggregation(*aggregator, {block});
+
+    EXPECT_TRUE(aggregator->dict_key_state.isActive())
+        << "Dict-key should activate for Nullable<String> key";
+    EXPECT_TRUE(aggregator->dict_key_state.nullable_key);
+
+    auto results = collectNullableSumResults(results_blocks);
+    EXPECT_EQ(results.size(), 3u); // US, UK, NULL
+    EXPECT_EQ(results["US"], 60);  // 10 + 50
+    EXPECT_EQ(results["UK"], 30);
+    EXPECT_EQ(results["__NULL__"], 60); // 20 + 40
+}
+CATCH
+
+/// Nullable<String> key with no actual NULLs — should still activate
+TEST_F(AggregatorDictKeyTest, NullableString_NoNulls_StillActivates)
+try
+{
+    auto block = makeNullableStringKeyBlock(
+        {"US", "UK", "DE"},
+        {10, 20, 30},
+        {}); // no nulls
+
+    auto aggregator = makeSumAggregator(block.cloneEmpty());
+    auto results_blocks = runAggregation(*aggregator, {block});
+
+    EXPECT_TRUE(aggregator->dict_key_state.isActive());
+    EXPECT_TRUE(aggregator->dict_key_state.nullable_key);
+
+    auto results = collectNullableSumResults(results_blocks);
+    EXPECT_EQ(results.size(), 3u);
+    EXPECT_EQ(results["US"], 10);
+    EXPECT_EQ(results["UK"], 20);
+    EXPECT_EQ(results["DE"], 30);
+}
+CATCH
+
+/// Nullable<String> multi-block with NULLs in different blocks
+TEST_F(AggregatorDictKeyTest, NullableString_MultiBlock_NullsAcrossBlocks)
+try
+{
+    auto block1 = makeNullableStringKeyBlock(
+        {"US", "UK", "US"},
+        {10, 20, 30},
+        {}); // no nulls in block 1
+
+    auto block2 = makeNullableStringKeyBlock(
+        {"UK", "", "US", ""},
+        {100, 200, 300, 400},
+        {1, 3}); // indices 1 and 3 are NULL in block 2
+
+    auto aggregator = makeSumAggregator(block1.cloneEmpty());
+    auto results_blocks = runAggregation(*aggregator, {block1, block2});
+
+    EXPECT_TRUE(aggregator->dict_key_state.isActive());
+
+    auto results = collectNullableSumResults(results_blocks);
+    EXPECT_EQ(results.size(), 3u); // US, UK, NULL
+    EXPECT_EQ(results["US"], 340);  // 10+30+300
+    EXPECT_EQ(results["UK"], 120);  // 20+100
+    EXPECT_EQ(results["__NULL__"], 600); // 200+400
 }
 CATCH
 

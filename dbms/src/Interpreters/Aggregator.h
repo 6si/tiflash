@@ -1086,6 +1086,8 @@ public:
         bool active = false;
         bool failed = false;
         bool padding_binary = false;
+        bool nullable_key = false;
+        UInt16 null_dict_id = 0; // dict ID assigned to NULL values
         std::atomic<bool> dictionary_frozen{false};
 
         std::vector<String> id_to_value;

@@ -315,10 +315,24 @@ ColumnPtr Aggregator::DictKeyState::decodeKeyColumn(const IColumn & uint16_col) 
     const auto & data = static_cast<const ColumnUInt16 &>(uint16_col).getData();
     auto str_col = ColumnString::create();
     str_col->reserve(data.size());
+
+    MutableColumnPtr null_map_col;
+    NullMap * null_map = nullptr;
+    if (nullable_key)
+    {
+        null_map_col = ColumnUInt8::create(data.size(), 0);
+        null_map = &static_cast<ColumnUInt8 &>(*null_map_col).getData();
+    }
+
     for (size_t i = 0; i < data.size(); ++i)
     {
         UInt16 id = data[i];
-        if (likely(id < id_to_value.size()))
+        if (nullable_key && id == null_dict_id)
+        {
+            str_col->insertDefault(); // placeholder string for NULL row
+            (*null_map)[i] = 1;
+        }
+        else if (likely(id < id_to_value.size()))
         {
             const auto & str = id_to_value[id];
             str_col->insertData(str.data(), str.size());
@@ -328,6 +342,9 @@ ColumnPtr Aggregator::DictKeyState::decodeKeyColumn(const IColumn & uint16_col) 
             str_col->insertDefault();
         }
     }
+
+    if (nullable_key)
+        return ColumnNullable::create(std::move(str_col), std::move(null_map_col));
     return std::move(str_col);
 }
 
@@ -1210,26 +1227,46 @@ void Aggregator::AggProcessInfo::prepareForAgg()
     /// Try dictionary-encoded key fast path for single string group-by key.
     /// On first block from any thread, check if the key column is low-cardinality
     /// string and activate the key16 FixedHashMap path.
+    /// Handles both String and Nullable<String> key types.
     auto & dks = aggregator->dict_key_state;
     std::call_once(dks.init_flag, [&]() {
         if (aggregator->params.keys_size == 1 && aggregator->params.src_header.columns() > 0)
         {
             const auto & key_type
                 = aggregator->params.src_header.safeGetByPosition(aggregator->params.keys[0]).type;
+            auto inner_type = removeNullable(key_type);
+            bool is_nullable = key_type->isNullable();
             const auto * collator = (!aggregator->params.collators.empty())
                 ? aggregator->params.collators[0]
                 : nullptr;
             bool collation_safe = (collator == nullptr)
                 || collator->isBinary()
                 || collator->isPaddingBinary();
-            if (key_type->isString() && collation_safe)
+            if (inner_type->isString() && collation_safe)
             {
                 dks.id_to_value.reserve(Aggregator::DictKeyState::ACTIVATION_THRESHOLD);
                 dks.original_key_type = key_type;
+                dks.nullable_key = is_nullable;
                 dks.padding_binary = (collator != nullptr && collator->isPaddingBinary());
 
+                // Reserve dict ID 0 for NULL if key is nullable
+                if (is_nullable)
+                {
+                    dks.id_to_value.push_back(""); // placeholder for NULL
+                    dks.null_dict_id = 0;
+                }
+
+                /// Unwrap ColumnNullable to get the inner column for type detection
+                const IColumn * inner_col = key_columns[0];
+                if (is_nullable)
+                {
+                    const auto * nullable_col = typeid_cast<const ColumnNullable *>(key_columns[0]);
+                    if (nullable_col)
+                        inner_col = &nullable_col->getNestedColumn();
+                }
+
                 /// Check if the column is already ColumnDictionary (from encoded storage)
-                const auto * dict_col = typeid_cast<const ColumnDictionary *>(key_columns[0]);
+                const auto * dict_col = typeid_cast<const ColumnDictionary *>(inner_col);
                 if (dict_col)
                 {
                     size_t dict_size = dict_col->getDictionarySize();
@@ -1239,7 +1276,6 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                         for (size_t i = 0; i < dict.size(); ++i)
                         {
                             String val = dict[i].get<String>();
-                            // Use getOrInsert to apply padding normalization
                             dks.getOrInsert(StringRef(val));
                         }
                         dks.active = true;
@@ -1247,13 +1283,14 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                         aggregator->key_sizes = {2};
                         LOG_INFO(
                             aggregator->log,
-                            "Activated dict-key fast path (ColumnDictionary): {} groups → key16 FixedHashMap",
+                            "Activated dict-key fast path (ColumnDictionary{}): {} groups → key16 FixedHashMap",
+                            is_nullable ? ", nullable" : "",
                             dict_size);
                     }
                 }
                 else
                 {
-                    const auto * str_col = typeid_cast<const ColumnString *>(key_columns[0]);
+                    const auto * str_col = typeid_cast<const ColumnString *>(inner_col);
                     if (str_col)
                     {
                         bool too_many = false;
@@ -1275,7 +1312,8 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                             aggregator->key_sizes = {2};
                             LOG_INFO(
                                 aggregator->log,
-                                "Activated dict-key fast path: {} distinct values → key16 FixedHashMap",
+                                "Activated dict-key fast path{}: {} distinct values → key16 FixedHashMap",
+                                is_nullable ? " (nullable)" : "",
                                 dks.id_to_value.size());
                         }
                     }
@@ -1287,7 +1325,17 @@ void Aggregator::AggProcessInfo::prepareForAgg()
     /// If dict-key fast path is active, convert key column to UInt16 IDs
     if (dks.isActive())
     {
-        const auto * dict_col = typeid_cast<const ColumnDictionary *>(key_columns[0]);
+        /// Unwrap ColumnNullable if key is nullable
+        const IColumn * inner_key_col = key_columns[0];
+        const ColumnNullable * nullable_col = nullptr;
+        if (dks.nullable_key)
+        {
+            nullable_col = typeid_cast<const ColumnNullable *>(key_columns[0]);
+            if (nullable_col)
+                inner_key_col = &nullable_col->getNestedColumn();
+        }
+
+        const auto * dict_col = typeid_cast<const ColumnDictionary *>(inner_key_col);
         if (dict_col)
         {
             /// ColumnDictionary → UInt16: remap through our dictionary.
@@ -1308,34 +1356,50 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                 auto uint16_col = ColumnUInt16::create();
                 auto & data = uint16_col->getData();
                 data.resize(dict_ids.size());
-                for (size_t i = 0; i < dict_ids.size(); ++i)
-                    data[i] = remap[dict_ids[i]];
+                if (nullable_col)
+                {
+                    const auto & null_map = nullable_col->getNullMapData();
+                    for (size_t i = 0; i < dict_ids.size(); ++i)
+                        data[i] = null_map[i] ? dks.null_dict_id : remap[dict_ids[i]];
+                }
+                else
+                {
+                    for (size_t i = 0; i < dict_ids.size(); ++i)
+                        data[i] = remap[dict_ids[i]];
+                }
                 materialized_columns.push_back(std::move(uint16_col));
                 key_columns[0] = materialized_columns.back().get();
             }
         }
         else
         {
-            const auto * str_col = typeid_cast<const ColumnString *>(key_columns[0]);
+            const auto * str_col = typeid_cast<const ColumnString *>(inner_key_col);
             if (str_col)
             {
                 auto uint16_col = ColumnUInt16::create();
                 auto & data = uint16_col->getData();
                 data.resize(str_col->size());
+                const NullMap * null_map = nullable_col ? &nullable_col->getNullMapData() : nullptr;
                 const bool frozen = dks.dictionary_frozen.load(std::memory_order_acquire);
                 if (frozen)
                 {
                     for (size_t i = 0; i < str_col->size(); ++i)
                     {
+                        if (null_map && (*null_map)[i])
+                        {
+                            data[i] = dks.null_dict_id;
+                            continue;
+                        }
                         UInt16 id = dks.lookupFrozen(str_col->getDataAt(i));
                         if (unlikely(id >= dks.id_to_value.size()))
                         {
-                            // New value seen after freeze — fall back to locked path
-                            // and unfreeze for future blocks.
                             dks.dictionary_frozen.store(false, std::memory_order_release);
                             for (size_t j = 0; j < str_col->size(); ++j)
                             {
-                                data[j] = dks.getOrInsert(str_col->getDataAt(j));
+                                if (null_map && (*null_map)[j])
+                                    data[j] = dks.null_dict_id;
+                                else
+                                    data[j] = dks.getOrInsert(str_col->getDataAt(j));
                                 if (unlikely(dks.failed))
                                     break;
                             }
@@ -1349,6 +1413,11 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                     const size_t prev_dict_size = dks.id_to_value.size();
                     for (size_t i = 0; i < str_col->size(); ++i)
                     {
+                        if (null_map && (*null_map)[i])
+                        {
+                            data[i] = dks.null_dict_id;
+                            continue;
+                        }
                         data[i] = dks.getOrInsert(str_col->getDataAt(i));
                         if (unlikely(dks.failed))
                         {
@@ -1360,7 +1429,6 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                             break;
                         }
                     }
-                    // Freeze if no new entries were added during this block
                     if (!dks.failed && dks.id_to_value.size() == prev_dict_size)
                         dks.freezeDictionary();
                 }
