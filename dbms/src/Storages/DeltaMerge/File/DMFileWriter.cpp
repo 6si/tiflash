@@ -31,34 +31,6 @@
 namespace DB::DM
 {
 
-namespace
-{
-/// Convert StringV2 (SeparateSizeAndChars) to String (SizePrefix) for dictionary
-/// encoding. Returns the original type unchanged for non-String types.
-DataTypePtr toDictEncodingType(const DataTypePtr & type)
-{
-    if (const auto * nullable = typeid_cast<const DataTypeNullable *>(type.get()))
-    {
-        auto inner = removeNullable(type);
-        if (inner && inner->getTypeId() == TypeIndex::String)
-        {
-            auto sp = std::make_shared<DataTypeString>(DataTypeString::SerdesFormat::SizePrefix);
-            return makeNullable(sp);
-        }
-    }
-    else if (type->getTypeId() == TypeIndex::String)
-    {
-        return std::make_shared<DataTypeString>(DataTypeString::SerdesFormat::SizePrefix);
-    }
-    return type;
-}
-
-bool isStringFamily(const DataTypePtr & type)
-{
-    auto inner = removeNullable(type);
-    return inner && inner->getTypeId() == TypeIndex::String;
-}
-} // namespace
 
 DMFileWriter::DMFileWriter(
     const DMFilePtr & dmfile_,
@@ -96,13 +68,11 @@ DMFileWriter::DMFileWriter(
         auto type = removeNullable(cd.type);
         bool do_index = cd.id == MutSup::extra_handle_id || type->isInteger() || type->isDateOrDateTime();
 
-        // For String columns, use SizePrefix format + Dictionary codec on disk.
-        // This stores dictionary + integer IDs instead of repeated strings,
-        // reducing I/O by ~8x for low-cardinality columns.
+        // Dictionary codec on disk is disabled: for short strings with low NDV,
+        // StringV2+LZ4 achieves better compression than Dictionary+LZ4 on random
+        // UInt8 IDs. Compute savings come from auto-encoding on read instead.
         auto type_on_disk = cd.type;
-        bool use_dict = isStringFamily(cd.type);
-        if (use_dict)
-            type_on_disk = toDictEncodingType(cd.type);
+        bool use_dict = false;
 
         addStreams(cd.id, type_on_disk, do_index, use_dict);
         dmfile->meta->getColumnStats().emplace(
