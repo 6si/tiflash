@@ -17,6 +17,7 @@
 #include <AggregateFunctions/AggregateFunctionArray.h>
 #include <AggregateFunctions/AggregateFunctionState.h>
 #include <Columns/ColumnDictionary.h>
+#include <Columns/ColumnNullable.h>
 #include <Common/FailPoint.h>
 #include <Common/Stopwatch.h>
 #include <Common/ThresholdUtils.h>
@@ -1149,10 +1150,10 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                 }
             }
             // Case 2: key is ColumnString — auto-encode if low cardinality.
-            // NOTE: Nullable<ColumnString> is NOT handled here because the visit_cache
-            // fast path does not check the null map. Null rows would be incorrectly
-            // grouped. Nullable support requires adding null-map handling to
-            // executeDictionaryKeyFastPath (future improvement).
+            // NOTE: Nullable<ColumnString> is intentionally NOT handled here. The
+            // visit_cache fast path would need to store a separate null aggregate
+            // state in the hash table's merge/output path, which is non-trivial.
+            // For now, Nullable keys fall back to the standard aggregation path.
             else if (const auto * col_str = typeid_cast<const ColumnString *>(key_columns[i]))
             {
                 static constexpr size_t MIN_ROWS_FOR_AUTO_ENCODE = 256;

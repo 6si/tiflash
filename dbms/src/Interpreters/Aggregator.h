@@ -1002,6 +1002,9 @@ public:
         const PaddedPODArray<UInt32> * dict_ids = nullptr;
         std::vector<StringRef> dict_entries_refs;
         size_t dict_size = 0;
+        /// Null map for Nullable<ColumnString> keys. When non-null, rows where
+        /// (*dict_null_map)[i] != 0 are null and get a separate aggregate state.
+        const PaddedPODArray<UInt8> * dict_null_map = nullptr;
         /// Holds the auto-encoded ColumnDictionary when we build one on-the-fly
         /// from a low-cardinality ColumnString key. Prevents dangling pointers.
         ColumnPtr auto_encoded_dict_col;
@@ -1028,6 +1031,7 @@ public:
             dict_ids = nullptr;
             dict_entries_refs.clear();
             dict_size = 0;
+            dict_null_map = nullptr;
             auto_encoded_dict_col = nullptr;
         }
     };
