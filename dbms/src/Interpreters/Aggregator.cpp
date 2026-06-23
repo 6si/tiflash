@@ -1188,9 +1188,13 @@ void Aggregator::AggProcessInfo::prepareForAgg()
         {
             const auto & key_type
                 = aggregator->params.src_header.safeGetByPosition(aggregator->params.keys[0]).type;
-            bool has_collation = !aggregator->params.collators.empty()
-                && aggregator->params.collators[0] != nullptr;
-            if (key_type->isString() && !has_collation)
+            const auto * collator = (!aggregator->params.collators.empty())
+                ? aggregator->params.collators[0]
+                : nullptr;
+            bool collation_safe = (collator == nullptr)
+                || collator->isBinary()
+                || collator->isPaddingBinary();
+            if (key_type->isString() && collation_safe)
             {
                 dks.id_to_value.reserve(Aggregator::DictKeyState::ACTIVATION_THRESHOLD);
                 dks.original_key_type = key_type;

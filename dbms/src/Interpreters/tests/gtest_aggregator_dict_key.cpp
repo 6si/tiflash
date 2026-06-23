@@ -423,4 +423,117 @@ TEST_F(AggregatorDictKeyTest, DictKeyState_GetOrInsert)
     EXPECT_FALSE(dks.failed);
 }
 
+/// Test that dict-key path activates with binary collation (utf8mb4_bin)
+TEST_F(AggregatorDictKeyTest, BinaryCollation_StillActivates)
+try
+{
+    auto block = makeStringKeyBlock(
+        {"US", "UK", "DE", "FR", "JP", "US", "UK", "DE", "FR", "JP"},
+        {10, 20, 30, 40, 50, 60, 70, 80, 90, 100});
+
+    auto context = TiFlashTestEnv::getContext();
+    ColumnNumbers keys = {0};
+    AggregateDescriptions agg_descs;
+    AggregateDescription desc;
+    desc.column_name = "sum_val";
+    desc.arguments = {1};
+    DataTypes arg_types = {std::make_shared<DataTypeInt64>()};
+    desc.function = AggregateFunctionFactory::instance().get(*context, "sum", arg_types);
+    desc.parameters = Array();
+    agg_descs.push_back(desc);
+
+    // utf8mb4_bin collation (padding binary)
+    auto collator = TiDB::ITiDBCollator::getCollator("utf8mb4_bin");
+    TiDB::TiDBCollators collators = {collator};
+
+    Aggregator::Params params(
+        block.cloneEmpty(),
+        keys,
+        /*key_ref_agg_func=*/{},
+        /*agg_func_ref_key=*/{},
+        agg_descs,
+        /*group_by_two_level_threshold=*/0,
+        /*group_by_two_level_threshold_bytes=*/0,
+        /*max_bytes_before_external_group_by=*/0,
+        /*empty_result_for_aggregation_by_empty_set=*/false,
+        SpillConfig("/tmp/tiflash_test_spill", "test", 0, 0, 0, nullptr),
+        /*max_block_size=*/65536,
+        /*use_magic_hash=*/false,
+        collators);
+
+    auto aggregator = std::make_unique<Aggregator>(
+        params,
+        "test",
+        /*concurrency=*/1,
+        /*register_operator_spill_context=*/nullptr,
+        /*is_auto_pass_through=*/false,
+        /*use_magic_hash=*/false);
+
+    auto data = std::make_shared<AggregatedDataVariants>();
+    Aggregator::AggProcessInfo info(aggregator.get());
+    info.resetBlock(block);
+    aggregator->executeOnBlock(info, *data, 0);
+
+    EXPECT_TRUE(aggregator->dict_key_state.isActive())
+        << "Dict-key path should activate with utf8mb4_bin collation";
+    EXPECT_EQ(aggregator->dict_key_state.id_to_value.size(), 5u);
+}
+CATCH
+
+/// Test that dict-key path does NOT activate with case-insensitive collation
+TEST_F(AggregatorDictKeyTest, CICollation_DoesNotActivate)
+try
+{
+    auto block = makeStringKeyBlock(
+        {"US", "UK", "DE", "FR", "JP"},
+        {10, 20, 30, 40, 50});
+
+    auto context = TiFlashTestEnv::getContext();
+    ColumnNumbers keys = {0};
+    AggregateDescriptions agg_descs;
+    AggregateDescription desc;
+    desc.column_name = "sum_val";
+    desc.arguments = {1};
+    DataTypes arg_types = {std::make_shared<DataTypeInt64>()};
+    desc.function = AggregateFunctionFactory::instance().get(*context, "sum", arg_types);
+    desc.parameters = Array();
+    agg_descs.push_back(desc);
+
+    // utf8mb4_general_ci collation (case-insensitive — NOT safe for dict-key)
+    auto collator = TiDB::ITiDBCollator::getCollator("utf8mb4_general_ci");
+    TiDB::TiDBCollators collators = {collator};
+
+    Aggregator::Params params(
+        block.cloneEmpty(),
+        keys,
+        /*key_ref_agg_func=*/{},
+        /*agg_func_ref_key=*/{},
+        agg_descs,
+        /*group_by_two_level_threshold=*/0,
+        /*group_by_two_level_threshold_bytes=*/0,
+        /*max_bytes_before_external_group_by=*/0,
+        /*empty_result_for_aggregation_by_empty_set=*/false,
+        SpillConfig("/tmp/tiflash_test_spill", "test", 0, 0, 0, nullptr),
+        /*max_block_size=*/65536,
+        /*use_magic_hash=*/false,
+        collators);
+
+    auto aggregator = std::make_unique<Aggregator>(
+        params,
+        "test",
+        /*concurrency=*/1,
+        /*register_operator_spill_context=*/nullptr,
+        /*is_auto_pass_through=*/false,
+        /*use_magic_hash=*/false);
+
+    auto data = std::make_shared<AggregatedDataVariants>();
+    Aggregator::AggProcessInfo info(aggregator.get());
+    info.resetBlock(block);
+    aggregator->executeOnBlock(info, *data, 0);
+
+    EXPECT_FALSE(aggregator->dict_key_state.isActive())
+        << "Dict-key path should NOT activate with case-insensitive collation";
+}
+CATCH
+
 } // namespace DB::tests
