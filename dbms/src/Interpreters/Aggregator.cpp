@@ -1243,7 +1243,7 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                 || collator->isBinary()
                 || collator->isPaddingBinary();
 
-            LOG_INFO(
+            LOG_ERROR(
                 aggregator->log,
                 "DICTKEY_DIAG init: keys_size={} key_type={} inner_type={} is_nullable={} "
                 "has_collator={} collation_safe={} isString={} block_rows={} col_name={}",
@@ -1280,7 +1280,7 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                         inner_col = &nullable_col->getNestedColumn();
                 }
 
-                LOG_INFO(
+                LOG_ERROR(
                     aggregator->log,
                     "DICTKEY_DIAG col_check: inner_col_type={} isDictionary={} isString={} col_size={}",
                     demangle(typeid(*inner_col).name()),
@@ -1304,7 +1304,7 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                         dks.active = true;
                         aggregator->effective_method_chosen = AggregatedDataVariants::Type::key16;
                         aggregator->key_sizes = {2};
-                        LOG_INFO(
+                        LOG_ERROR(
                             aggregator->log,
                             "DICTKEY_DIAG ACTIVATED (ColumnDictionary{}): {} groups -> key16 FixedHashMap",
                             is_nullable ? ", nullable" : "",
@@ -1312,7 +1312,7 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                     }
                     else
                     {
-                        LOG_INFO(
+                        LOG_ERROR(
                             aggregator->log,
                             "DICTKEY_DIAG SKIPPED: ColumnDictionary dict_size={} exceeds threshold={}",
                             dict_size,
@@ -1341,7 +1341,7 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                             dks.active = true;
                             aggregator->effective_method_chosen = AggregatedDataVariants::Type::key16;
                             aggregator->key_sizes = {2};
-                            LOG_INFO(
+                            LOG_ERROR(
                                 aggregator->log,
                                 "DICTKEY_DIAG ACTIVATED (ColumnString{}): {} distinct values -> key16 FixedHashMap",
                                 is_nullable ? ", nullable" : "",
@@ -1349,7 +1349,7 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                         }
                         else
                         {
-                            LOG_INFO(
+                            LOG_ERROR(
                                 aggregator->log,
                                 "DICTKEY_DIAG SKIPPED: ColumnString too_many={} dict_size={} failed={}",
                                 too_many,
@@ -1359,7 +1359,7 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                     }
                     else
                     {
-                        LOG_INFO(
+                        LOG_ERROR(
                             aggregator->log,
                             "DICTKEY_DIAG SKIPPED: inner_col is neither ColumnDictionary nor ColumnString, "
                             "type={}",
@@ -1369,7 +1369,7 @@ void Aggregator::AggProcessInfo::prepareForAgg()
             }
             else
             {
-                LOG_INFO(
+                LOG_ERROR(
                     aggregator->log,
                     "DICTKEY_DIAG SKIPPED: type/collation check failed isString={} collation_safe={}",
                     inner_type->isString(),
@@ -1378,7 +1378,7 @@ void Aggregator::AggProcessInfo::prepareForAgg()
         }
         else
         {
-            LOG_INFO(
+            LOG_ERROR(
                 aggregator->log,
                 "DICTKEY_DIAG SKIPPED: precondition failed keys_size={} header_columns={}",
                 aggregator->params.keys_size,
