@@ -614,4 +614,146 @@ try
 }
 CATCH
 
+/// Test that padding-binary collation (utf8mb4_bin) correctly normalizes trailing spaces
+TEST_F(AggregatorDictKeyTest, PaddingBinary_TrailingSpacesNormalized)
+try
+{
+    // "US", "US " (1 space), "US  " (2 spaces) should all map to same dict ID
+    auto block = makeStringKeyBlock(
+        {"US", "US ", "US  ", "UK", "UK "},
+        {10, 20, 30, 40, 50});
+
+    auto context = TiFlashTestEnv::getContext();
+    ColumnNumbers keys = {0};
+    AggregateDescriptions agg_descs;
+    AggregateDescription desc;
+    desc.column_name = "sum_val";
+    desc.arguments = {1};
+    DataTypes arg_types = {std::make_shared<DataTypeInt64>()};
+    desc.function = AggregateFunctionFactory::instance().get(*context, "sum", arg_types);
+    desc.parameters = Array();
+    agg_descs.push_back(desc);
+
+    // utf8mb4_bin collation (padding binary — strips trailing spaces)
+    auto collator = TiDB::ITiDBCollator::getCollator("utf8mb4_bin");
+    TiDB::TiDBCollators collators = {collator};
+
+    Aggregator::Params params(
+        block.cloneEmpty(),
+        keys,
+        /*key_ref_agg_func=*/{},
+        /*agg_func_ref_key=*/{},
+        agg_descs,
+        /*group_by_two_level_threshold=*/0,
+        /*group_by_two_level_threshold_bytes=*/0,
+        /*max_bytes_before_external_group_by=*/0,
+        /*empty_result_for_aggregation_by_empty_set=*/false,
+        SpillConfig("/tmp/tiflash_test_spill", "test", 0, 0, 0, nullptr),
+        /*max_block_size=*/65536,
+        /*use_magic_hash=*/false,
+        collators);
+
+    auto aggregator = std::make_unique<Aggregator>(
+        params,
+        "test",
+        /*concurrency=*/1,
+        /*register_operator_spill_context=*/nullptr,
+        /*is_auto_pass_through=*/false,
+        /*use_magic_hash=*/false);
+
+    auto data = std::make_shared<AggregatedDataVariants>();
+    Aggregator::AggProcessInfo info(aggregator.get());
+    info.resetBlock(block);
+    aggregator->executeOnBlock(info, *data, 0);
+
+    EXPECT_TRUE(aggregator->dict_key_state.isActive());
+    EXPECT_TRUE(aggregator->dict_key_state.padding_binary);
+    // "US", "US ", "US  " should all normalize to "US" → 2 distinct groups, not 4
+    EXPECT_EQ(aggregator->dict_key_state.id_to_value.size(), 2u)
+        << "Trailing spaces should be normalized for padding-binary collation";
+
+    // Verify sums: US group = 10+20+30=60, UK group = 40+50=90
+    ManyAggregatedDataVariants many_data;
+    many_data.push_back(std::move(data));
+    auto merging = aggregator->mergeAndConvertToBlocks(many_data, /*final=*/true, /*max_threads=*/1);
+    Int64 total_sum = 0;
+    size_t total_rows = 0;
+    if (merging)
+    {
+        while (true)
+        {
+            Block out = merging->getData(0);
+            if (!out)
+                break;
+            total_rows += out.rows();
+            auto & sum_col = typeid_cast<const ColumnVector<Int64> &>(*out.getByName("sum_val").column);
+            for (size_t i = 0; i < out.rows(); ++i)
+                total_sum += sum_col.getData()[i];
+        }
+    }
+    EXPECT_EQ(total_rows, 2u);
+    EXPECT_EQ(total_sum, 150); // 60 + 90
+}
+CATCH
+
+/// Test that pure BINARY collation does NOT normalize trailing spaces
+TEST_F(AggregatorDictKeyTest, PureBinary_TrailingSpacesPreserved)
+try
+{
+    // With pure BINARY collation, "US" and "US " are DIFFERENT keys
+    auto block = makeStringKeyBlock(
+        {"US", "US ", "UK"},
+        {10, 20, 30});
+
+    auto context = TiFlashTestEnv::getContext();
+    ColumnNumbers keys = {0};
+    AggregateDescriptions agg_descs;
+    AggregateDescription desc;
+    desc.column_name = "sum_val";
+    desc.arguments = {1};
+    DataTypes arg_types = {std::make_shared<DataTypeInt64>()};
+    desc.function = AggregateFunctionFactory::instance().get(*context, "sum", arg_types);
+    desc.parameters = Array();
+    agg_descs.push_back(desc);
+
+    // Pure BINARY collation (no padding — exact byte comparison)
+    auto collator = TiDB::ITiDBCollator::getCollator("binary");
+    TiDB::TiDBCollators collators = {collator};
+
+    Aggregator::Params params(
+        block.cloneEmpty(),
+        keys,
+        /*key_ref_agg_func=*/{},
+        /*agg_func_ref_key=*/{},
+        agg_descs,
+        /*group_by_two_level_threshold=*/0,
+        /*group_by_two_level_threshold_bytes=*/0,
+        /*max_bytes_before_external_group_by=*/0,
+        /*empty_result_for_aggregation_by_empty_set=*/false,
+        SpillConfig("/tmp/tiflash_test_spill", "test", 0, 0, 0, nullptr),
+        /*max_block_size=*/65536,
+        /*use_magic_hash=*/false,
+        collators);
+
+    auto aggregator = std::make_unique<Aggregator>(
+        params,
+        "test",
+        /*concurrency=*/1,
+        /*register_operator_spill_context=*/nullptr,
+        /*is_auto_pass_through=*/false,
+        /*use_magic_hash=*/false);
+
+    auto data = std::make_shared<AggregatedDataVariants>();
+    Aggregator::AggProcessInfo info(aggregator.get());
+    info.resetBlock(block);
+    aggregator->executeOnBlock(info, *data, 0);
+
+    EXPECT_TRUE(aggregator->dict_key_state.isActive());
+    EXPECT_FALSE(aggregator->dict_key_state.padding_binary);
+    // "US" and "US " are different keys under pure BINARY → 3 distinct groups
+    EXPECT_EQ(aggregator->dict_key_state.id_to_value.size(), 3u)
+        << "Trailing spaces should be preserved for pure BINARY collation";
+}
+CATCH
+
 } // namespace DB::tests
