@@ -340,4 +340,71 @@ TEST_F(ColumnDictionaryTest, ConvertToFullColumnIfDictionaryNonDict)
     ASSERT_EQ(result.get(), ptr.get());
 }
 
+TEST_F(ColumnDictionaryTest, ScatterTo)
+{
+    // Reproduces the MPP HashPartition crash: ColumnDictionary must support
+    // scatterTo for exchange sender to partition data across TiFlash nodes.
+    auto col = createTestColumn();
+    size_t n = col->size();
+    ASSERT_TRUE(col->isDictionaryEncoded());
+
+    // Create 2 target partitions
+    IColumn::ScatterColumns targets(2);
+    targets[0] = ColumnString::create()->assumeMutable();
+    targets[1] = ColumnString::create()->assumeMutable();
+
+    // Build selector: even rows → partition 0, odd → partition 1
+    IColumn::Selector selector(n);
+    size_t count0 = 0, count1 = 0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        selector[i] = i % 2;
+        if (i % 2 == 0)
+            ++count0;
+        else
+            ++count1;
+    }
+
+    col->scatterTo(targets, selector);
+    ASSERT_EQ(targets[0]->size(), count0);
+    ASSERT_EQ(targets[1]->size(), count1);
+
+    // Verify values are correct
+    size_t idx0 = 0, idx1 = 0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        Field orig_val;
+        col->get(i, orig_val);
+        if (i % 2 == 0)
+        {
+            Field target_val;
+            targets[0]->get(idx0++, target_val);
+            ASSERT_EQ(orig_val, target_val);
+        }
+        else
+        {
+            Field target_val;
+            targets[1]->get(idx1++, target_val);
+            ASSERT_EQ(orig_val, target_val);
+        }
+    }
+}
+
+TEST_F(ColumnDictionaryTest, Scatter)
+{
+    auto col = createTestColumn();
+    size_t n = col->size();
+    IColumn::Selector selector(n);
+    for (size_t i = 0; i < n; ++i)
+        selector[i] = i % 3;
+
+    auto scattered = col->scatter(3, selector);
+    ASSERT_EQ(scattered.size(), 3);
+
+    size_t total = 0;
+    for (auto & part : scattered)
+        total += part->size();
+    ASSERT_EQ(total, n);
+}
+
 } // namespace DB::tests

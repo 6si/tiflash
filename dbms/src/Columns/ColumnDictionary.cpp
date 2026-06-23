@@ -114,27 +114,78 @@ ColumnPtr ColumnDictionary::tryAutoEncode(
 
     const size_t num_rows = col_str->size();
 
+    // For very low cardinality (common case: 5-50 entries), linear scan of a
+    // small vector is faster than unordered_map due to no heap allocation per
+    // node and better cache locality. Switch to hash map only above threshold.
+    static constexpr size_t LINEAR_SCAN_THRESHOLD = 64;
+
     std::vector<Field> dict_entries;
-    std::unordered_map<StringRef, UInt32> dict_map;
     PaddedPODArray<UInt32> ids;
     ids.reserve(num_rows);
+
+    // dict_refs holds StringRefs pointing into ColumnString's stable buffer.
+    // Used for O(1) comparison during linear scan (no string copy needed).
+    std::vector<StringRef> dict_refs;
+    dict_refs.reserve(std::min(static_cast<size_t>(max_dict_size), LINEAR_SCAN_THRESHOLD));
+
+    bool use_linear = true;
+    std::unordered_map<StringRef, UInt32> dict_map;
 
     for (size_t i = 0; i < num_rows; ++i)
     {
         StringRef ref = col_str->getDataAt(i);
-        auto it = dict_map.find(ref);
-        if (it != dict_map.end())
+
+        if (use_linear)
         {
-            ids.push_back(it->second);
+            // Linear scan for small dictionaries
+            UInt32 found_id = static_cast<UInt32>(dict_refs.size());
+            for (size_t d = 0; d < dict_refs.size(); ++d)
+            {
+                if (dict_refs[d] == ref)
+                {
+                    found_id = static_cast<UInt32>(d);
+                    break;
+                }
+            }
+
+            if (found_id < dict_refs.size())
+            {
+                ids.push_back(found_id);
+            }
+            else
+            {
+                if (dict_entries.size() >= max_dict_size)
+                    return column;
+                dict_refs.push_back(ref);
+                dict_entries.emplace_back(String(ref.data, ref.size));
+                ids.push_back(found_id);
+
+                // Switch to hash map when linear scan becomes too expensive
+                if (dict_refs.size() >= LINEAR_SCAN_THRESHOLD)
+                {
+                    use_linear = false;
+                    for (size_t d = 0; d < dict_refs.size(); ++d)
+                        dict_map[dict_refs[d]] = static_cast<UInt32>(d);
+                }
+            }
         }
         else
         {
-            if (dict_entries.size() >= max_dict_size)
-                return column; // cardinality too high, keep original
-            UInt32 new_id = static_cast<UInt32>(dict_entries.size());
-            dict_map[ref] = new_id;
-            dict_entries.emplace_back(String(ref.data, ref.size));
-            ids.push_back(new_id);
+            // Hash map for larger dictionaries
+            auto it = dict_map.find(ref);
+            if (it != dict_map.end())
+            {
+                ids.push_back(it->second);
+            }
+            else
+            {
+                if (dict_entries.size() >= max_dict_size)
+                    return column;
+                UInt32 new_id = static_cast<UInt32>(dict_entries.size());
+                dict_map[ref] = new_id;
+                dict_entries.emplace_back(String(ref.data, ref.size));
+                ids.push_back(new_id);
+            }
         }
     }
 

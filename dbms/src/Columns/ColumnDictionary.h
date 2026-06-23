@@ -409,24 +409,28 @@ public:
 
     void forEachSubcolumn(ColumnCallback) override {}
 
-    ScatterColumns scatter(ColumnIndex /*num_columns*/, const Selector & /*selector*/) const override
+    ScatterColumns scatter(ColumnIndex num_columns, const Selector & selector) const override
     {
-        throw Exception("scatter not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        auto materialized = decode();
+        return materialized->scatter(num_columns, selector);
     }
 
-    ScatterColumns scatter(ColumnIndex /*num_columns*/, const Selector & /*selector*/, const BlockSelective & /*selective*/) const override
+    ScatterColumns scatter(ColumnIndex num_columns, const Selector & selector, const BlockSelective & selective) const override
     {
-        throw Exception("scatter not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        auto materialized = decode();
+        return materialized->scatter(num_columns, selector, selective);
     }
 
-    void scatterTo(ScatterColumns & /*columns*/, const Selector & /*selector*/) const override
+    void scatterTo(ScatterColumns & columns, const Selector & selector) const override
     {
-        throw Exception("scatterTo not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        auto materialized = decode();
+        materialized->scatterTo(columns, selector);
     }
 
-    void scatterTo(ScatterColumns & /*columns*/, const Selector & /*selector*/, const BlockSelective & /*selective*/) const override
+    void scatterTo(ScatterColumns & columns, const Selector & selector, const BlockSelective & selective) const override
     {
-        throw Exception("scatterTo not supported for ColumnDictionary", ErrorCodes::NOT_IMPLEMENTED);
+        auto materialized = decode();
+        materialized->scatterTo(columns, selector, selective);
     }
 
     void gather(ColumnGathererStream & /*gatherer_stream*/) override
