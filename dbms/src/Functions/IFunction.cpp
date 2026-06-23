@@ -284,10 +284,11 @@ bool IExecutableFunction::defaultImplementationForDictionaryColumns(
             if (num_rows >= MIN_ROWS_FOR_AUTO_ENCODE)
             {
                 const auto * col_str = typeid_cast<const ColumnString *>(col.get());
-                // Build dictionary — use String keys (not StringRef) to avoid
-                // dangling pointers when dict_entries vector reallocates.
+                // StringRef keys point into the ColumnString's stable internal buffer.
+                // dict_entries stores copies for ColumnDictionary but is NOT used as
+                // hash map keys (avoids vector-reallocation dangling pointer bug).
                 std::vector<Field> dict_entries;
-                std::unordered_map<String, UInt32> dict_map;
+                std::unordered_map<StringRef, UInt32> dict_map;
                 PaddedPODArray<UInt32> ids;
                 ids.reserve(num_rows);
                 bool success = true;
@@ -295,8 +296,7 @@ bool IExecutableFunction::defaultImplementationForDictionaryColumns(
                 for (size_t i = 0; i < num_rows; ++i)
                 {
                     StringRef ref = col_str->getDataAt(i);
-                    String key(ref.data, ref.size);
-                    auto it = dict_map.find(key);
+                    auto it = dict_map.find(ref);
                     if (it != dict_map.end())
                     {
                         ids.push_back(it->second);
@@ -309,8 +309,8 @@ bool IExecutableFunction::defaultImplementationForDictionaryColumns(
                             break;
                         }
                         UInt32 new_id = static_cast<UInt32>(dict_entries.size());
-                        dict_map[key] = new_id;
-                        dict_entries.emplace_back(std::move(key));
+                        dict_map[ref] = new_id;
+                        dict_entries.emplace_back(String(ref.data, ref.size));
                         ids.push_back(new_id);
                     }
                 }

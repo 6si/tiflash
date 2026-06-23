@@ -1156,10 +1156,12 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                 const size_t num_rows = col_str->size();
                 if (num_rows >= MIN_ROWS_FOR_AUTO_ENCODE)
                 {
-                    // Use String keys (not StringRef) to avoid dangling pointers
-                    // when dict_entries vector reallocates.
+                    // StringRef keys point into the ColumnString's internal buffer
+                    // which is stable for the block's lifetime. dict_entries stores
+                    // copies for ColumnDictionary creation but is NOT referenced by
+                    // the hash map (avoids the vector-reallocation dangling pointer bug).
                     std::vector<Field> dict_entries;
-                    std::unordered_map<String, UInt32> dict_map;
+                    std::unordered_map<StringRef, UInt32> dict_map;
                     PaddedPODArray<UInt32> ids;
                     ids.reserve(num_rows);
                     bool success = true;
@@ -1167,8 +1169,7 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                     for (size_t r = 0; r < num_rows; ++r)
                     {
                         StringRef ref = col_str->getDataAt(r);
-                        String key(ref.data, ref.size);
-                        auto it = dict_map.find(key);
+                        auto it = dict_map.find(ref);
                         if (it != dict_map.end())
                         {
                             ids.push_back(it->second);
@@ -1181,8 +1182,8 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                                 break;
                             }
                             UInt32 new_id = static_cast<UInt32>(dict_entries.size());
-                            dict_map[key] = new_id;
-                            dict_entries.emplace_back(std::move(key));
+                            dict_map[ref] = new_id;
+                            dict_entries.emplace_back(String(ref.data, ref.size));
                             ids.push_back(new_id);
                         }
                     }
