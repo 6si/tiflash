@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <Columns/ColumnDictionary.h>
 #include <IO/Compression/ICompressionCodec.h>
 
 namespace DB
@@ -22,11 +23,15 @@ namespace DB
 /**
  * Dictionary compression codec for string columns with low cardinality.
  *
- * Compressed format:
- *   [dict_size: UInt32]                               - number of dictionary entries
- *   [entry_0_len: VarUInt][entry_0_data: bytes]...    - dictionary entries (length-prefixed)
- *   [num_rows: UInt32]                                - number of rows
- *   [ids: UInt32[num_rows]]                           - per-row dictionary IDs
+ * Compressed format (v2 — adaptive index width):
+ *   [index_width: UInt8]   - 1=UInt8 ids, 2=UInt16 ids, 0=raw fallback
+ *   If index_width > 0 (dictionary encoded):
+ *     [dict_size: UInt16]                               - number of dictionary entries
+ *     [entry_0_len: VarUInt][entry_0_data: bytes]...    - dictionary entries (length-prefixed)
+ *     [num_rows: UInt32]                                - number of rows
+ *     [ids: UInt8[num_rows] or UInt16[num_rows]]        - per-row dictionary IDs
+ *   If index_width == 0 (raw fallback for high NDV):
+ *     [raw SizePrefix data, unmodified]
  *
  * The uncompressed format (for standard decompression) is:
  *   TiFlash SizePrefix format: [VarUInt length][string bytes] per row
@@ -44,6 +49,15 @@ public:
     UInt8 getMethodByte() const override;
 
     bool isCompression() const override { return true; }
+
+    /// Decompress directly into a ColumnDictionary without materializing
+    /// to intermediate ColumnString. Returns nullptr if the block is a
+    /// raw fallback block (index_width == 0).
+    ColumnPtr decompressAsColumnDictionary(
+        const char * source,
+        UInt32 source_size,
+        UInt32 uncompressed_size,
+        const DataTypePtr & value_type) const;
 
 protected:
     UInt32 doCompressData(const char * source, UInt32 source_size, char * dest) const override;

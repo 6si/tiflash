@@ -24,6 +24,8 @@
 #include <Storages/DeltaMerge/File/DMFile.h>
 #include <Storages/DeltaMerge/Index/MinMaxIndex.h>
 
+#include <unordered_map>
+
 namespace DB::DM
 {
 
@@ -106,9 +108,12 @@ public:
         {
             // Force use Lightweight compression for string sizes, since the string sizes almost always small.
             // Performance of LZ4 to decompress such integers is not good.
-            return isStringSizes(type, file_base_name)
-                ? CompressionSetting{CompressionMethod::Lightweight, CompressionDataType::Int64}
-                : CompressionSetting::create<>(setting.method, setting.level, *type);
+            if (isStringSizes(type, file_base_name))
+                return CompressionSetting{CompressionMethod::Lightweight, CompressionDataType::Int64};
+            // Dictionary codec is passed through directly — it handles String data natively.
+            if (setting.method_byte == CompressionMethodByte::Dictionary)
+                return setting;
+            return CompressionSetting::create<>(setting.method, setting.level, *type);
         }
 
         // compressed_buf -> plain_file
@@ -177,7 +182,7 @@ private:
     /// Add streams with specified column id. Since a single column may have more than one Stream,
     /// for example Nullable column has a NullMap column, we would track them with a mapping
     /// FileNameBase -> Stream.
-    void addStreams(ColId col_id, DataTypePtr type, bool do_index);
+    void addStreams(ColId col_id, DataTypePtr type, bool do_index, bool use_dict = false);
 
     WriteBufferFromFileBasePtr createMetaFile();
     void finalizeMeta();
@@ -197,6 +202,10 @@ private:
     WriteBufferFromFileBasePtr meta_file;
 
     DMFileMetaV2::MergedFileWriter merged_file;
+
+    // Mapping from col_id to SizePrefix DataTypePtr for dictionary-encoded String columns.
+    // These columns are serialized with SizePrefix format + Dictionary compression codec.
+    std::unordered_map<ColId, DataTypePtr> dict_encoded_types;
 
     // use to avoid count data written in index file for empty dmfile
     bool is_empty_file = true;
