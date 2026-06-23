@@ -290,6 +290,37 @@ TEST_F(AggregatorDictKeyTest, DictColumnKey_SumCorrectness)
     EXPECT_EQ(results.size(), 3u);
 }
 
+/// Cross-segment ColumnDictionary with different dictionary orderings
+/// Simulates two DMFile segments where the same strings have different dict IDs.
+TEST_F(AggregatorDictKeyTest, CrossSegment_DifferentDictOrder)
+try
+{
+    // Segment 1: dict = {"US", "UK", "DE"}, IDs: US=0, UK=1, DE=2
+    auto block1 = makeDictKeyBlock(
+        {"US", "UK", "DE"},
+        {0, 1, 2, 0},
+        {10, 20, 30, 40});
+
+    // Segment 2: dict = {"DE", "US", "UK"} — DIFFERENT ordering!
+    // IDs: DE=0, US=1, UK=2
+    auto block2 = makeDictKeyBlock(
+        {"DE", "US", "UK"},
+        {1, 0, 2, 1}, // US(1), DE(0), UK(2), US(1)
+        {100, 200, 300, 400});
+
+    auto aggregator = makeSumAggregator(block1.cloneEmpty());
+    auto results_blocks = runAggregation(*aggregator, {block1, block2});
+    auto results = collectSumResults(results_blocks);
+
+    // block1: US=10+40=50, UK=20, DE=30
+    // block2: US=100+400=500, DE=200, UK=300
+    EXPECT_EQ(results.size(), 3u);
+    EXPECT_EQ(results["US"], 550);  // 50 + 500
+    EXPECT_EQ(results["UK"], 320);  // 20 + 300
+    EXPECT_EQ(results["DE"], 230);  // 30 + 200
+}
+CATCH
+
 /// Single group value
 TEST_F(AggregatorDictKeyTest, SingleGroup)
 {
