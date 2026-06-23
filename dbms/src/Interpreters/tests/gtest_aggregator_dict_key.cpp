@@ -321,6 +321,34 @@ try
 }
 CATCH
 
+/// Mixed: first block ColumnDictionary, second block ColumnString
+/// Simulates when some segments are dict-encoded and others are plain strings.
+TEST_F(AggregatorDictKeyTest, MixedInput_DictThenString)
+try
+{
+    // First block: ColumnDictionary with dict = {"US", "UK", "DE"}
+    auto block1 = makeDictKeyBlock(
+        {"US", "UK", "DE"},
+        {0, 1, 2},
+        {10, 20, 30});
+
+    // Second block: plain ColumnString (from a non-dict-encoded segment)
+    auto block2 = makeStringKeyBlock(
+        {"US", "DE", "JP"}, // JP is new — not in block1's dictionary
+        {100, 200, 300});
+
+    auto aggregator = makeSumAggregator(block1.cloneEmpty());
+    auto results_blocks = runAggregation(*aggregator, {block1, block2});
+    auto results = collectSumResults(results_blocks);
+
+    EXPECT_EQ(results.size(), 4u);
+    EXPECT_EQ(results["US"], 110);  // 10 + 100
+    EXPECT_EQ(results["UK"], 20);
+    EXPECT_EQ(results["DE"], 230);  // 30 + 200
+    EXPECT_EQ(results["JP"], 300);  // new key from string block
+}
+CATCH
+
 /// Single group value
 TEST_F(AggregatorDictKeyTest, SingleGroup)
 {
