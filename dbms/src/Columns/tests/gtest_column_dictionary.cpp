@@ -298,6 +298,42 @@ TEST_F(ColumnDictionaryTest, MaterializeBeforeInsertRangeFrom)
     }
 }
 
+TEST_F(ColumnDictionaryTest, ColumnStringInsertRangeFromDictionary)
+{
+    // Tests the defensive fix in ColumnString::insertRangeFrom that handles
+    // ColumnDictionary source directly (decodes before inserting).
+    // This simulates the delta-stable merge path where the output column is
+    // ColumnString and the stable layer returns ColumnDictionary from disk.
+    auto dict_col = createTestColumn();
+    ASSERT_TRUE(dict_col->isDictionaryEncoded());
+
+    // Insert directly from ColumnDictionary into ColumnString — should NOT crash
+    auto output = ColumnString::create();
+    output->insertRangeFrom(*dict_col, 0, dict_col->size());
+    ASSERT_EQ(output->size(), dict_col->size());
+
+    // Verify values match
+    for (size_t i = 0; i < output->size(); ++i)
+    {
+        Field dict_val, out_val;
+        dict_col->get(i, dict_val);
+        output->get(i, out_val);
+        ASSERT_EQ(dict_val, out_val);
+    }
+
+    // Also test partial range insertion
+    auto output2 = ColumnString::create();
+    output2->insertRangeFrom(*dict_col, 2, 5);
+    ASSERT_EQ(output2->size(), 5);
+    for (size_t i = 0; i < 5; ++i)
+    {
+        Field dict_val, out_val;
+        dict_col->get(i + 2, dict_val);
+        output2->get(i, out_val);
+        ASSERT_EQ(dict_val, out_val);
+    }
+}
+
 TEST_F(ColumnDictionaryTest, FilterPreservesDictionary)
 {
     // Verifies that filter() on ColumnDictionary returns ColumnDictionary

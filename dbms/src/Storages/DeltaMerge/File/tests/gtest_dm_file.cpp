@@ -2046,6 +2046,61 @@ try
 }
 CATCH
 
+TEST_P(DMFileTest, DictionaryOnDiskStringColumn)
+try
+{
+    auto cols = DMTestEnv::getDefaultColumns();
+    ColumnDefine str_col(2, "status", typeFromString(DataTypeString::getDefaultName()));
+    cols->push_back(str_col);
+
+    reload(cols);
+
+    const size_t num_rows_write = 128;
+    // Low cardinality: 5 distinct values repeated across 128 rows
+    std::vector<String> values = {"active", "inactive", "pending", "deleted", "archived"};
+    Strings col_data;
+    col_data.reserve(num_rows_write);
+    for (size_t i = 0; i < num_rows_write; ++i)
+        col_data.push_back(values[i % values.size()]);
+
+    {
+        Block block = DMTestEnv::prepareSimpleWriteBlock(0, num_rows_write, false);
+        block.insert(ColumnWithTypeAndName{
+            DB::tests::makeColumn<String>(str_col.type, col_data),
+            str_col.type,
+            str_col.name,
+            str_col.id});
+
+        auto stream = std::make_unique<DMFileBlockOutputStream>(dbContext(), dm_file, *cols);
+        DMFileBlockOutputStream::BlockProperty block_property;
+        stream->writePrefix();
+        stream->write(block, block_property);
+        stream->writeSuffix();
+    }
+
+    {
+        // Verify the on-disk type is SizePrefix (not StringV2) for dictionary-encoded columns
+        auto type_on_disk = dm_file->getColumnStat(str_col.id).type;
+        ASSERT_EQ(type_on_disk->getName(), "String");
+    }
+
+    {
+        // Read back and verify data correctness
+        DMFileBlockInputStreamBuilder builder(dbContext());
+        auto stream
+            = builder.setColumnCache(column_cache)
+                  .build(dm_file, *cols, RowKeyRanges{RowKeyRange::newAll(false, 1)}, std::make_shared<ScanContext>());
+        ASSERT_INPUTSTREAM_COLS_UR(
+            stream,
+            Strings({DMTestEnv::pk_name, str_col.name}),
+            createColumns({
+                createColumn<Int64>(createNumbers<Int64>(0, num_rows_write)),
+                createColumn<String>(col_data),
+            }));
+    }
+}
+CATCH
+
 TEST_P(DMFileTest, NullableType)
 try
 {
