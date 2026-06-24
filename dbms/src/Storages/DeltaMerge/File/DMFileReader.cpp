@@ -528,40 +528,15 @@ ColumnPtr DMFileReader::readColumn(const ColumnDefine & cd, size_t start_pack_id
     return maybeAutoEncodeColumn(result, cd);
 }
 
-ColumnPtr DMFileReader::maybeAutoEncodeColumn(const ColumnPtr & column, const ColumnDefine & cd) const
+ColumnPtr DMFileReader::maybeAutoEncodeColumn(const ColumnPtr & column, const ColumnDefine & /*cd*/) const
 {
-    // Only auto-encode during query reads — compaction/internal reads must
-    // produce regular columns for merge compatibility.
-    if (read_tag != ReadTag::Query && read_tag != ReadTag::LMFilter)
-        return column;
-
-    // Check if the column type is String or Nullable(String)
-    auto inner_type = removeNullable(cd.type);
-    if (!inner_type || inner_type->getTypeId() != TypeIndex::String)
-        return column;
-
-    auto result = ColumnDictionary::tryAutoEncode(column);
-    if (result.get() != column.get() && scan_context)
-    {
-        // Column was auto-encoded — record stats
-        scan_context->dict_encoded_columns += 1;
-        scan_context->dict_total_rows_encoded += result->size();
-        const auto * dict_col = typeid_cast<const ColumnDictionary *>(result.get());
-        if (!dict_col)
-        {
-            // Nullable wrapping — get nested dictionary
-            if (const auto * nullable = typeid_cast<const ColumnNullable *>(result.get()))
-                dict_col = typeid_cast<const ColumnDictionary *>(nullable->getNestedColumnPtr().get());
-        }
-        if (dict_col)
-        {
-            auto card = dict_col->getDictionarySize();
-            uint64_t prev = scan_context->dict_max_cardinality.load();
-            while (card > prev && !scan_context->dict_max_cardinality.compare_exchange_weak(prev, card))
-                ;
-        }
-    }
-    return result;
+    // Reader-level auto-encoding is disabled: in MPP queries, the
+    // HashPartition exchange materializes ColumnDictionary→ColumnString
+    // via scatterTo(), destroying the dictionary before the Aggregator.
+    // This causes 3x overhead (encode + materialize + re-encode) with no
+    // benefit. The Aggregator's own visit_cache (Case 2) handles encoding
+    // after the exchange, avoiding the scatter overhead.
+    return column;
 }
 
 ColumnPtr DMFileReader::readFromDisk(
