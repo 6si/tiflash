@@ -123,6 +123,13 @@ private:
         const DataTypePtr & type_on_disk,
         size_t start_pack_id,
         size_t read_rows);
+    ColumnPtr wrapNullableForDictColumn(
+        const ColumnPtr & dict_result,
+        const ColumnDefine & cd,
+        const DataTypePtr & type_on_disk,
+        bool is_nullable,
+        size_t start_pack_id,
+        size_t read_rows);
     ColumnPtr readFromDiskOrSharingCache(
         const ColumnDefine & cd,
         const DataTypePtr & type_on_disk,

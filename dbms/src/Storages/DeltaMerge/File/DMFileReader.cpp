@@ -33,6 +33,8 @@
 #include <common/logger_useful.h>
 #include <fmt/format.h>
 
+#include <unordered_map>
+
 
 namespace DB::ErrorCodes
 {
@@ -505,7 +507,9 @@ ColumnPtr DMFileReader::readColumn(const ColumnDefine & cd, size_t start_pack_id
         // (schema) would trigger a spurious cast that can't handle ColumnDictionary.
         // Nullable wrapping is handled inside readFromDiskAsDictionary.
         if (auto dict_col = readFromDiskAsDictionary(cd, type_on_disk, start_pack_id, read_rows))
+        {
             return dict_col;
+        }
         auto column = readFromDiskOrSharingCache(cd, type_on_disk, start_pack_id, pack_count, read_rows);
         // Cast column's data from DataType in disk to what we need now
         auto result = convertColumnByColumnDefineIfNeed(type_on_disk, std::move(column), cd);
@@ -553,58 +557,161 @@ ColumnPtr DMFileReader::readFromDiskAsDictionary(
 
     bool is_nullable = type_on_disk->isNullable();
 
-    // Find the data substream
     const auto data_stream_name = DMFile::getFileNameBase(cd.id);
     auto data_iter = column_streams.find(data_stream_name);
     if (data_iter == column_streams.end())
         return nullptr;
     auto & data_stream = data_iter->second;
 
-    // Only attempt dictionary path when starting at a block boundary
-    if (data_stream->getOffsetInDecompressedBlock(start_pack_id) != 0)
+    auto offset_in_decomp = data_stream->getOffsetInDecompressedBlock(start_pack_id);
+    if (offset_in_decomp != 0)
         return nullptr;
 
-    // Seek data substream
-    data_stream->buf->seek(data_stream->getOffsetInFile(start_pack_id), 0);
+    // Position file pointer at the compressed block boundary WITHOUT decompressing.
+    // tryReadBlockAsColumnDictionary will read the block from this position.
+    auto saved_offset_in_file = data_stream->getOffsetInFile(start_pack_id);
+    data_stream->buf->seekToFilePosition(saved_offset_in_file);
 
-    // Read one compressed block as ColumnDictionary. We only use single-block reads
-    // to avoid O(N) re-encoding when merging ColumnDictionary instances with different
-    // dictionaries. If the block doesn't contain enough rows, fall back to normal path.
-    auto dict_col = data_stream->buf->tryReadBlockAsColumnDictionary(inner_type);
-    if (!dict_col)
+    // Read first compressed block as ColumnDictionary
+    auto first_block = data_stream->buf->tryReadBlockAsColumnDictionary(inner_type);
+    if (!first_block)
         return nullptr;
 
-    if (dict_col->size() < read_rows)
-        return nullptr; // Block has fewer rows than needed; fall back to normal path
+    const auto * first_dict_col = typeid_cast<const ColumnDictionary *>(first_block.get());
+    if (!first_dict_col)
+        return nullptr;
 
-    ColumnPtr result;
-    if (dict_col->size() > read_rows)
-        result = dict_col->cloneResized(read_rows);
-    else
-        result = std::move(dict_col);
-
-    // Handle Nullable wrapping: read null map from the null substream
-    if (is_nullable)
+    size_t rows_collected = first_dict_col->size();
+    if (rows_collected >= read_rows)
     {
-        IDataType::SubstreamPath null_path;
-        null_path.emplace_back(IDataType::Substream::NullMap);
-        const auto null_stream_name = DMFile::getFileNameBase(cd.id, null_path);
-        auto null_iter = column_streams.find(null_stream_name);
-        if (null_iter == column_streams.end())
-            return nullptr;
-
-        auto & null_stream = null_iter->second;
-        null_stream->buf->seek(
-            null_stream->getOffsetInFile(start_pack_id),
-            null_stream->getOffsetInDecompressedBlock(start_pack_id));
-
-        auto null_map_col = ColumnUInt8::create();
-        DataTypeUInt8().deserializeBinaryBulk(*null_map_col, *null_stream->buf, read_rows, 0);
-
-        result = ColumnNullable::create(result, std::move(null_map_col));
+        // Single block has enough rows
+        ColumnPtr result = (rows_collected > read_rows) ? first_block->cloneResized(read_rows) : first_block;
+        return wrapNullableForDictColumn(result, cd, type_on_disk, is_nullable, start_pack_id, read_rows);
     }
 
-    return result;
+    // Multi-block read: accumulate ColumnDictionary from consecutive blocks.
+    // Build a master dictionary and remap IDs from each block.
+    auto & master_dict = first_dict_col->getDictionary();
+    auto & first_ids = first_dict_col->getDictionaryIds();
+
+    PaddedPODArray<UInt32> merged_ids;
+    merged_ids.reserve(read_rows);
+    merged_ids.insert(first_ids.begin(), first_ids.end());
+
+    // Master dictionary: copy to mutable vector, build lookup map.
+    // Use String keys (not StringRef) because vector reallocation would invalidate StringRefs.
+    std::vector<Field> master_dict_vec(master_dict.begin(), master_dict.end());
+    std::unordered_map<String, UInt32> master_lookup;
+    for (UInt32 i = 0; i < master_dict_vec.size(); ++i)
+        master_lookup[master_dict_vec[i].get<String>()] = i;
+
+    while (rows_collected < read_rows)
+    {
+        auto block = data_stream->buf->tryReadBlockAsColumnDictionary(inner_type);
+        if (!block)
+        {
+            // Block not dictionary-encoded; fall back to normal read path
+            data_stream->buf->seekToFilePosition(saved_offset_in_file);
+            return nullptr;
+        }
+
+        const auto * block_dict_col = typeid_cast<const ColumnDictionary *>(block.get());
+        if (!block_dict_col)
+        {
+            data_stream->buf->seekToFilePosition(saved_offset_in_file);
+            return nullptr;
+        }
+
+        auto & block_dict = block_dict_col->getDictionary();
+        auto & block_ids = block_dict_col->getDictionaryIds();
+
+        // Build remap table: block_dict[i] → master_dict[remap[i]]
+        std::vector<UInt32> remap(block_dict.size());
+        bool same_dict = (block_dict.size() == master_dict_vec.size());
+
+        if (same_dict)
+        {
+            // Fast check: are dictionaries identical (same entries, same order)?
+            for (size_t i = 0; i < block_dict.size(); ++i)
+            {
+                if (block_dict[i] != master_dict_vec[i])
+                {
+                    same_dict = false;
+                    break;
+                }
+            }
+        }
+
+        if (same_dict)
+        {
+            // Identical dictionaries: append IDs directly (most common case)
+            size_t rows_to_take = std::min(block_ids.size(), read_rows - rows_collected);
+            merged_ids.insert(block_ids.begin(), block_ids.begin() + rows_to_take);
+            rows_collected += rows_to_take;
+        }
+        else
+        {
+            // Different dictionaries: build remap and append remapped IDs
+            for (size_t i = 0; i < block_dict.size(); ++i)
+            {
+                const auto & entry_str = block_dict[i].get<String>();
+                auto it = master_lookup.find(entry_str);
+                if (it != master_lookup.end())
+                {
+                    remap[i] = it->second;
+                }
+                else
+                {
+                    UInt32 new_id = static_cast<UInt32>(master_dict_vec.size());
+                    master_dict_vec.push_back(block_dict[i]);
+                    master_lookup[entry_str] = new_id;
+                    remap[i] = new_id;
+                }
+            }
+
+            size_t rows_to_take = std::min(block_ids.size(), read_rows - rows_collected);
+            for (size_t i = 0; i < rows_to_take; ++i)
+                merged_ids.push_back(remap[block_ids[i]]);
+            rows_collected += rows_to_take;
+        }
+    }
+
+    auto result_col = ColumnDictionary::createMutable(
+        std::move(master_dict_vec),
+        std::move(merged_ids),
+        inner_type);
+
+    ColumnPtr result = std::move(result_col);
+    return wrapNullableForDictColumn(result, cd, type_on_disk, is_nullable, start_pack_id, read_rows);
+}
+
+ColumnPtr DMFileReader::wrapNullableForDictColumn(
+    const ColumnPtr & dict_result,
+    const ColumnDefine & cd,
+    const DataTypePtr & /*type_on_disk*/,
+    bool is_nullable,
+    size_t start_pack_id,
+    size_t read_rows)
+{
+    if (!is_nullable)
+        return dict_result;
+
+    IDataType::SubstreamPath null_path;
+    null_path.emplace_back(IDataType::Substream::NullMap);
+    const auto null_stream_name = DMFile::getFileNameBase(cd.id, null_path);
+    auto null_iter = column_streams.find(null_stream_name);
+    if (null_iter == column_streams.end())
+        return nullptr;
+
+    auto & null_stream = null_iter->second;
+    null_stream->buf->seek(
+        null_stream->getOffsetInFile(start_pack_id),
+        null_stream->getOffsetInDecompressedBlock(start_pack_id));
+
+    auto null_map_col = ColumnUInt8::create();
+    DataTypeUInt8().deserializeBinaryBulk(*null_map_col, *null_stream->buf, read_rows, 0);
+
+    return ColumnNullable::create(dict_result, std::move(null_map_col));
 }
 
 ColumnPtr DMFileReader::readFromDisk(

@@ -176,6 +176,16 @@ ColumnPtr CompressedReadBufferFromFileImpl<has_legacy_checksum>::tryReadBlockAsC
     return nullptr;
 }
 
+template <bool has_legacy_checksum>
+void CompressedReadBufferFromFileImpl<has_legacy_checksum>::seekToFilePosition(size_t offset_in_compressed_file)
+{
+    [[maybe_unused]] auto ret = file_in.seek(offset_in_compressed_file);
+    size_compressed = 0;
+    memory.resize(0);
+    working_buffer = Buffer(memory.data(), memory.data());
+    pos = working_buffer.begin();
+}
+
 template class CompressedReadBufferFromFileImpl<true>;
 template class CompressedReadBufferFromFileImpl<false>;
 
