@@ -1150,6 +1150,8 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                 }
             }
             // Case 2: key is ColumnString — auto-encode if low cardinality.
+            // Uses linear scan (no hash map) for K ≤ 64 to avoid per-row hash
+            // overhead that dominates when K is small and strings are short.
             // NOTE: Nullable<ColumnString> is intentionally NOT handled here. The
             // visit_cache fast path would need to store a separate null aggregate
             // state in the hash table's merge/output path, which is non-trivial.
@@ -1157,16 +1159,16 @@ void Aggregator::AggProcessInfo::prepareForAgg()
             else if (const auto * col_str = typeid_cast<const ColumnString *>(key_columns[i]))
             {
                 static constexpr size_t MIN_ROWS_FOR_AUTO_ENCODE = 256;
-                static constexpr UInt32 MAX_DICT_SIZE_AUTO = 65536;
+                static constexpr UInt32 MAX_LINEAR_SCAN_DICT = 64;
                 const size_t num_rows = col_str->size();
                 if (num_rows >= MIN_ROWS_FOR_AUTO_ENCODE)
                 {
-                    // StringRef keys point into the ColumnString's internal buffer
-                    // which is stable for the block's lifetime. dict_entries stores
-                    // copies for ColumnDictionary creation but is NOT referenced by
-                    // the hash map (avoids the vector-reallocation dangling pointer bug).
+                    // Linear scan: keep a small array of seen StringRefs.
+                    // For K=5, scanning 5 entries per row is ~2ns (cache-friendly)
+                    // vs ~5ns for unordered_map lookup (hash + probe + compare).
                     std::vector<Field> dict_entries;
-                    std::unordered_map<StringRef, UInt32> dict_map;
+                    std::vector<StringRef> dict_refs; // points into col_str's buffer
+                    dict_refs.reserve(MAX_LINEAR_SCAN_DICT);
                     PaddedPODArray<UInt32> ids;
                     ids.reserve(num_rows);
                     bool success = true;
@@ -1174,23 +1176,29 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                     for (size_t r = 0; r < num_rows; ++r)
                     {
                         StringRef ref = col_str->getDataAt(r);
-                        auto it = dict_map.find(ref);
-                        if (it != dict_map.end())
+                        // Linear scan over seen entries
+                        UInt32 found_id = static_cast<UInt32>(dict_refs.size());
+                        for (UInt32 d = 0; d < static_cast<UInt32>(dict_refs.size()); ++d)
                         {
-                            ids.push_back(it->second);
+                            if (dict_refs[d].size == ref.size
+                                && memcmp(dict_refs[d].data, ref.data, ref.size) == 0)
+                            {
+                                found_id = d;
+                                break;
+                            }
                         }
-                        else
+                        if (found_id == static_cast<UInt32>(dict_refs.size()))
                         {
-                            if (dict_entries.size() >= MAX_DICT_SIZE_AUTO)
+                            // New entry
+                            if (dict_refs.size() >= MAX_LINEAR_SCAN_DICT)
                             {
                                 success = false;
                                 break;
                             }
-                            UInt32 new_id = static_cast<UInt32>(dict_entries.size());
-                            dict_map[ref] = new_id;
+                            dict_refs.push_back(ref);
                             dict_entries.emplace_back(String(ref.data, ref.size));
-                            ids.push_back(new_id);
                         }
+                        ids.push_back(found_id);
                     }
 
                     if (success)
