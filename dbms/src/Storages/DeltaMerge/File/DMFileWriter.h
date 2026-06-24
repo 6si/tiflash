@@ -24,6 +24,7 @@
 #include <Storages/DeltaMerge/File/DMFile.h>
 #include <Storages/DeltaMerge/Index/MinMaxIndex.h>
 
+#include <magic_enum.hpp>
 #include <unordered_map>
 
 namespace DB::DM
@@ -113,6 +114,19 @@ public:
             // Dictionary codec is passed through directly — it handles String data natively.
             if (setting.method_byte == CompressionMethodByte::Dictionary)
                 return setting;
+            // Use Lightweight compression for integer data columns (Int8/16/32/64, UInt8/16/32/64,
+            // Date, DateTime, Enum). Lightweight auto-selects the optimal per-block encoding:
+            // Constant, ConstantDelta, RunLength, FOR, DeltaFOR, or falls back to LZ4.
+            // For narrow-range integers (e.g. revenue [50-5000]) this uses FOR with ~13 bits/value
+            // instead of 64 bits + LZ4. For monotonic data (timestamps) DeltaFOR is selected.
+            // Worst case it falls back to LZ4, so there's no regression for random data.
+            auto inner_type = removeNullable(type);
+            if (inner_type->isValueRepresentedByInteger() && !inner_type->isString())
+            {
+                auto data_type = magic_enum::enum_cast<CompressionDataType>(inner_type->getSizeOfValueInMemory());
+                if (data_type.has_value())
+                    return CompressionSetting{CompressionMethod::Lightweight, data_type.value()};
+            }
             return CompressionSetting::create<>(setting.method, setting.level, *type);
         }
 
