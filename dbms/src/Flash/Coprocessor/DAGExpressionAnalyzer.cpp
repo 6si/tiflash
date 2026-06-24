@@ -601,6 +601,13 @@ void DAGExpressionAnalyzer::buildCommonAggFunc(
     if (agg_func_name == "sum" && child_size == 1)
     {
         const auto & child_expr = expr.children(0);
+        LOG_INFO(
+            Logger::get(),
+            "sumNativeInt64 check: agg_func={} child_tp={} child_sig={} child_children={}",
+            agg_func_name,
+            static_cast<int>(child_expr.tp()),
+            static_cast<int>(child_expr.sig()),
+            child_expr.children_size());
         if (child_expr.tp() == tipb::ExprType::ScalarFunc
             && child_expr.sig() == tipb::ScalarFuncSig::CastIntAsDecimal && child_expr.children_size() == 1)
         {
@@ -610,8 +617,14 @@ void DAGExpressionAnalyzer::buildCommonAggFunc(
 
             // Verify the inner type is actually Int64 (non-nullable or nullable wrapping Int64)
             auto inner_type = removeNullable(arg_types[0]);
+            LOG_INFO(
+                Logger::get(),
+                "sumNativeInt64 inner type check: type_name={} is_int64={}",
+                inner_type->getName(),
+                typeid_cast<const DataTypeInt64 *>(inner_type.get()) != nullptr);
             if (typeid_cast<const DataTypeInt64 *>(inner_type.get()))
             {
+                LOG_INFO(Logger::get(), "sumNativeInt64 ACTIVATED — bypassing CAST, using Int128 accumulator");
                 appendAggDescription(
                     arg_names,
                     arg_types,
