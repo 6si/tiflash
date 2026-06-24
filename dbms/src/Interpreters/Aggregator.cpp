@@ -1232,10 +1232,16 @@ void Aggregator::AggProcessInfo::prepareForAgg()
             }
         }
 
-        if (ColumnPtr converted = key_columns[i]->convertToFullColumnIfDictionary())
+        // Only materialize ColumnDictionary if the fast path is NOT available.
+        // When dict_ids is set, executeDictionaryKeyFastPath uses the dictionary
+        // IDs directly — materializing to ColumnString would waste O(N) decode work.
+        if (dict_ids == nullptr)
         {
-            materialized_columns.push_back(converted);
-            key_columns[i] = materialized_columns.back().get();
+            if (ColumnPtr converted = key_columns[i]->convertToFullColumnIfDictionary())
+            {
+                materialized_columns.push_back(converted);
+                key_columns[i] = materialized_columns.back().get();
+            }
         }
     }
 

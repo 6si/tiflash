@@ -280,55 +280,14 @@ bool IExecutableFunction::defaultImplementationForDictionaryColumns(
         if (has_const_arg && string_arg_idx != args.size())
         {
             const auto & col = block.getByPosition(args[string_arg_idx]).column;
-            size_t num_rows = col->size();
-            if (num_rows >= MIN_ROWS_FOR_AUTO_ENCODE)
+            auto encoded = ColumnDictionary::tryAutoEncode(col, MIN_ROWS_FOR_AUTO_ENCODE, MAX_DICT_SIZE_AUTO);
+            if (encoded.get() != col.get())
             {
-                const auto * col_str = typeid_cast<const ColumnString *>(col.get());
-                // StringRef keys point into the ColumnString's stable internal buffer.
-                // dict_entries stores copies for ColumnDictionary but is NOT used as
-                // hash map keys (avoids vector-reallocation dangling pointer bug).
-                std::vector<Field> dict_entries;
-                std::unordered_map<StringRef, UInt32> dict_map;
-                PaddedPODArray<UInt32> ids;
-                ids.reserve(num_rows);
-                bool success = true;
-
-                for (size_t i = 0; i < num_rows; ++i)
-                {
-                    StringRef ref = col_str->getDataAt(i);
-                    auto it = dict_map.find(ref);
-                    if (it != dict_map.end())
-                    {
-                        ids.push_back(it->second);
-                    }
-                    else
-                    {
-                        if (dict_entries.size() >= MAX_DICT_SIZE_AUTO)
-                        {
-                            success = false;
-                            break;
-                        }
-                        UInt32 new_id = static_cast<UInt32>(dict_entries.size());
-                        dict_map[ref] = new_id;
-                        dict_entries.emplace_back(String(ref.data, ref.size));
-                        ids.push_back(new_id);
-                    }
-                }
-
-                if (success)
-                {
-                    auto dict_col_ptr = ColumnDictionary::createMutable(
-                        std::move(dict_entries),
-                        std::move(ids),
-                        block.getByPosition(args[string_arg_idx]).type);
-                    // Save original column so we can restore it after the fast path
-                    // (the block may be used by subsequent operations that expect ColumnString)
-                    original_string_col = block.getByPosition(args[string_arg_idx]).column;
-                    auto_encoded_arg_idx = string_arg_idx;
-                    block.getByPosition(args[string_arg_idx]).column = std::move(dict_col_ptr);
-                    dict_arg_idx = string_arg_idx;
-                    num_dict_cols = 1;
-                }
+                original_string_col = block.getByPosition(args[string_arg_idx]).column;
+                auto_encoded_arg_idx = string_arg_idx;
+                block.getByPosition(args[string_arg_idx]).column = encoded;
+                dict_arg_idx = string_arg_idx;
+                num_dict_cols = 1;
             }
         }
     }

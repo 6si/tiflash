@@ -530,12 +530,11 @@ ColumnPtr DMFileReader::readColumn(const ColumnDefine & cd, size_t start_pack_id
 
 ColumnPtr DMFileReader::maybeAutoEncodeColumn(const ColumnPtr & column, const ColumnDefine & /*cd*/) const
 {
-    // Reader-level auto-encoding is disabled: in MPP queries, the
-    // HashPartition exchange materializes ColumnDictionary→ColumnString
-    // via scatterTo(), destroying the dictionary before the Aggregator.
-    // This causes 3x overhead (encode + materialize + re-encode) with no
-    // benefit. The Aggregator's own visit_cache (Case 2) handles encoding
-    // after the exchange, avoiding the scatter overhead.
+    // Reader-level auto-encoding is disabled because the delta-stable merge
+    // pipeline calls ColumnString::insertRangeFrom which does static_cast to
+    // ColumnString — this crashes if the column is ColumnDictionary.
+    // Instead, the IFunction and Aggregator auto-encode ColumnString→ColumnDictionary
+    // at the operator level (after the merge is complete), which is safe.
     return column;
 }
 
