@@ -593,6 +593,43 @@ void DAGExpressionAnalyzer::buildCommonAggFunc(
     DataTypes arg_types;
     TiDB::TiDBCollators arg_collators;
 
+    // Optimization: detect SUM(CAST(Int64 AS Decimal)) pattern and bypass the CAST.
+    // TiDB wraps SUM(integer_col) as SUM(CAST(col AS DECIMAL(20,0))) for MySQL overflow safety.
+    // This CAST is extremely expensive at scale (~136ms/node for 100M rows) because it converts
+    // every Int64 value to Decimal128 before accumulation. Instead, we accumulate directly in
+    // Int128 (no overflow possible) and convert only the final per-group result to Decimal.
+    if (agg_func_name == "sum" && child_size == 1)
+    {
+        const auto & child_expr = expr.children(0);
+        if (child_expr.tp() == tipb::ExprType::ScalarFunc
+            && child_expr.sig() == tipb::ScalarFuncSig::CastIntAsDecimal && child_expr.children_size() == 1)
+        {
+            // The inner expression is the raw Int64 column — use it directly
+            const auto & inner_expr = child_expr.children(0);
+            fillArgumentDetail(actions, inner_expr, arg_names, arg_types, arg_collators);
+
+            // Verify the inner type is actually Int64 (non-nullable or nullable wrapping Int64)
+            auto inner_type = removeNullable(arg_types[0]);
+            if (typeid_cast<const DataTypeInt64 *>(inner_type.get()))
+            {
+                appendAggDescription(
+                    arg_names,
+                    arg_types,
+                    arg_collators,
+                    "sumNativeInt64",
+                    aggregate_descriptions,
+                    aggregated_columns,
+                    empty_input_as_null,
+                    context);
+                return;
+            }
+            // If not Int64, fall through to normal path (re-process with CAST)
+            arg_names.clear();
+            arg_types.clear();
+            arg_collators.clear();
+        }
+    }
+
     for (Int32 i = 0; i < child_size; ++i)
     {
         fillArgumentDetail(actions, expr.children(i), arg_names, arg_types, arg_collators);

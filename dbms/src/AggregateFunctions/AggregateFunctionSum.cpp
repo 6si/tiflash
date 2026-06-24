@@ -16,8 +16,10 @@
 
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <AggregateFunctions/AggregateFunctionSum.h>
+#include <AggregateFunctions/AggregateFunctionSumNativeInt64.h>
 #include <AggregateFunctions/FactoryHelpers.h>
 #include <AggregateFunctions/Helpers.h>
+#include <DataTypes/DataTypesNumber.h>
 #include <fmt/core.h>
 
 namespace DB
@@ -116,6 +118,34 @@ AggregateFunctionPtr createAggregateFunctionSum(
 
 } // namespace
 
+/// Factory function for sumNativeInt64: takes Int64 input, accumulates in Int128, returns Decimal(20,0).
+/// This bypasses the expensive per-row Int64→Decimal cast that TiDB injects for SUM(INT).
+AggregateFunctionPtr createAggregateFunctionSumNativeInt64(
+    const Context & /* context */,
+    const std::string & name,
+    const DataTypes & argument_types,
+    const Array & parameters)
+{
+    assertNoParameters(name, parameters);
+    assertUnary(name, argument_types);
+
+    const IDataType * p = argument_types[0].get();
+    if (!typeid_cast<const DataTypeInt64 *>(p))
+    {
+        throw Exception(
+            fmt::format(
+                "Illegal type {} of argument for aggregate function {}. Expected Int64.",
+                p->getName(),
+                name),
+            ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+    }
+
+    // Return Decimal(38, 0) — max precision for Decimal128/Int128 storage.
+    // Int128 accumulator range is ~1.7×10^38, so overflow is impossible.
+    // appendCastAfterAgg will handle widening to TiDB's expected Decimal(41,0) per-group.
+    return std::make_shared<AggregateFunctionSumNativeInt64>(38, 0);
+}
+
 void registerAggregateFunctionSum(AggregateFunctionFactory & factory)
 {
     factory.registerFunction(
@@ -130,6 +160,7 @@ void registerAggregateFunctionSum(AggregateFunctionFactory & factory)
         NameCountSecondStage::name,
         createAggregateFunctionSum<AggregateFunctionCountSecondStage, NameCountSecondStage>,
         AggregateFunctionFactory::CaseInsensitive);
+    factory.registerFunction("sumNativeInt64", createAggregateFunctionSumNativeInt64);
 }
 
 } // namespace DB
