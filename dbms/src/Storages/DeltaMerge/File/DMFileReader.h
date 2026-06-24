@@ -118,6 +118,11 @@ private:
         const DataTypePtr & type_on_disk,
         size_t start_pack_id,
         size_t read_rows);
+    ColumnPtr readFromDiskAsDictionary(
+        const ColumnDefine & cd,
+        const DataTypePtr & type_on_disk,
+        size_t start_pack_id,
+        size_t read_rows);
     ColumnPtr readFromDiskOrSharingCache(
         const ColumnDefine & cd,
         const DataTypePtr & type_on_disk,

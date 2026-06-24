@@ -68,11 +68,21 @@ DMFileWriter::DMFileWriter(
         auto type = removeNullable(cd.type);
         bool do_index = cd.id == MutSup::extra_handle_id || type->isInteger() || type->isDateOrDateTime();
 
-        // Dictionary codec on disk is disabled: for short strings with low NDV,
-        // StringV2+LZ4 achieves better compression than Dictionary+LZ4 on random
-        // UInt8 IDs. Compute savings come from auto-encoding on read instead.
+        // Dictionary codec on disk for String columns: enables DMFileReader to
+        // produce ColumnDictionary directly without query-time hash map construction.
+        // Force SizePrefix format so Dictionary codec gets VarUInt-prefixed strings
+        // in a single substream (StringV2 splits into offsets+chars which the codec can't parse).
         auto type_on_disk = cd.type;
         bool use_dict = false;
+        if (type->isString() && cd.id != MutSup::extra_handle_id)
+        {
+            use_dict = true;
+            auto size_prefix_string = std::make_shared<DataTypeString>(DataTypeString::SerdesFormat::SizePrefix);
+            if (cd.type->isNullable())
+                type_on_disk = std::make_shared<DataTypeNullable>(size_prefix_string);
+            else
+                type_on_disk = size_prefix_string;
+        }
 
         addStreams(cd.id, type_on_disk, do_index, use_dict);
         dmfile->meta->getColumnStats().emplace(

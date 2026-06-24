@@ -21,6 +21,8 @@
 #include <Common/TiFlashMetrics.h>
 #include <Common/escapeForFileName.h>
 #include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/IDataType.h>
 #include <Storages/DeltaMerge/DeltaMergeDefines.h>
 #include <Storages/DeltaMerge/File/ColumnCacheLongTerm.h>
@@ -498,6 +500,12 @@ ColumnPtr DMFileReader::readColumn(const ColumnDefine & cd, size_t start_pack_id
     // Not cached
     if (!enable_column_cache || !isCacheableColumn(cd))
     {
+        // Try dictionary-on-disk path: produce ColumnDictionary directly from compressed blocks.
+        // Skip convertColumnByColumnDefineIfNeed — "String" (SizePrefix on disk) vs "StringV2"
+        // (schema) would trigger a spurious cast that can't handle ColumnDictionary.
+        // Nullable wrapping is handled inside readFromDiskAsDictionary.
+        if (auto dict_col = readFromDiskAsDictionary(cd, type_on_disk, start_pack_id, read_rows))
+            return dict_col;
         auto column = readFromDiskOrSharingCache(cd, type_on_disk, start_pack_id, pack_count, read_rows);
         // Cast column's data from DataType in disk to what we need now
         auto result = convertColumnByColumnDefineIfNeed(type_on_disk, std::move(column), cd);
@@ -530,12 +538,73 @@ ColumnPtr DMFileReader::readColumn(const ColumnDefine & cd, size_t start_pack_id
 
 ColumnPtr DMFileReader::maybeAutoEncodeColumn(const ColumnPtr & column, const ColumnDefine & /*cd*/) const
 {
-    // Reader-level auto-encoding is disabled because the delta-stable merge
-    // pipeline calls ColumnString::insertRangeFrom which does static_cast to
-    // ColumnString — this crashes if the column is ColumnDictionary.
-    // Instead, the IFunction and Aggregator auto-encode ColumnString→ColumnDictionary
-    // at the operator level (after the merge is complete), which is safe.
     return column;
+}
+
+ColumnPtr DMFileReader::readFromDiskAsDictionary(
+    const ColumnDefine & cd,
+    const DataTypePtr & type_on_disk,
+    size_t start_pack_id,
+    size_t read_rows)
+{
+    auto inner_type = removeNullable(type_on_disk);
+    if (!inner_type->isString())
+        return nullptr;
+
+    bool is_nullable = type_on_disk->isNullable();
+
+    // Find the data substream
+    const auto data_stream_name = DMFile::getFileNameBase(cd.id);
+    auto data_iter = column_streams.find(data_stream_name);
+    if (data_iter == column_streams.end())
+        return nullptr;
+    auto & data_stream = data_iter->second;
+
+    // Only attempt dictionary path when starting at a block boundary
+    if (data_stream->getOffsetInDecompressedBlock(start_pack_id) != 0)
+        return nullptr;
+
+    // Seek data substream
+    data_stream->buf->seek(data_stream->getOffsetInFile(start_pack_id), 0);
+
+    // Read one compressed block as ColumnDictionary. We only use single-block reads
+    // to avoid O(N) re-encoding when merging ColumnDictionary instances with different
+    // dictionaries. If the block doesn't contain enough rows, fall back to normal path.
+    auto dict_col = data_stream->buf->tryReadBlockAsColumnDictionary(inner_type);
+    if (!dict_col)
+        return nullptr;
+
+    if (dict_col->size() < read_rows)
+        return nullptr; // Block has fewer rows than needed; fall back to normal path
+
+    ColumnPtr result;
+    if (dict_col->size() > read_rows)
+        result = dict_col->cloneResized(read_rows);
+    else
+        result = std::move(dict_col);
+
+    // Handle Nullable wrapping: read null map from the null substream
+    if (is_nullable)
+    {
+        IDataType::SubstreamPath null_path;
+        null_path.emplace_back(IDataType::Substream::NullMap);
+        const auto null_stream_name = DMFile::getFileNameBase(cd.id, null_path);
+        auto null_iter = column_streams.find(null_stream_name);
+        if (null_iter == column_streams.end())
+            return nullptr;
+
+        auto & null_stream = null_iter->second;
+        null_stream->buf->seek(
+            null_stream->getOffsetInFile(start_pack_id),
+            null_stream->getOffsetInDecompressedBlock(start_pack_id));
+
+        auto null_map_col = ColumnUInt8::create();
+        DataTypeUInt8().deserializeBinaryBulk(*null_map_col, *null_stream->buf, read_rows, 0);
+
+        result = ColumnNullable::create(result, std::move(null_map_col));
+    }
+
+    return result;
 }
 
 ColumnPtr DMFileReader::readFromDisk(
