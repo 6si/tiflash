@@ -1132,8 +1132,93 @@ void Aggregator::AggProcessInfo::prepareForAgg()
         /// applied to each dictionary entry in executeDictionaryKeyFastPath.
         if (aggregator->params.keys_size == 1)
         {
-            // Case 1: key is already ColumnDictionary (e.g., from storage)
-            if (key_columns[i]->isDictionaryEncoded())
+            // Case 0a: Nullable(ColumnDictionary) — unwrap to get the nested dict.
+            // The serialized aggregation method handles nulls via a separate key.
+            if (const auto * nullable_col = typeid_cast<const ColumnNullable *>(key_columns[i]))
+            {
+                const auto & nested = nullable_col->getNestedColumnPtr();
+                if (nested->isDictionaryEncoded())
+                {
+                    const auto * nested_dict = typeid_cast<const ColumnDictionary *>(nested.get());
+                    if (nested_dict && nested_dict->getDictionarySize() <= 65536)
+                    {
+                        dict_ids = &nested_dict->getDictionaryIds();
+                        dict_size = nested_dict->getDictionarySize();
+                        const auto & dict = nested_dict->getDictionary();
+                        dict_entries_refs.resize(dict_size);
+                        for (size_t d = 0; d < dict_size; ++d)
+                        {
+                            const auto & s = dict[d].get<String>();
+                            dict_entries_refs[d] = StringRef(s.data(), s.size());
+                        }
+                        dict_null_map = &nullable_col->getNullMapData();
+                    }
+                }
+                // Case 0b: Nullable(ColumnString) — auto-encode nested string.
+                else if (const auto * nested_str = typeid_cast<const ColumnString *>(nested.get()))
+                {
+                    static constexpr size_t MIN_ROWS_FOR_AUTO_ENCODE = 256;
+                    static constexpr UInt32 MAX_LINEAR_SCAN_DICT = 64;
+                    const size_t num_rows = nested_str->size();
+                    if (num_rows >= MIN_ROWS_FOR_AUTO_ENCODE)
+                    {
+                        std::vector<Field> dict_entries;
+                        std::vector<StringRef> dict_refs;
+                        dict_refs.reserve(MAX_LINEAR_SCAN_DICT);
+                        PaddedPODArray<UInt32> ids;
+                        ids.reserve(num_rows);
+                        bool success = true;
+
+                        for (size_t r = 0; r < num_rows; ++r)
+                        {
+                            StringRef ref = nested_str->getDataAt(r);
+                            UInt32 found_id = static_cast<UInt32>(dict_refs.size());
+                            for (UInt32 d = 0; d < static_cast<UInt32>(dict_refs.size()); ++d)
+                            {
+                                if (dict_refs[d].size == ref.size
+                                    && memcmp(dict_refs[d].data, ref.data, ref.size) == 0)
+                                {
+                                    found_id = d;
+                                    break;
+                                }
+                            }
+                            if (found_id == static_cast<UInt32>(dict_refs.size()))
+                            {
+                                if (dict_refs.size() >= MAX_LINEAR_SCAN_DICT)
+                                {
+                                    success = false;
+                                    break;
+                                }
+                                dict_refs.push_back(ref);
+                                dict_entries.emplace_back(String(ref.data, ref.size));
+                            }
+                            ids.push_back(found_id);
+                        }
+
+                        if (success)
+                        {
+                            auto dict_col_ptr = ColumnDictionary::createMutable(
+                                std::move(dict_entries),
+                                std::move(ids),
+                                std::make_shared<DataTypeString>());
+                            const auto * dc = typeid_cast<const ColumnDictionary *>(dict_col_ptr.get());
+                            dict_ids = &dc->getDictionaryIds();
+                            dict_size = dc->getDictionarySize();
+                            const auto & dict = dc->getDictionary();
+                            dict_entries_refs.resize(dict_size);
+                            for (size_t d = 0; d < dict_size; ++d)
+                            {
+                                const auto & s = dict[d].get<String>();
+                                dict_entries_refs[d] = StringRef(s.data(), s.size());
+                            }
+                            auto_encoded_dict_col = std::move(dict_col_ptr);
+                            dict_null_map = &nullable_col->getNullMapData();
+                        }
+                    }
+                }
+            }
+            // Case 1: key is already ColumnDictionary (e.g., from storage, non-nullable)
+            else if (key_columns[i]->isDictionaryEncoded())
             {
                 const auto * dict_col = typeid_cast<const ColumnDictionary *>(key_columns[i]);
                 if (dict_col && dict_col->getDictionarySize() <= 65536)
@@ -1150,12 +1235,6 @@ void Aggregator::AggProcessInfo::prepareForAgg()
                 }
             }
             // Case 2: key is ColumnString — auto-encode if low cardinality.
-            // Uses linear scan (no hash map) for K ≤ 64 to avoid per-row hash
-            // overhead that dominates when K is small and strings are short.
-            // NOTE: Nullable<ColumnString> is intentionally NOT handled here. The
-            // visit_cache fast path would need to store a separate null aggregate
-            // state in the hash table's merge/output path, which is non-trivial.
-            // For now, Nullable keys fall back to the standard aggregation path.
             else if (const auto * col_str = typeid_cast<const ColumnString *>(key_columns[i]))
             {
                 static constexpr size_t MIN_ROWS_FOR_AUTO_ENCODE = 256;
@@ -1287,6 +1366,9 @@ void Aggregator::executeDictionaryKeyFastPath(
     const size_t rows = agg_process_info.end_row - agg_process_info.start_row;
     const auto collator = agg_process_info.dict_collator;
 
+    if constexpr (Method::State::can_batch_get_key_holder)
+        result.batch_get_key_holder = true;
+
     /// Pass 1: look up each dictionary entry in the hash table (K lookups).
     /// When a collator is present, apply sortKey() to each entry first so that
     /// collation-aware grouping is correct (e.g. utf8mb4_bin trailing-space trim).
@@ -1317,6 +1399,122 @@ void Aggregator::executeDictionaryKeyFastPath(
     {
         UInt32 dict_id = dict_ids[agg_process_info.start_row + i];
         places[i] = visit_cache[dict_id];
+    }
+
+    /// Pass 3: call aggregate functions with the places array.
+    for (AggregateFunctionInstruction * inst = agg_process_info.aggregate_functions_instructions.data(); inst->that;
+         ++inst)
+    {
+        inst->batch_that->addBatch(
+            agg_process_info.start_row,
+            rows,
+            places.get(),
+            inst->state_offset,
+            inst->batch_arguments,
+            pool);
+    }
+
+    agg_process_info.start_row = agg_process_info.end_row;
+}
+
+template <typename Method>
+void Aggregator::executeDictionaryKeyFastPathNullable(
+    Method & method,
+    AggregatedDataVariants & result,
+    AggProcessInfo & agg_process_info) const
+{
+    auto * pool = result.aggregates_pool;
+    const auto & dict_ids = *agg_process_info.dict_ids;
+    const auto & dict_refs = agg_process_info.dict_entries_refs;
+    const size_t dict_size = agg_process_info.dict_size;
+    const size_t rows = agg_process_info.end_row - agg_process_info.start_row;
+    const auto * null_map = agg_process_info.dict_null_map;
+    const auto collator = agg_process_info.dict_collator;
+
+    // Keys are emplaced via ArenaKeyHolder (the batch-style key holder for
+    // the serialized method). Mark the result so the merge/convert path uses
+    // the compatible deserialization.
+    if constexpr (Method::State::can_batch_get_key_holder)
+        result.batch_get_key_holder = true;
+
+    /// Pass 1: K hash lookups — one per dictionary entry.
+    /// Keys use the batch serialization format so that the convert-to-blocks
+    /// path (insertKeyIntoColumnsBatch → deserializeAndInsertFromPos) can read
+    /// them correctly.  Batch Nullable(String) format:
+    ///   [UInt8 null_flag][UInt32 str_size][string data]
+    /// For non-null: null_flag=0, str_size includes the terminating '\0'.
+    /// For null:     null_flag=1, followed by a default empty string [UInt32 1]['\0'].
+    std::string sort_key_container;
+    std::vector<AggregateDataPtr> visit_cache(dict_size, nullptr);
+    AggregateDataPtr null_place = nullptr;
+
+    std::string key_buf;
+    for (size_t i = 0; i < dict_size; ++i)
+    {
+        StringRef ref = dict_refs[i];
+        if (collator)
+            ref = collator->sortKey(ref.data, ref.size, sort_key_container);
+
+        key_buf.clear();
+        UInt8 null_flag = 0;
+        key_buf.append(reinterpret_cast<const char *>(&null_flag), sizeof(UInt8));
+        UInt32 str_size = collator ? static_cast<UInt32>(ref.size) : static_cast<UInt32>(ref.size + 1);
+        key_buf.append(reinterpret_cast<const char *>(&str_size), sizeof(UInt32));
+        key_buf.append(ref.data, ref.size);
+        if (!collator)
+            key_buf.push_back('\0');
+
+        StringRef serialized_key{key_buf.data(), key_buf.size()};
+
+        typename Method::Data::LookupResult lookup_result;
+        bool inserted = false;
+        method.data.emplace(ArenaKeyHolder{serialized_key, pool}, lookup_result, inserted);
+        if (inserted)
+        {
+            auto * place = pool->alignedAlloc(total_size_of_aggregate_states, align_aggregate_states);
+            createAggregateStates(place);
+            lookup_result->getMapped() = place;
+        }
+        visit_cache[i] = lookup_result->getMapped();
+    }
+
+    /// Pass 2: fill places array using dictionary IDs + null map (N array lookups).
+    /// Lazily emplace the null key on the first null row encountered.
+    auto places = std::unique_ptr<AggregateDataPtr[]>(new AggregateDataPtr[rows]);
+    for (size_t i = 0; i < rows; ++i)
+    {
+        size_t row = agg_process_info.start_row + i;
+        if ((*null_map)[row] != 0)
+        {
+            if (!null_place)
+            {
+                // Batch format for null: [UInt8 1][UInt32 1]['\0']
+                key_buf.clear();
+                UInt8 nf = 1;
+                key_buf.append(reinterpret_cast<const char *>(&nf), sizeof(UInt8));
+                UInt32 default_str_size = 1;
+                key_buf.append(reinterpret_cast<const char *>(&default_str_size), sizeof(UInt32));
+                key_buf.push_back('\0');
+
+                StringRef null_key{key_buf.data(), key_buf.size()};
+
+                typename Method::Data::LookupResult lr;
+                bool ins = false;
+                method.data.emplace(ArenaKeyHolder{null_key, pool}, lr, ins);
+                if (ins)
+                {
+                    auto * p = pool->alignedAlloc(total_size_of_aggregate_states, align_aggregate_states);
+                    createAggregateStates(p);
+                    lr->getMapped() = p;
+                }
+                null_place = lr->getMapped();
+            }
+            places[i] = null_place;
+        }
+        else
+        {
+            places[i] = visit_cache[dict_ids[row]];
+        }
     }
 
     /// Pass 3: call aggregate functions with the places array.
@@ -1382,19 +1580,30 @@ bool Aggregator::executeOnBlockImpl(
     else
     {
         /// Visit-cache fast path: when the key column was dictionary-encoded,
-        /// do K hash lookups instead of N. Only for key_string (single string key)
-        /// and only in the normal (non-lookup) path.
+        /// do K hash lookups instead of N. Only in the normal (non-lookup) path.
         bool used_dict_fast_path = false;
         if constexpr (!only_lookup)
         {
-            if (agg_process_info.dict_ids != nullptr
-                && result.type == AggregatedDataVariants::Type::key_string)
+            if (agg_process_info.dict_ids != nullptr)
             {
-                executeDictionaryKeyFastPath(
-                    *ToAggregationMethodPtr(key_string, result.aggregation_method_impl),
-                    result,
-                    agg_process_info);
-                used_dict_fast_path = true;
+                if (result.type == AggregatedDataVariants::Type::key_string)
+                {
+                    executeDictionaryKeyFastPath(
+                        *ToAggregationMethodPtr(key_string, result.aggregation_method_impl),
+                        result,
+                        agg_process_info);
+                    used_dict_fast_path = true;
+                }
+                else if (
+                    result.type == AggregatedDataVariants::Type::serialized
+                    && agg_process_info.dict_null_map != nullptr)
+                {
+                    executeDictionaryKeyFastPathNullable(
+                        *ToAggregationMethodPtr(serialized, result.aggregation_method_impl),
+                        result,
+                        agg_process_info);
+                    used_dict_fast_path = true;
+                }
             }
         }
 

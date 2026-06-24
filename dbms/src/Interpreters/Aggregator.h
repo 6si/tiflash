@@ -1063,6 +1063,15 @@ public:
         AggregatedDataVariants & result,
         AggProcessInfo & agg_process_info) const;
 
+    /// Nullable variant: handles Nullable(ColumnDictionary) keys with the
+    /// serialized aggregation method. Constructs serialized keys for each
+    /// dictionary entry (K+1 lookups including null) instead of N.
+    template <typename Method>
+    void executeDictionaryKeyFastPathNullable(
+        Method & method,
+        AggregatedDataVariants & result,
+        AggProcessInfo & agg_process_info) const;
+
     /** Merge several aggregation data structures and output the MergingBucketsPtr used to merge.
       * Return nullptr if there are no non empty data_variant.
       */

@@ -15,10 +15,12 @@
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <AggregateFunctions/registerAggregateFunctions.h>
 #include <Columns/ColumnDictionary.h>
+#include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnsNumber.h>
 #include <Core/ColumnWithTypeAndName.h>
 #include <Core/OperatorSpillContext.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Debug/TiFlashTestEnv.h>
@@ -140,7 +142,10 @@ protected:
         return std::make_unique<Aggregator>(params, "test", /*concurrency=*/1, no_spill, false, false);
     }
 
-    /// Run aggregation on a block, return {key -> count} map
+    /// Run aggregation on a block, return {key -> count} map.
+    /// Null keys are stored under the special key "\0__NULL__".
+    static constexpr const char * NULL_KEY_SENTINEL = "\0__NULL__";
+
     std::map<String, UInt64> runAggregation(const Block & block)
     {
         auto aggregator = createCountAggregator(block);
@@ -169,7 +174,18 @@ protected:
             const auto & cnt_col = output_block.getByPosition(1).column;
             for (size_t i = 0; i < rows; ++i)
             {
-                String key = key_col->getDataAt(i).toString();
+                String key;
+                if (const auto * nullable = typeid_cast<const ColumnNullable *>(key_col.get()))
+                {
+                    if (nullable->isNullAt(i))
+                        key = NULL_KEY_SENTINEL;
+                    else
+                        key = nullable->getNestedColumn().getDataAt(i).toString();
+                }
+                else
+                {
+                    key = key_col->getDataAt(i).toString();
+                }
                 UInt64 count = cnt_col->getUInt(i);
                 counts[key] += count;
             }
@@ -452,6 +468,148 @@ try
         String key = "key_" + std::to_string(i);
         ASSERT_EQ(counts_with[key], num_rows / num_distinct) << "Collator path mismatch for key: " << key;
         ASSERT_EQ(counts_with[key], counts_without[key]) << "Collator vs no-collator mismatch for key: " << key;
+    }
+}
+CATCH
+
+/// Build a Nullable(ColumnDictionary) block: col0 = Nullable dict key, col1 = UInt64 values.
+/// Every null_every-th row is null (0 = no nulls).
+static Block buildNullableDictBlock(size_t num_rows, size_t num_distinct, size_t null_every)
+{
+    std::vector<Field> dict;
+    dict.reserve(num_distinct);
+    for (size_t i = 0; i < num_distinct; ++i)
+        dict.push_back(Field(String("key_") + std::to_string(i)));
+
+    PaddedPODArray<UInt32> ids;
+    ids.reserve(num_rows);
+    for (size_t i = 0; i < num_rows; ++i)
+        ids.push_back(static_cast<UInt32>(i % num_distinct));
+
+    auto dict_col = ColumnDictionary::createMutable(std::move(dict), std::move(ids), std::make_shared<DataTypeString>());
+
+    auto null_map = ColumnUInt8::create();
+    for (size_t i = 0; i < num_rows; ++i)
+        null_map->insert(Field(static_cast<UInt64>((null_every > 0 && i % null_every == 0) ? 1 : 0)));
+
+    auto nullable_col = ColumnNullable::create(std::move(dict_col), std::move(null_map));
+
+    auto val_col = ColumnUInt64::create();
+    for (size_t i = 0; i < num_rows; ++i)
+        val_col->insert(Field(static_cast<UInt64>(1)));
+
+    Block block;
+    block.insert(ColumnWithTypeAndName(
+        std::move(nullable_col),
+        std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>()),
+        "key"));
+    block.insert(ColumnWithTypeAndName(std::move(val_col), std::make_shared<DataTypeUInt64>(), "val"));
+    return block;
+}
+
+/// Build a Nullable(ColumnString) block for comparison.
+static Block buildNullableStringBlock(size_t num_rows, size_t num_distinct, size_t null_every)
+{
+    auto str_col = ColumnString::create();
+    auto null_map = ColumnUInt8::create();
+    for (size_t i = 0; i < num_rows; ++i)
+    {
+        str_col->insert(Field(String("key_") + std::to_string(i % num_distinct)));
+        null_map->insert(Field(static_cast<UInt64>((null_every > 0 && i % null_every == 0) ? 1 : 0)));
+    }
+
+    auto nullable_col = ColumnNullable::create(std::move(str_col), std::move(null_map));
+
+    auto val_col = ColumnUInt64::create();
+    for (size_t i = 0; i < num_rows; ++i)
+        val_col->insert(Field(static_cast<UInt64>(1)));
+
+    Block block;
+    block.insert(ColumnWithTypeAndName(
+        std::move(nullable_col),
+        std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>()),
+        "key"));
+    block.insert(ColumnWithTypeAndName(std::move(val_col), std::make_shared<DataTypeUInt64>(), "val"));
+    return block;
+}
+
+/// Nullable(ColumnDictionary) GROUP BY should produce correct results via the
+/// serialized-method fast path (executeDictionaryKeyFastPathNullable).
+TEST_F(AggregatorDictionaryVisitCacheTest, NullableDictionaryKeyCorrectness)
+try
+{
+    const size_t num_rows = 1000;
+    const size_t num_distinct = 5;
+    const size_t null_every = 7; // every 7th row is null
+
+    auto nullable_dict_block = buildNullableDictBlock(num_rows, num_distinct, null_every);
+    auto nullable_string_block = buildNullableStringBlock(num_rows, num_distinct, null_every);
+
+    auto dict_counts = runAggregation(nullable_dict_block);
+    auto string_counts = runAggregation(nullable_string_block);
+
+    // Both should produce the same results (including null group).
+    ASSERT_EQ(dict_counts.size(), string_counts.size())
+        << "Dict has " << dict_counts.size() << " groups, String has " << string_counts.size();
+
+    for (const auto & [key, count] : string_counts)
+    {
+        ASSERT_TRUE(dict_counts.count(key))
+            << "Missing key in dict result: " << key;
+        ASSERT_EQ(dict_counts[key], count)
+            << "Count mismatch for key: " << key << " (dict=" << dict_counts[key] << ", string=" << count << ")";
+    }
+}
+CATCH
+
+/// Verify dict_ids + dict_null_map are set for Nullable(ColumnDictionary)
+TEST_F(AggregatorDictionaryVisitCacheTest, NullableDictVisitCacheActivation)
+try
+{
+    auto block = buildNullableDictBlock(512, 3, 10);
+    auto aggregator = createCountAggregator(block);
+    Aggregator::AggProcessInfo info(aggregator.get());
+    info.resetBlock(block);
+    info.prepareForAgg();
+
+    ASSERT_NE(info.dict_ids, nullptr) << "dict_ids should be set for Nullable(ColumnDictionary)";
+    ASSERT_EQ(info.dict_size, 3u);
+    ASSERT_NE(info.dict_null_map, nullptr) << "dict_null_map should be set for nullable key";
+}
+CATCH
+
+/// Verify dict_ids + dict_null_map are set for Nullable(ColumnString) auto-encode
+TEST_F(AggregatorDictionaryVisitCacheTest, NullableStringAutoEncodeActivation)
+try
+{
+    auto block = buildNullableStringBlock(512, 3, 10);
+    auto aggregator = createCountAggregator(block);
+    Aggregator::AggProcessInfo info(aggregator.get());
+    info.resetBlock(block);
+    info.prepareForAgg();
+
+    ASSERT_NE(info.dict_ids, nullptr) << "dict_ids should be set for Nullable(ColumnString) auto-encode";
+    ASSERT_EQ(info.dict_size, 3u);
+    ASSERT_NE(info.dict_null_map, nullptr) << "dict_null_map should be set for nullable key";
+    ASSERT_NE(info.auto_encoded_dict_col, nullptr) << "auto_encoded_dict_col should hold temporary";
+}
+CATCH
+
+/// Nullable with no actual nulls should still use the fast path and produce correct results
+TEST_F(AggregatorDictionaryVisitCacheTest, NullableDictNoActualNulls)
+try
+{
+    const size_t num_rows = 1000;
+    const size_t num_distinct = 5;
+
+    auto block = buildNullableDictBlock(num_rows, num_distinct, 0);
+    auto counts = runAggregation(block);
+
+    ASSERT_EQ(counts.size(), num_distinct);
+    for (size_t i = 0; i < num_distinct; ++i)
+    {
+        String key = "key_" + std::to_string(i);
+        ASSERT_EQ(counts[key], num_rows / num_distinct) << "Mismatch for key: " << key;
     }
 }
 CATCH
