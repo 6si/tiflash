@@ -336,6 +336,73 @@ TEST_F(ColumnDictionaryTest, ColumnStringInsertRangeFromDictionary)
     }
 }
 
+TEST_F(ColumnDictionaryTest, ColumnStringInsertSelectiveRangeFromDictionary)
+{
+    // Simulates the G2 crash: ColumnString::insertSelectiveRangeFrom receives
+    // a ColumnDictionary source (from late materialization path in DMFileReader).
+    // Previously crashed with "Cannot mmap 8 EiB" due to unchecked static_cast.
+    auto dict_col = createTestColumn();
+    ASSERT_TRUE(dict_col->isDictionaryEncoded());
+
+    // Build selective offsets (every other row)
+    IColumn::Offsets selective_offsets;
+    for (size_t i = 0; i < dict_col->size(); i += 2)
+        selective_offsets.push_back(i);
+
+    auto output = ColumnString::create();
+    output->insertSelectiveRangeFrom(*dict_col, selective_offsets, 0, selective_offsets.size());
+    ASSERT_EQ(output->size(), selective_offsets.size());
+
+    // Verify values match
+    for (size_t i = 0; i < output->size(); ++i)
+    {
+        Field dict_val, out_val;
+        dict_col->get(selective_offsets[i], dict_val);
+        output->get(i, out_val);
+        ASSERT_EQ(dict_val, out_val);
+    }
+}
+
+TEST_F(ColumnDictionaryTest, ColumnStringInsertFromDictionary)
+{
+    // Simulates insertFrom with ColumnDictionary source — same crash pattern.
+    auto dict_col = createTestColumn();
+    ASSERT_TRUE(dict_col->isDictionaryEncoded());
+
+    auto output = ColumnString::create();
+    for (size_t i = 0; i < dict_col->size(); ++i)
+        output->insertFrom(*dict_col, i);
+
+    ASSERT_EQ(output->size(), dict_col->size());
+    for (size_t i = 0; i < output->size(); ++i)
+    {
+        Field dict_val, out_val;
+        dict_col->get(i, dict_val);
+        output->get(i, out_val);
+        ASSERT_EQ(dict_val, out_val);
+    }
+}
+
+TEST_F(ColumnDictionaryTest, ColumnStringInsertManyFromDictionary)
+{
+    // Simulates insertManyFrom with ColumnDictionary source.
+    auto dict_col = createTestColumn();
+    ASSERT_TRUE(dict_col->isDictionaryEncoded());
+
+    auto output = ColumnString::create();
+    output->insertManyFrom(*dict_col, 2, 5); // Insert row 2, five times
+
+    ASSERT_EQ(output->size(), 5);
+    Field expected;
+    dict_col->get(2, expected);
+    for (size_t i = 0; i < 5; ++i)
+    {
+        Field out_val;
+        output->get(i, out_val);
+        ASSERT_EQ(expected, out_val);
+    }
+}
+
 TEST_F(ColumnDictionaryTest, FilterPreservesDictionary)
 {
     // Verifies that filter() on ColumnDictionary returns ColumnDictionary
