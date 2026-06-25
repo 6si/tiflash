@@ -212,7 +212,9 @@ Block DMFileReader::readWithFilter(const IColumn::Filter & filter)
             }
             for (size_t i = 0; i < block.columns(); ++i)
             {
-                auto column = block.getByPosition(i).column;
+                // ColumnDictionary must be materialized before insertSelectiveFrom —
+                // ColumnString::insertSelectiveRangeFrom does a static_cast<ColumnString> on src.
+                auto column = block.getByPosition(i).column->convertToFullColumnIfDictionary();
                 columns[i]->insertSelectiveFrom(*column, offsets);
             }
         }
@@ -220,7 +222,8 @@ Block DMFileReader::readWithFilter(const IColumn::Filter & filter)
         {
             for (size_t i = 0; i < block.columns(); ++i)
             {
-                columns[i]->insertRangeFrom(*block.getByPosition(i).column, 0, passed_count);
+                auto column = block.getByPosition(i).column->convertToFullColumnIfDictionary();
+                columns[i]->insertRangeFrom(*column, 0, passed_count);
             }
         }
     }
