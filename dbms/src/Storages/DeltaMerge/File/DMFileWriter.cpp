@@ -63,10 +63,11 @@ DMFileWriter::DMFileWriter(
 
     for (auto & cd : write_columns)
     {
-        // TODO: currently we only generate index for Integers, Date, DateTime types, and this should be configurable by user.
-        /// for handle column always generate index
+        /// Generate min/max index for handle, integer, date/datetime, and string columns.
+        /// String zone maps enable pack skipping for string predicates (e.g. WHERE status = 'active').
         auto type = removeNullable(cd.type);
-        bool do_index = cd.id == MutSup::extra_handle_id || type->isInteger() || type->isDateOrDateTime();
+        bool do_index = cd.id == MutSup::extra_handle_id || type->isInteger() || type->isDateOrDateTime()
+            || type->isString();
 
         // Dictionary codec on disk for String columns: enables DMFileReader to
         // produce ColumnDictionary directly without query-time hash map construction.

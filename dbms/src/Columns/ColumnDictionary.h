@@ -452,26 +452,57 @@ public:
 
     ScatterColumns scatter(ColumnIndex num_columns, const Selector & selector) const override
     {
-        auto materialized = decode();
-        return materialized->scatter(num_columns, selector);
+        ScatterColumns result(num_columns);
+        std::vector<PaddedPODArray<UInt32>> scattered_ids(num_columns);
+        for (size_t i = 0; i < ids.size(); ++i)
+            scattered_ids[selector[i]].push_back(ids[i]);
+        for (ColumnIndex part = 0; part < num_columns; ++part)
+            result[part] = ColumnDictionary::createMutable(dictionary, std::move(scattered_ids[part]), value_type);
+        return result;
     }
 
     ScatterColumns scatter(ColumnIndex num_columns, const Selector & selector, const BlockSelective & selective) const override
     {
-        auto materialized = decode();
-        return materialized->scatter(num_columns, selector, selective);
+        ScatterColumns result(num_columns);
+        std::vector<PaddedPODArray<UInt32>> scattered_ids(num_columns);
+        for (size_t idx = 0; idx < selective.size(); ++idx)
+            scattered_ids[selector[idx]].push_back(ids[selective[idx]]);
+        for (ColumnIndex part = 0; part < num_columns; ++part)
+            result[part] = ColumnDictionary::createMutable(dictionary, std::move(scattered_ids[part]), value_type);
+        return result;
     }
 
     void scatterTo(ScatterColumns & columns, const Selector & selector) const override
     {
-        auto materialized = decode();
-        materialized->scatterTo(columns, selector);
+        for (size_t i = 0; i < ids.size(); ++i)
+        {
+            auto & dest = columns[selector[i]];
+            auto * dest_dict = typeid_cast<ColumnDictionary *>(dest.get());
+            if (dest_dict)
+                dest_dict->getDictionaryIds().push_back(ids[i]);
+            else
+            {
+                StringRef ref = getDataAt(i);
+                dest->insertData(ref.data, ref.size);
+            }
+        }
     }
 
     void scatterTo(ScatterColumns & columns, const Selector & selector, const BlockSelective & selective) const override
     {
-        auto materialized = decode();
-        materialized->scatterTo(columns, selector, selective);
+        for (size_t idx = 0; idx < selective.size(); ++idx)
+        {
+            size_t i = selective[idx];
+            auto & dest = columns[selector[idx]];
+            auto * dest_dict = typeid_cast<ColumnDictionary *>(dest.get());
+            if (dest_dict)
+                dest_dict->getDictionaryIds().push_back(ids[i]);
+            else
+            {
+                StringRef ref = getDataAt(i);
+                dest->insertData(ref.data, ref.size);
+            }
+        }
     }
 
     void gather(ColumnGathererStream & /*gatherer_stream*/) override

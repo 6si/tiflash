@@ -16,6 +16,7 @@
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnVector.h>
+#include <Core/BlockInfo.h>
 #include <DataTypes/DataTypeString.h>
 #include <gtest/gtest.h>
 
@@ -441,6 +442,130 @@ TEST_F(ColumnDictionaryTest, Scatter)
     for (auto & part : scattered)
         total += part->size();
     ASSERT_EQ(total, n);
+}
+
+TEST_F(ColumnDictionaryTest, ScatterPreservesDictionary)
+{
+    auto col = createTestColumn();
+    size_t n = col->size();
+    IColumn::Selector selector(n);
+    for (size_t i = 0; i < n; ++i)
+        selector[i] = i % 2;
+
+    auto scattered = col->scatter(2, selector);
+    ASSERT_EQ(scattered.size(), 2);
+
+    // scatter() on ColumnDictionary should return ColumnDictionary partitions
+    for (auto & part : scattered)
+    {
+        ASSERT_TRUE(part->isDictionaryEncoded()) << "scatter() should preserve dictionary encoding";
+    }
+
+    // Verify values match original
+    size_t idx0 = 0, idx1 = 0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        Field orig_val;
+        col->get(i, orig_val);
+        if (i % 2 == 0)
+        {
+            Field part_val;
+            scattered[0]->get(idx0++, part_val);
+            ASSERT_EQ(orig_val, part_val);
+        }
+        else
+        {
+            Field part_val;
+            scattered[1]->get(idx1++, part_val);
+            ASSERT_EQ(orig_val, part_val);
+        }
+    }
+}
+
+TEST_F(ColumnDictionaryTest, ScatterWithSelective)
+{
+    auto col = createTestColumn();
+
+    // Selective: only rows 0,2,4,6,8
+    BlockSelective selective = {0, 2, 4, 6, 8};
+    IColumn::Selector selector(selective.size());
+    for (size_t i = 0; i < selective.size(); ++i)
+        selector[i] = i % 2;
+
+    auto scattered = col->scatter(2, selector, selective);
+    ASSERT_EQ(scattered.size(), 2);
+
+    size_t total = 0;
+    for (auto & part : scattered)
+    {
+        ASSERT_TRUE(part->isDictionaryEncoded());
+        total += part->size();
+    }
+    ASSERT_EQ(total, selective.size());
+}
+
+TEST_F(ColumnDictionaryTest, ScatterToWithDictionaryDest)
+{
+    auto col = createTestColumn();
+    size_t n = col->size();
+
+    // Create ColumnDictionary destinations (same dictionary)
+    IColumn::ScatterColumns targets(2);
+    std::vector<Field> dict = {Field(String("apple")), Field(String("banana")), Field(String("cherry"))};
+    PaddedPODArray<UInt32> empty_ids;
+    targets[0] = ColumnDictionary::createMutable(dict, PaddedPODArray<UInt32>{}, std::make_shared<DataTypeString>());
+    targets[1] = ColumnDictionary::createMutable(dict, PaddedPODArray<UInt32>{}, std::make_shared<DataTypeString>());
+
+    IColumn::Selector selector(n);
+    for (size_t i = 0; i < n; ++i)
+        selector[i] = i % 2;
+
+    col->scatterTo(targets, selector);
+
+    // Both targets should still be dictionary-encoded
+    ASSERT_TRUE(targets[0]->isDictionaryEncoded());
+    ASSERT_TRUE(targets[1]->isDictionaryEncoded());
+
+    // Verify correct values
+    size_t idx0 = 0, idx1 = 0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        Field orig_val;
+        col->get(i, orig_val);
+        if (i % 2 == 0)
+        {
+            Field target_val;
+            targets[0]->get(idx0++, target_val);
+            ASSERT_EQ(orig_val, target_val);
+        }
+        else
+        {
+            Field target_val;
+            targets[1]->get(idx1++, target_val);
+            ASSERT_EQ(orig_val, target_val);
+        }
+    }
+}
+
+TEST_F(ColumnDictionaryTest, ConvertToFullColumnIfDictionary)
+{
+    auto col = createTestColumn();
+    ColumnPtr col_ptr = std::move(col);
+
+    auto full = col_ptr->convertToFullColumnIfDictionary();
+    ASSERT_NE(full.get(), nullptr);
+    ASSERT_FALSE(full->isDictionaryEncoded());
+
+    // Verify all values match
+    auto orig = createTestColumn();
+    ASSERT_EQ(full->size(), orig->size());
+    for (size_t i = 0; i < full->size(); ++i)
+    {
+        Field orig_val, full_val;
+        orig->get(i, orig_val);
+        full->get(i, full_val);
+        ASSERT_EQ(orig_val, full_val);
+    }
 }
 
 } // namespace DB::tests
