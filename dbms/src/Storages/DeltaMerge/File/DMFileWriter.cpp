@@ -179,7 +179,11 @@ void DMFileWriter::write(const Block & block, const BlockProperty & block_proper
 
     for (auto & cd : write_columns)
     {
-        const auto & col = getByColumnId(block, cd.id).column;
+        auto col = getByColumnId(block, cd.id).column;
+        // ColumnDictionary may arrive here from scatter-preserved exchange paths
+        // or auto-encoding. Materialize to ColumnString before serialization —
+        // DataTypeString::serializeBinaryBulk requires concrete ColumnString.
+        col = col->convertToFullColumnIfDictionary();
         // Use the dict-encoded type for serialization if available
         auto it = dict_encoded_types.find(cd.id);
         const IDataType & type_for_write = (it != dict_encoded_types.end()) ? *it->second : *cd.type;
