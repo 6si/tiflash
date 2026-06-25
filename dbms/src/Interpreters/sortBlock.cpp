@@ -404,6 +404,16 @@ void sortBlock(Block & block, const SortDescription & description, size_t limit)
     if (!block)
         return;
 
+    // Materialize any ColumnDictionary columns referenced by sort keys.
+    // Sort comparators use static_cast<const ColumnString *> which crashes on ColumnDictionary.
+    for (const auto & desc : description)
+    {
+        auto & col_with_type = !desc.column_name.empty()
+            ? block.getByName(desc.column_name)
+            : block.safeGetByPosition(desc.column_number);
+        col_with_type.column = col_with_type.column->convertToFullColumnIfDictionary();
+    }
+
     /// If only one column to sort by
     if (description.size() == 1)
     {
