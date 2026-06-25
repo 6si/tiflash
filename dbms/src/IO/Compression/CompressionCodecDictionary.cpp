@@ -33,6 +33,35 @@ extern const int CANNOT_COMPRESS;
 extern const int CANNOT_DECOMPRESS;
 } // namespace ErrorCodes
 
+/// Non-throwing VarUInt reader. Returns false on truncated input instead of
+/// throwing ATTEMPT_TO_READ_AFTER_EOF. Used by doCompressData to handle
+/// compression buffer boundaries that may split mid-string.
+static bool tryReadVarUInt(UInt64 & x, const char *& pos, const char * end)
+{
+    x = 0;
+    for (size_t i = 0; i < 9; ++i)
+    {
+        if (pos == end)
+            return false;
+        UInt64 byte = static_cast<UInt8>(*pos);
+        ++pos;
+        x |= (byte & 0x7F) << (7 * i);
+        if (!(byte & 0x80))
+            return true;
+    }
+    return true;
+}
+
+static UInt32 writeRawFallback(const char * source, UInt32 source_size, char * dest)
+{
+    char * out = dest;
+    *out = 0; // index_width = 0 = raw fallback
+    out += sizeof(UInt8);
+    memcpy(out, source, source_size);
+    out += source_size;
+    return static_cast<UInt32>(out - dest);
+}
+
 UInt8 CompressionCodecDictionary::getMethodByte() const
 {
     return static_cast<UInt8>(CompressionMethodByte::Dictionary);
@@ -50,9 +79,12 @@ UInt32 CompressionCodecDictionary::doCompressData(const char * source, UInt32 so
     while (pos < end)
     {
         UInt64 str_len = 0;
-        pos = readVarUInt(str_len, pos, end - pos);
-        if (unlikely(pos + str_len > end))
-            throw Exception("CompressionCodecDictionary: input data truncated", ErrorCodes::CANNOT_COMPRESS);
+        if (unlikely(!tryReadVarUInt(str_len, pos, end) || pos + str_len > end))
+        {
+            // CompressedWriteBuffer flushed mid-string — the buffer boundary
+            // split a VarUInt-prefixed string. Fall back to raw passthrough.
+            return writeRawFallback(source, source_size, dest);
+        }
 
         std::string_view sv(pos, str_len);
         auto it = dict_map.find(sv);
@@ -60,14 +92,7 @@ UInt32 CompressionCodecDictionary::doCompressData(const char * source, UInt32 so
         if (it == dict_map.end())
         {
             if (dict_entries.size() >= MAX_DICT_SIZE)
-            {
-                char * out = dest;
-                *out = 0; // index_width = 0 = raw fallback
-                out += sizeof(UInt8);
-                memcpy(out, source, source_size);
-                out += source_size;
-                return static_cast<UInt32>(out - dest);
-            }
+                return writeRawFallback(source, source_size, dest);
             id = static_cast<UInt16>(dict_entries.size());
             dict_entries.push_back(sv);
             dict_map[sv] = id;
@@ -116,14 +141,7 @@ UInt32 CompressionCodecDictionary::doCompressData(const char * source, UInt32 so
     size_t raw_total = sizeof(UInt8) + source_size;
 
     if (dict_total >= raw_total)
-    {
-        char * out = dest;
-        *out = 0;
-        out += sizeof(UInt8);
-        memcpy(out, source, source_size);
-        out += source_size;
-        return static_cast<UInt32>(out - dest);
-    }
+        return writeRawFallback(source, source_size, dest);
 
     // Write v3 format: index_width 3 or 4 = LZ4-compressed IDs
     char * out = dest;

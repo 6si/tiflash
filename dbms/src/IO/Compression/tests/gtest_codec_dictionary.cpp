@@ -240,6 +240,86 @@ TEST_F(CompressionCodecDictionaryTest, MethodByte)
     ASSERT_EQ(codec.getMethodByte(), static_cast<UInt8>(CompressionMethodByte::Dictionary));
 }
 
+TEST_F(CompressionCodecDictionaryTest, TruncatedInput_MidString_RawFallback)
+{
+    // Simulates the crash scenario: CompressedWriteBuffer flushes mid-string,
+    // so doCompressData receives a buffer that ends in the middle of a string.
+    // Before the fix, this would throw "input data truncated" (SIGFATAL in prod).
+    std::vector<std::string> input = {"active", "inactive", "pending", "active", "deleted"};
+    auto full_source = buildSizePrefixData(input);
+
+    // Truncate at various positions within the last string
+    for (size_t cut = 1; cut <= 10; ++cut)
+    {
+        size_t truncated_size = full_source.size() - cut;
+        auto truncated = full_source.substr(0, truncated_size);
+        UInt32 source_size = static_cast<UInt32>(truncated.size());
+
+        // Should NOT throw — should fall back to raw passthrough
+        auto compressed = compressWithHeader(truncated);
+
+        // Verify raw fallback: index_width == 0
+        ASSERT_EQ(static_cast<UInt8>(*getPayload(compressed)), 0)
+            << "Expected raw fallback for truncation at -" << cut;
+
+        // Verify round-trip: decompress should produce exact same truncated bytes
+        auto decompressed = decompressWithHeader(compressed, source_size);
+        ASSERT_EQ(decompressed, truncated)
+            << "Round-trip failed for truncation at -" << cut;
+    }
+}
+
+TEST_F(CompressionCodecDictionaryTest, TruncatedInput_MidVarUInt_RawFallback)
+{
+    // Simulate buffer split in the middle of a multi-byte VarUInt length prefix.
+    // A string of length 200 has a 2-byte VarUInt (0xC8 0x01).
+    std::string long_str(200, 'x');
+    std::vector<std::string> input = {"short", long_str};
+    auto full_source = buildSizePrefixData(input);
+
+    // Cut right after the first byte of the 2-byte VarUInt for the long string
+    // "short" = VarUInt(5) + 5 bytes = 6 bytes. Then VarUInt(200) starts at offset 6.
+    // VarUInt(200) = 0xC8 0x01 (2 bytes). Cut after 0xC8 to leave an incomplete VarUInt.
+    size_t cut_pos = 6 + 1; // 6 bytes for "short" + 1 byte of VarUInt(200)
+    auto truncated = full_source.substr(0, cut_pos);
+    UInt32 source_size = static_cast<UInt32>(truncated.size());
+
+    auto compressed = compressWithHeader(truncated);
+    ASSERT_EQ(static_cast<UInt8>(*getPayload(compressed)), 0) << "Expected raw fallback for mid-VarUInt truncation";
+
+    auto decompressed = decompressWithHeader(compressed, source_size);
+    ASSERT_EQ(decompressed, truncated);
+}
+
+TEST_F(CompressionCodecDictionaryTest, LargeStrings_ExceedBufferSize)
+{
+    // Simulates the real crash: 8192 strings of ~200 bytes each = ~1.6MB,
+    // exceeding the 1MB CompressedWriteBuffer default. When the buffer flushes
+    // mid-pack, the codec receives a 1MB chunk that ends mid-string.
+    // Here we directly test doCompressData with a truncated chunk.
+    std::string payload(200, 'A');
+    std::vector<std::string> input;
+    for (int i = 0; i < 8192; ++i)
+        input.push_back(payload);
+
+    auto full_source = buildSizePrefixData(input);
+    // Each string = 2 bytes VarUInt(200) + 200 bytes = 202 bytes
+    // Total = 8192 * 202 = ~1,654,784 bytes > 1MB buffer
+
+    // Simulate the first 1MB buffer flush
+    size_t first_chunk = 1048576; // 1MB
+    ASSERT_LT(first_chunk, full_source.size());
+    auto chunk = full_source.substr(0, first_chunk);
+    UInt32 chunk_size = static_cast<UInt32>(chunk.size());
+
+    // Should not crash — should fall back to raw if the chunk ends mid-string
+    auto compressed = compressWithHeader(chunk);
+
+    // Verify round-trip
+    auto decompressed = decompressWithHeader(compressed, chunk_size);
+    ASSERT_EQ(decompressed, chunk);
+}
+
 TEST_F(CompressionCodecDictionaryTest, CompressionRatio_5NDV_100Krows)
 {
     std::vector<std::string> values = {"active", "inactive", "pending", "deleted", "suspended"};
