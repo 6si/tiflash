@@ -135,4 +135,70 @@ TEST_F(CodecRevenueComparisonTest, LightweightFallsBackForRandomData)
     EXPECT_EQ(data, decompressed) << "Lightweight decompression must produce identical data";
 }
 
+TEST(CompressionCodecLightweight, MisalignedDataFallback)
+{
+    // Simulate the crash scenario: Lightweight codec configured for Int64 (8-byte alignment)
+    // but receives data that isn't aligned to 8 bytes (e.g., 5 bytes from a partial buffer flush
+    // during PreHandleSnapshot). Previously this threw "data size 5 is not aligned to 8".
+    // After the fix, it should gracefully fall back to non-integer compression.
+    CompressionCodecLightweight codec(CompressionDataType::Int64, 3);
+
+    // 5 bytes — not aligned to 8
+    const char source[] = "hello";
+    const UInt32 source_size = 5;
+
+    std::vector<char> compressed(codec.getCompressedReserveSize(source_size));
+    auto compressed_size = codec.compress(source, source_size, compressed.data());
+    ASSERT_GT(compressed_size, 0u);
+
+    // Verify round-trip decompression works
+    std::vector<char> decompressed(source_size);
+    codec.decompress(compressed.data(), compressed_size, decompressed.data(), source_size);
+    EXPECT_EQ(std::string_view(decompressed.data(), source_size), std::string_view(source, source_size));
+}
+
+TEST(CompressionCodecLightweight, MisalignedInt32Fallback)
+{
+    // Int32 codec with 5 bytes (not aligned to 4)
+    CompressionCodecLightweight codec(CompressionDataType::Int32, 3);
+
+    const char source[] = "abcde";
+    const UInt32 source_size = 5;
+
+    std::vector<char> compressed(codec.getCompressedReserveSize(source_size));
+    auto compressed_size = codec.compress(source, source_size, compressed.data());
+    ASSERT_GT(compressed_size, 0u);
+
+    std::vector<char> decompressed(source_size);
+    codec.decompress(compressed.data(), compressed_size, decompressed.data(), source_size);
+    EXPECT_EQ(std::string_view(decompressed.data(), source_size), std::string_view(source, source_size));
+}
+
+TEST(CompressionCodecLightweight, AlignedDataStillUsesIntegerPath)
+{
+    // Verify aligned data still uses the efficient integer compression path
+    CompressionCodecLightweight codec(CompressionDataType::Int64, 3);
+
+    // 8 identical Int64 values — should compress well with integer path (constant encoding)
+    std::vector<Int64> data(8, 42);
+    const auto source_size = static_cast<UInt32>(data.size() * sizeof(Int64));
+
+    std::vector<char> compressed(codec.getCompressedReserveSize(source_size));
+    auto compressed_size
+        = codec.compress(reinterpret_cast<const char *>(data.data()), source_size, compressed.data());
+
+    // Integer path for constant data should compress well (< 50% of original even with header overhead)
+    double ratio = static_cast<double>(compressed_size) / source_size;
+    EXPECT_LT(ratio, 0.50) << "Aligned constant data should use integer compression path";
+
+    // Verify round-trip
+    std::vector<Int64> decompressed(8);
+    codec.decompress(
+        compressed.data(),
+        compressed_size,
+        reinterpret_cast<char *>(decompressed.data()),
+        source_size);
+    EXPECT_EQ(data, decompressed);
+}
+
 } // namespace DB::tests

@@ -48,9 +48,16 @@ UInt32 CompressionCodecLightweight::getMaxCompressedDataSize(UInt32 uncompressed
 
 UInt32 CompressionCodecLightweight::doCompressData(const char * source, UInt32 source_size, char * dest) const
 {
-    dest[0] = magic_enum::enum_integer(data_type);
+    // If data_type is integer but source_size isn't aligned to the type's byte width,
+    // fall back to non-integer (LZ4) compression. This can occur when CompressedWriteBuffer
+    // flushes a partial buffer during PreHandleSnapshot with very few rows.
+    auto effective_type = data_type;
+    if (isInteger(data_type) && source_size % static_cast<UInt8>(data_type) != 0)
+        effective_type = CompressionDataType::Unknown;
+
+    dest[0] = magic_enum::enum_integer(effective_type);
     dest += 1;
-    switch (data_type)
+    switch (effective_type)
     {
     case CompressionDataType::Int8:
         return 1 + compressDataForInteger<UInt8>(source, source_size, dest);
