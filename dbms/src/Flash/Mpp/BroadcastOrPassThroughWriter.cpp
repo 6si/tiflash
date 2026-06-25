@@ -17,6 +17,7 @@
 #include <Flash/Coprocessor/CHBlockChunkCodecV1.h>
 #include <Flash/Coprocessor/DAGContext.h>
 #include <Flash/Mpp/BroadcastOrPassThroughWriter.h>
+#include <Flash/Mpp/HashBaseWriterHelper.h>
 #include <Flash/Mpp/MPPTunnelSetWriter.h>
 #include <TiDB/Decode/TypeMapping.h>
 
@@ -119,6 +120,8 @@ template <class ExchangeWriterPtr>
 void BroadcastOrPassThroughWriter<ExchangeWriterPtr>::writeBlocks()
 {
     assert(!blocks.empty());
+
+    HashBaseWriterHelper::materializeBlocks(blocks);
 
     // check schema
     if (!expected_types.empty())

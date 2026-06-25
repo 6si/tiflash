@@ -444,9 +444,27 @@ public:
         return ColumnDictionary::createMutable(dictionary, std::move(new_ids), value_type);
     }
 
-    size_t byteSize() const override { return ids.size() * sizeof(UInt32) + dictionary.size() * 16; }
+    size_t byteSize() const override
+    {
+        size_t dict_bytes = 0;
+        for (const auto & field : dictionary)
+        {
+            const auto & s = field.get<String>();
+            dict_bytes += s.size() + sizeof(UInt64); // string data + length prefix
+        }
+        return ids.size() * sizeof(UInt32) + dict_bytes;
+    }
 
-    size_t allocatedBytes() const override { return ids.allocated_bytes() + dictionary.capacity() * 16; }
+    size_t allocatedBytes() const override
+    {
+        size_t dict_bytes = 0;
+        for (const auto & field : dictionary)
+        {
+            const auto & s = field.get<String>();
+            dict_bytes += s.capacity() + sizeof(UInt64);
+        }
+        return ids.allocated_bytes() + dict_bytes;
+    }
 
     void forEachSubcolumn(ColumnCallback) override {}
 

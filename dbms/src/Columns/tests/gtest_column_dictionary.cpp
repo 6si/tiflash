@@ -16,6 +16,7 @@
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnVector.h>
+#include <Core/Block.h>
 #include <Core/BlockInfo.h>
 #include <DataTypes/DataTypeString.h>
 #include <gtest/gtest.h>
@@ -566,6 +567,112 @@ TEST_F(ColumnDictionaryTest, ConvertToFullColumnIfDictionary)
         full->get(i, full_val);
         ASSERT_EQ(orig_val, full_val);
     }
+}
+
+TEST_F(ColumnDictionaryTest, ByteSizeReturnsReasonableValue)
+{
+    auto col = createTestColumn();
+    // 10 rows, 3 dict entries ("apple"=5, "banana"=6, "cherry"=6 bytes)
+    size_t expected_ids = 10 * sizeof(UInt32); // 40 bytes
+    size_t expected_dict = (5 + 8) + (6 + 8) + (6 + 8); // string data + UInt64 prefix per entry = 41
+    size_t byte_size = col->byteSize();
+    ASSERT_EQ(byte_size, expected_ids + expected_dict);
+    // Must be reasonable — definitely less than 1 MB for 10 rows with short strings
+    ASSERT_LT(byte_size, 1024 * 1024);
+}
+
+TEST_F(ColumnDictionaryTest, ByteSizeWithLargeStrings)
+{
+    // Simulate VARCHAR(256) columns like "region" that triggered the original bug
+    std::vector<Field> dict;
+    for (int i = 0; i < 50; ++i)
+        dict.emplace_back(String(200, 'A' + (i % 26))); // 200-char strings
+
+    PaddedPODArray<UInt32> ids;
+    for (UInt32 i = 0; i < 8192; ++i)
+        ids.push_back(i % 50);
+
+    auto col = ColumnDictionary::createMutable(std::move(dict), std::move(ids), std::make_shared<DataTypeString>());
+
+    size_t byte_size = col->byteSize();
+    // 8192 * 4 = 32768 for ids
+    // 50 * (200 + 8) = 10400 for dictionary
+    // Total should be ~43168
+    ASSERT_GT(byte_size, 32768); // at least the ids
+    ASSERT_LT(byte_size, 100000); // definitely not 8 EiB
+    // Verify it's close to expected
+    size_t expected = 8192 * sizeof(UInt32) + 50 * (200 + sizeof(UInt64));
+    ASSERT_EQ(byte_size, expected);
+}
+
+TEST_F(ColumnDictionaryTest, AllocatedBytesReasonable)
+{
+    auto col = createTestColumn();
+    size_t alloc = col->allocatedBytes();
+    // Must be positive and reasonable
+    ASSERT_GT(alloc, 0UL);
+    ASSERT_LT(alloc, 1024 * 1024);
+    // byteSize should also be reasonable
+    ASSERT_GT(col->byteSize(), 0UL);
+    ASSERT_LT(col->byteSize(), 1024 * 1024);
+}
+
+TEST_F(ColumnDictionaryTest, BlockBytesWithColumnDictionary)
+{
+    // Simulate the exact scenario: a Block containing ColumnDictionary
+    // passes through ExchangeSender which calls block.bytes() and block.allocatedBytes()
+    auto dict_col = createTestColumn();
+    ColumnPtr col_ptr = dict_col->getPtr();
+
+    Block block;
+    ColumnWithTypeAndName col_with_type;
+    col_with_type.column = col_ptr;
+    col_with_type.type = std::make_shared<DataTypeString>();
+    col_with_type.name = "status";
+    block.insert(col_with_type);
+
+    // This is what ExchangeSender calls for buffered_bytes tracking
+    size_t block_bytes = block.bytes();
+    size_t block_allocated = block.allocatedBytes();
+
+    // Both must be reasonable — not overflow/garbage
+    ASSERT_GT(block_bytes, 0UL);
+    ASSERT_LT(block_bytes, 1024 * 1024); // 10 rows of short strings < 1MB
+    ASSERT_GT(block_allocated, 0UL);
+    ASSERT_LT(block_allocated, 1024 * 1024);
+}
+
+TEST_F(ColumnDictionaryTest, MaterializeBlockConvertsColumnDictionary)
+{
+    // Simulate the exchange writer materializeBlock() path
+    auto dict_col = createTestColumn();
+    ColumnPtr col_ptr = dict_col->getPtr();
+
+    Block block;
+    ColumnWithTypeAndName col_with_type;
+    col_with_type.column = col_ptr;
+    col_with_type.type = std::make_shared<DataTypeString>();
+    col_with_type.name = "region";
+    block.insert(col_with_type);
+
+    // Before materialization: column is ColumnDictionary
+    ASSERT_TRUE(block.getByPosition(0).column->isDictionaryEncoded());
+
+    // Simulate what materializeBlock now does
+    for (size_t i = 0; i < block.columns(); ++i)
+    {
+        auto & element = block.getByPosition(i);
+        auto & src = element.column;
+        if (ColumnPtr converted = src->convertToFullColumnIfConst())
+            src = converted;
+        src = src->convertToFullColumnIfDictionary();
+    }
+
+    // After materialization: column is ColumnString
+    ASSERT_FALSE(block.getByPosition(0).column->isDictionaryEncoded());
+    ASSERT_EQ(block.getByPosition(0).column->size(), 10);
+    ASSERT_EQ(block.getByPosition(0).column->getDataAt(0), StringRef("apple", 5));
+    ASSERT_EQ(block.getByPosition(0).column->getDataAt(1), StringRef("banana", 6));
 }
 
 } // namespace DB::tests
