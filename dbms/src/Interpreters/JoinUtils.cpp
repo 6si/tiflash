@@ -36,6 +36,14 @@ ColumnRawPtrs extractAndMaterializeKeyColumns(
             materialized_columns.emplace_back(converted);
             key_columns[i] = materialized_columns.back().get();
         }
+        {
+            ColumnPtr converted = key_columns[i]->convertToFullColumnIfDictionary();
+            if (converted.get() != key_columns[i])
+            {
+                materialized_columns.emplace_back(converted);
+                key_columns[i] = materialized_columns.back().get();
+            }
+        }
     }
     return key_columns;
 }

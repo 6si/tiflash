@@ -20,6 +20,7 @@
 #include <Flash/Coprocessor/DefaultChunkCodec.h>
 #include <Flash/Coprocessor/StreamWriter.h>
 #include <Flash/Coprocessor/StreamingDAGResponseWriter.h>
+#include <Flash/Mpp/HashBaseWriterHelper.h>
 #include <Flash/Mpp/MPPTunnelSetWriter.h>
 
 namespace DB
@@ -116,6 +117,11 @@ template <class StreamWriterPtr>
 void StreamingDAGResponseWriter<StreamWriterPtr>::encodeThenWriteBlocks()
 {
     assert(!blocks.empty());
+
+    // Materialize ColumnDictionary (and ColumnConst) before encoding.
+    // CHBlockChunkCodec::WriteColumnData handles this too, but memory accounting
+    // (block.allocatedBytes()) is called before encode, so we must materialize early.
+    HashBaseWriterHelper::materializeBlocks(blocks);
 
     TrackedSelectResp response;
     response.setEncodeType(dag_context.encode_type);

@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <Columns/ColumnDictionary.h>
 #include <Columns/ColumnString.h>
 #include <Columns/filterColumn.h>
 #include <Common/HashTable/Hash.h>
@@ -85,6 +86,16 @@ void ColumnString::insertRangeFrom(const IColumn & src, size_t start, size_t len
 {
     if (length == 0)
         return;
+
+    // Handle ColumnDictionary source by materializing to ColumnString first.
+    // This happens during delta-stable merge when stable layer has dictionary-on-disk
+    // columns but the output column is ColumnString.
+    if (const auto * dict_col = typeid_cast<const ColumnDictionary *>(&src))
+    {
+        auto decoded = dict_col->decode();
+        insertRangeFrom(*decoded, start, length);
+        return;
+    }
 
     const auto & src_concrete = static_cast<const ColumnString &>(src);
 

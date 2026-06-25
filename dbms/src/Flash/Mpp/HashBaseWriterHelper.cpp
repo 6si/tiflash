@@ -26,6 +26,7 @@ void materializeBlock(Block & input_block)
         auto & src = element.column;
         if (ColumnPtr converted = src->convertToFullColumnIfConst())
             src = converted;
+        src = src->convertToFullColumnIfDictionary();
     }
 }
 

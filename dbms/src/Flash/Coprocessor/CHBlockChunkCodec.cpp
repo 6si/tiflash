@@ -90,8 +90,9 @@ void CHBlockChunkCodec::WriteColumnData(
     size_t offset,
     size_t limit)
 {
-    /** If there are columns-constants - then we materialize them.
-      * (Since the data type does not know how to serialize / deserialize constants.)
+    /** Materialize columns-constants and dictionary-encoded columns before serialization.
+      * DataType serializers (e.g. DataTypeString) use typeid_cast to the concrete column type
+      * and cannot handle ColumnConst or ColumnDictionary directly.
       */
     ColumnPtr full_column;
 
@@ -99,6 +100,9 @@ void CHBlockChunkCodec::WriteColumnData(
         full_column = converted;
     else
         full_column = column;
+
+    if (ColumnPtr converted = full_column->convertToFullColumnIfDictionary())
+        full_column = converted;
 
     IDataType::OutputStreamGetter output_stream_getter = [&](const IDataType::SubstreamPath &) {
         return &ostr;

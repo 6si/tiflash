@@ -13,6 +13,9 @@
 // limitations under the License.
 
 #include <Common/TiFlashException.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeString.h>
+#include <IO/Compression/CompressionInfo.h>
 #include <IO/FileProvider/WriteBufferFromWritableFileBuilder.h>
 #include <Storages/DeltaMerge/DeltaMergeHelpers.h>
 #include <Storages/DeltaMerge/File/DMFileWriter.h>
@@ -27,6 +30,7 @@
 
 namespace DB::DM
 {
+
 
 DMFileWriter::DMFileWriter(
     const DMFilePtr & dmfile_,
@@ -59,17 +63,34 @@ DMFileWriter::DMFileWriter(
 
     for (auto & cd : write_columns)
     {
-        // TODO: currently we only generate index for Integers, Date, DateTime types, and this should be configurable by user.
-        /// for handle column always generate index
+        /// Generate min/max index for handle, integer, date/datetime, and string columns.
+        /// String zone maps enable pack skipping for string predicates (e.g. WHERE status = 'active').
         auto type = removeNullable(cd.type);
-        bool do_index = cd.id == MutSup::extra_handle_id || type->isInteger() || type->isDateOrDateTime();
+        bool do_index = cd.id == MutSup::extra_handle_id || type->isInteger() || type->isDateOrDateTime()
+            || type->isString();
 
-        addStreams(cd.id, cd.type, do_index);
+        // Dictionary codec on disk for String columns: enables DMFileReader to
+        // produce ColumnDictionary directly without query-time hash map construction.
+        // Force SizePrefix format so Dictionary codec gets VarUInt-prefixed strings
+        // in a single substream (StringV2 splits into offsets+chars which the codec can't parse).
+        auto type_on_disk = cd.type;
+        bool use_dict = false;
+        if (type->isString() && cd.id != MutSup::extra_handle_id)
+        {
+            use_dict = true;
+            auto size_prefix_string = std::make_shared<DataTypeString>(DataTypeString::SerdesFormat::SizePrefix);
+            if (cd.type->isNullable())
+                type_on_disk = std::make_shared<DataTypeNullable>(size_prefix_string);
+            else
+                type_on_disk = size_prefix_string;
+        }
+
+        addStreams(cd.id, type_on_disk, do_index, use_dict);
         dmfile->meta->getColumnStats().emplace(
             cd.id,
             ColumnStat{
                 .col_id = cd.id,
-                .type = cd.type,
+                .type = type_on_disk,
                 .avg_size = 0,
                 // ... here ignore some fields with default initializers
                 .indexes = {},
@@ -77,6 +98,10 @@ DMFileWriter::DMFileWriter(
                 .additional_data_for_test = {},
 #endif
             });
+
+        // Store the on-disk type for use in write() and finalizeColumn()
+        if (use_dict)
+            dict_encoded_types[cd.id] = type_on_disk;
     }
 }
 
@@ -109,17 +134,22 @@ DMFileWriter::WriteBufferFromFileBasePtr DMFileWriter::createMetaFile()
     }
 }
 
-void DMFileWriter::addStreams(ColId col_id, DataTypePtr type, bool do_index)
+void DMFileWriter::addStreams(ColId col_id, DataTypePtr type, bool do_index, bool use_dict)
 {
     auto callback = [&](const IDataType::SubstreamPath & substream_path) {
         const auto stream_name = DMFile::getFileNameBase(col_id, substream_path);
         bool substream_can_index = !IDataType::isNullMap(substream_path) && !IDataType::isArraySizes(substream_path)
             && !IDataType::isStringSizes(substream_path);
+        // Use Dictionary codec for the main data stream of dict-encoded columns
+        bool is_dict_data_stream = use_dict && !IDataType::isNullMap(substream_path);
+        auto compression = is_dict_data_stream
+            ? CompressionSettings(CompressionSetting(CompressionMethodByte::Dictionary))
+            : options.compression_settings;
         auto stream = std::make_unique<Stream>(
             dmfile,
             stream_name,
             type,
-            options.compression_settings,
+            compression,
             options.max_compress_block_size,
             file_provider,
             write_limiter,
@@ -149,8 +179,15 @@ void DMFileWriter::write(const Block & block, const BlockProperty & block_proper
 
     for (auto & cd : write_columns)
     {
-        const auto & col = getByColumnId(block, cd.id).column;
-        writeColumn(cd.id, *cd.type, *col, del_mark);
+        auto col = getByColumnId(block, cd.id).column;
+        // ColumnDictionary may arrive here from scatter-preserved exchange paths
+        // or auto-encoding. Materialize to ColumnString before serialization —
+        // DataTypeString::serializeBinaryBulk requires concrete ColumnString.
+        col = col->convertToFullColumnIfDictionary();
+        // Use the dict-encoded type for serialization if available
+        auto it = dict_encoded_types.find(cd.id);
+        const IDataType & type_for_write = (it != dict_encoded_types.end()) ? *it->second : *cd.type;
+        writeColumn(cd.id, type_for_write, *col, del_mark);
 
         if (cd.id == MutSup::version_col_id)
             stat.first_version = col->get64(0);
@@ -172,7 +209,9 @@ void DMFileWriter::finalize()
     // Some fields of ColumnStat is set in `finalizeColumn`
     for (auto & cd : write_columns)
     {
-        finalizeColumn(cd.id, cd.type);
+        auto it = dict_encoded_types.find(cd.id);
+        auto type_for_finalize = (it != dict_encoded_types.end()) ? it->second : cd.type;
+        finalizeColumn(cd.id, type_for_finalize);
     }
     if (dmfile->useMetaV2())
     {

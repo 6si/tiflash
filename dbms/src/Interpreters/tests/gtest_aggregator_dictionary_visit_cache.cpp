@@ -1,0 +1,617 @@
+// Copyright 2024 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <AggregateFunctions/AggregateFunctionFactory.h>
+#include <AggregateFunctions/registerAggregateFunctions.h>
+#include <Columns/ColumnDictionary.h>
+#include <Columns/ColumnNullable.h>
+#include <Columns/ColumnString.h>
+#include <Columns/ColumnsNumber.h>
+#include <Core/ColumnWithTypeAndName.h>
+#include <Core/OperatorSpillContext.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypesNumber.h>
+#include <Debug/TiFlashTestEnv.h>
+#include <IO/Encryption/MockKeyManager.h>
+#include <IO/FileProvider/FileProvider.h>
+#include <Interpreters/Aggregator.h>
+#include <Interpreters/Context.h>
+#include <TiDB/Collation/Collator.h>
+#include <TestUtils/TiFlashTestBasic.h>
+#include <gtest/gtest.h>
+
+namespace DB::tests
+{
+
+class AggregatorDictionaryVisitCacheTest : public ::testing::Test
+{
+protected:
+    static void SetUpTestCase()
+    {
+        try
+        {
+            DB::registerAggregateFunctions();
+        }
+        catch (DB::Exception &)
+        {
+            // Already registered
+        }
+    }
+
+    void SetUp() override
+    {
+        context = TiFlashTestEnv::getContext();
+        auto key_manager = std::make_shared<MockKeyManager>(false);
+        auto file_provider = std::make_shared<FileProvider>(key_manager, false);
+        spill_dir = TiFlashTestEnv::getTemporaryPath("agg_dict_visit_cache_test");
+        spill_config = std::make_shared<SpillConfig>(spill_dir, "test", 1024ULL * 1024 * 1024, 0, 0, file_provider);
+    }
+
+    void TearDown() override
+    {
+        Poco::File spiller_dir(spill_dir);
+        if (spiller_dir.exists())
+            spiller_dir.remove(true);
+    }
+
+    /// Build a block with: col0 = ColumnDictionary key, col1 = UInt64 values
+    static Block buildDictBlock(size_t num_rows, size_t num_distinct)
+    {
+        std::vector<Field> dict;
+        dict.reserve(num_distinct);
+        for (size_t i = 0; i < num_distinct; ++i)
+            dict.push_back(Field(String("key_") + std::to_string(i)));
+
+        PaddedPODArray<UInt32> ids;
+        ids.reserve(num_rows);
+        for (size_t i = 0; i < num_rows; ++i)
+            ids.push_back(static_cast<UInt32>(i % num_distinct));
+
+        auto dict_col = ColumnDictionary::createMutable(std::move(dict), std::move(ids), std::make_shared<DataTypeString>());
+
+        auto val_col = ColumnUInt64::create();
+        for (size_t i = 0; i < num_rows; ++i)
+            val_col->insert(Field(static_cast<UInt64>(1)));
+
+        Block block;
+        block.insert(ColumnWithTypeAndName(std::move(dict_col), std::make_shared<DataTypeString>(), "key"));
+        block.insert(ColumnWithTypeAndName(std::move(val_col), std::make_shared<DataTypeUInt64>(), "val"));
+        return block;
+    }
+
+    /// Build an equivalent block using ColumnString (no dictionary)
+    static Block buildStringBlock(size_t num_rows, size_t num_distinct)
+    {
+        auto str_col = ColumnString::create();
+        for (size_t i = 0; i < num_rows; ++i)
+            str_col->insert(Field(String("key_") + std::to_string(i % num_distinct)));
+
+        auto val_col = ColumnUInt64::create();
+        for (size_t i = 0; i < num_rows; ++i)
+            val_col->insert(Field(static_cast<UInt64>(1)));
+
+        Block block;
+        block.insert(ColumnWithTypeAndName(std::move(str_col), std::make_shared<DataTypeString>(), "key"));
+        block.insert(ColumnWithTypeAndName(std::move(val_col), std::make_shared<DataTypeUInt64>(), "val"));
+        return block;
+    }
+
+    /// Create Aggregator for: SELECT key, COUNT(val) FROM ... GROUP BY key
+    std::unique_ptr<Aggregator> createCountAggregator(const Block & header)
+    {
+        auto data_type_uint64 = std::make_shared<DataTypeUInt64>();
+        AggregateDescriptions agg_descs{
+            {.function = AggregateFunctionFactory::instance().get(*context, "count", {data_type_uint64}, {}, 0, false),
+             .parameters = {},
+             .arguments = {1},
+             .argument_names = {"val"},
+             .column_name = "count(val)"},
+        };
+
+        ColumnNumbers keys = {0};
+        KeyRefAggFuncMap key_ref_agg_func;
+        AggFuncRefKeyMap agg_func_ref_key;
+
+        Aggregator::Params params(
+            header,
+            keys,
+            key_ref_agg_func,
+            agg_func_ref_key,
+            agg_descs,
+            0,
+            0,
+            0,
+            false,
+            *spill_config,
+            8192,
+            false);
+
+        RegisterOperatorSpillContext no_spill = [](const OperatorSpillContextPtr &) {};
+        return std::make_unique<Aggregator>(params, "test", /*concurrency=*/1, no_spill, false, false);
+    }
+
+    /// Run aggregation on a block, return {key -> count} map.
+    /// Null keys are stored under the special key "\0__NULL__".
+    static constexpr const char * NULL_KEY_SENTINEL = "\0__NULL__";
+
+    std::map<String, UInt64> runAggregation(const Block & block)
+    {
+        auto aggregator = createCountAggregator(block);
+        auto result = std::make_shared<AggregatedDataVariants>();
+        Aggregator::AggProcessInfo info(aggregator.get());
+        info.resetBlock(block);
+        aggregator->executeOnBlock(info, *result, 0);
+
+        ManyAggregatedDataVariants variants;
+        variants.push_back(result);
+        auto merged = aggregator->mergeAndConvertToBlocks(variants, true, 1);
+
+        std::map<String, UInt64> counts;
+        if (!merged)
+            return counts;
+
+        for (size_t ci = 0; ci < merged->getConcurrency(); ++ci)
+        {
+            auto output_block = merged->getData(ci);
+            if (!output_block)
+                continue;
+            size_t rows = output_block.rows();
+            if (rows == 0)
+                continue;
+            const auto & key_col = output_block.getByPosition(0).column;
+            const auto & cnt_col = output_block.getByPosition(1).column;
+            for (size_t i = 0; i < rows; ++i)
+            {
+                String key;
+                if (const auto * nullable = typeid_cast<const ColumnNullable *>(key_col.get()))
+                {
+                    if (nullable->isNullAt(i))
+                        key = NULL_KEY_SENTINEL;
+                    else
+                        key = nullable->getNestedColumn().getDataAt(i).toString();
+                }
+                else
+                {
+                    key = key_col->getDataAt(i).toString();
+                }
+                UInt64 count = cnt_col->getUInt(i);
+                counts[key] += count;
+            }
+        }
+        return counts;
+    }
+
+    /// Create Aggregator with a collator for: SELECT key, COUNT(val) FROM ... GROUP BY key
+    std::unique_ptr<Aggregator> createCountAggregatorWithCollator(
+        const Block & header,
+        TiDB::TiDBCollatorPtr collator)
+    {
+        auto data_type_uint64 = std::make_shared<DataTypeUInt64>();
+        AggregateDescriptions agg_descs{
+            {.function = AggregateFunctionFactory::instance().get(*context, "count", {data_type_uint64}, {}, 0, false),
+             .parameters = {},
+             .arguments = {1},
+             .argument_names = {"val"},
+             .column_name = "count(val)"},
+        };
+
+        ColumnNumbers keys = {0};
+        KeyRefAggFuncMap key_ref_agg_func;
+        AggFuncRefKeyMap agg_func_ref_key;
+
+        TiDB::TiDBCollators collators;
+        collators.push_back(collator);
+
+        Aggregator::Params params(
+            header,
+            keys,
+            key_ref_agg_func,
+            agg_func_ref_key,
+            agg_descs,
+            0,
+            0,
+            0,
+            false,
+            *spill_config,
+            8192,
+            false,
+            collators);
+
+        RegisterOperatorSpillContext no_spill = [](const OperatorSpillContextPtr &) {};
+        return std::make_unique<Aggregator>(params, "test", /*concurrency=*/1, no_spill, false, false);
+    }
+
+    std::shared_ptr<Context> context;
+    std::shared_ptr<SpillConfig> spill_config;
+    String spill_dir;
+};
+
+/// Verify visit-cache produces correct GROUP BY results with ColumnDictionary key
+TEST_F(AggregatorDictionaryVisitCacheTest, CorrectCountWithDictionaryKey)
+try
+{
+    const size_t num_rows = 1000;
+    const size_t num_distinct = 5;
+
+    auto dict_block = buildDictBlock(num_rows, num_distinct);
+    auto string_block = buildStringBlock(num_rows, num_distinct);
+
+    auto dict_counts = runAggregation(dict_block);
+    auto string_counts = runAggregation(string_block);
+
+    ASSERT_EQ(dict_counts.size(), num_distinct);
+    ASSERT_EQ(string_counts.size(), num_distinct);
+
+    for (size_t i = 0; i < num_distinct; ++i)
+    {
+        String key = "key_" + std::to_string(i);
+        ASSERT_EQ(dict_counts[key], num_rows / num_distinct) << "Mismatch for key: " << key;
+        ASSERT_EQ(dict_counts[key], string_counts[key]) << "Dict vs String mismatch for key: " << key;
+    }
+}
+CATCH
+
+/// Verify visit-cache activates (dict_ids is populated in AggProcessInfo)
+TEST_F(AggregatorDictionaryVisitCacheTest, VisitCacheActivation)
+try
+{
+    auto dict_block = buildDictBlock(512, 3);
+    auto aggregator = createCountAggregator(dict_block);
+    Aggregator::AggProcessInfo info(aggregator.get());
+    info.resetBlock(dict_block);
+    info.prepareForAgg();
+
+    ASSERT_NE(info.dict_ids, nullptr) << "dict_ids should be set for ColumnDictionary key";
+    ASSERT_EQ(info.dict_size, 3u);
+    ASSERT_EQ(info.dict_entries_refs.size(), 3u);
+    ASSERT_EQ(info.dict_entries_refs[0].toString(), "key_0");
+    ASSERT_EQ(info.dict_entries_refs[1].toString(), "key_1");
+    ASSERT_EQ(info.dict_entries_refs[2].toString(), "key_2");
+}
+CATCH
+
+/// Verify visit-cache auto-encodes low-cardinality ColumnString
+TEST_F(AggregatorDictionaryVisitCacheTest, AutoEncodeColumnString)
+try
+{
+    auto string_block = buildStringBlock(512, 3);
+    auto aggregator = createCountAggregator(string_block);
+    Aggregator::AggProcessInfo info(aggregator.get());
+    info.resetBlock(string_block);
+    info.prepareForAgg();
+
+    ASSERT_NE(info.dict_ids, nullptr) << "dict_ids should be set for auto-encoded low-cardinality ColumnString";
+    ASSERT_EQ(info.dict_size, 3u);
+    ASSERT_NE(info.auto_encoded_dict_col, nullptr) << "auto_encoded_dict_col should hold the temporary ColumnDictionary";
+}
+CATCH
+
+/// Verify visit-cache does NOT activate for small blocks (below MIN_ROWS_FOR_AUTO_ENCODE)
+TEST_F(AggregatorDictionaryVisitCacheTest, NoAutoEncodeForSmallBlock)
+try
+{
+    auto string_block = buildStringBlock(100, 3);
+    auto aggregator = createCountAggregator(string_block);
+    Aggregator::AggProcessInfo info(aggregator.get());
+    info.resetBlock(string_block);
+    info.prepareForAgg();
+
+    ASSERT_EQ(info.dict_ids, nullptr) << "dict_ids should be null for small block";
+    ASSERT_EQ(info.dict_size, 0u);
+}
+CATCH
+
+/// Verify large dictionary (> 65536) falls back to standard path
+TEST_F(AggregatorDictionaryVisitCacheTest, LargeDictionaryFallsBack)
+try
+{
+    auto dict_block = buildDictBlock(100000, 70000);
+    auto aggregator = createCountAggregator(dict_block);
+    Aggregator::AggProcessInfo info(aggregator.get());
+    info.resetBlock(dict_block);
+    info.prepareForAgg();
+
+    ASSERT_EQ(info.dict_ids, nullptr) << "dict_ids should be null for large dictionary (> 65536)";
+}
+CATCH
+
+/// Verify correctness with multiple blocks (cross-block dictionary remapping)
+TEST_F(AggregatorDictionaryVisitCacheTest, MultiBlockCorrectness)
+try
+{
+    // Block 1: keys key_0, key_1, key_2 with 300 rows each
+    auto block1 = buildDictBlock(900, 3);
+    // Block 2: keys key_0, ..., key_4 with 200 rows each
+    auto block2 = buildDictBlock(1000, 5);
+
+    auto aggregator = createCountAggregator(block1);
+    auto result = std::make_shared<AggregatedDataVariants>();
+
+    {
+        Aggregator::AggProcessInfo info(aggregator.get());
+        info.resetBlock(block1);
+        aggregator->executeOnBlock(info, *result, 0);
+    }
+    {
+        Aggregator::AggProcessInfo info(aggregator.get());
+        info.resetBlock(block2);
+        aggregator->executeOnBlock(info, *result, 0);
+    }
+
+    ManyAggregatedDataVariants variants2;
+    variants2.push_back(result);
+    auto merged = aggregator->mergeAndConvertToBlocks(variants2, true, 1);
+
+    std::map<String, UInt64> counts;
+    if (merged)
+    {
+        for (size_t ci = 0; ci < merged->getConcurrency(); ++ci)
+        {
+            auto output_block = merged->getData(ci);
+            if (!output_block)
+                continue;
+            size_t rows = output_block.rows();
+            if (rows == 0)
+                continue;
+            const auto & key_col = output_block.getByPosition(0).column;
+            const auto & cnt_col = output_block.getByPosition(1).column;
+            for (size_t i = 0; i < rows; ++i)
+            {
+                String key = key_col->getDataAt(i).toString();
+                UInt64 count = cnt_col->getUInt(i);
+                counts[key] += count;
+            }
+        }
+    }
+
+    // key_0: 300 (block1) + 200 (block2) = 500
+    // key_1: 300 + 200 = 500
+    // key_2: 300 + 200 = 500
+    // key_3: 0 + 200 = 200
+    // key_4: 0 + 200 = 200
+    ASSERT_EQ(counts.size(), 5u);
+    ASSERT_EQ(counts["key_0"], 500u);
+    ASSERT_EQ(counts["key_1"], 500u);
+    ASSERT_EQ(counts["key_2"], 500u);
+    ASSERT_EQ(counts["key_3"], 200u);
+    ASSERT_EQ(counts["key_4"], 200u);
+}
+CATCH
+
+/// Verify visit-cache activates WITH a collator (previously blocked by collator check)
+TEST_F(AggregatorDictionaryVisitCacheTest, VisitCacheActivatesWithCollator)
+try
+{
+    auto collator = TiDB::ITiDBCollator::getCollator(TiDB::ITiDBCollator::UTF8MB4_BIN);
+    ASSERT_NE(collator, nullptr);
+
+    auto string_block = buildStringBlock(512, 3);
+    auto aggregator = createCountAggregatorWithCollator(string_block, collator);
+    Aggregator::AggProcessInfo info(aggregator.get());
+    info.resetBlock(string_block);
+    info.prepareForAgg();
+
+    ASSERT_NE(info.dict_ids, nullptr) << "visit_cache should activate even with utf8mb4_bin collator";
+    ASSERT_EQ(info.dict_size, 3u);
+    ASSERT_EQ(info.dict_collator, collator) << "dict_collator should be stored for fast path";
+}
+CATCH
+
+/// Verify GROUP BY correctness with collator + visit_cache
+TEST_F(AggregatorDictionaryVisitCacheTest, CorrectCountWithCollator)
+try
+{
+    auto collator = TiDB::ITiDBCollator::getCollator(TiDB::ITiDBCollator::UTF8MB4_BIN);
+    ASSERT_NE(collator, nullptr);
+
+    const size_t num_rows = 1000;
+    const size_t num_distinct = 5;
+
+    auto string_block = buildStringBlock(num_rows, num_distinct);
+
+    auto collect = [](Aggregator & agg, const Block & block) {
+        auto result = std::make_shared<AggregatedDataVariants>();
+        Aggregator::AggProcessInfo info(&agg);
+        info.resetBlock(block);
+        agg.executeOnBlock(info, *result, 0);
+
+        ManyAggregatedDataVariants variants;
+        variants.push_back(result);
+        auto merged = agg.mergeAndConvertToBlocks(variants, true, 1);
+
+        std::map<String, UInt64> counts;
+        if (!merged)
+            return counts;
+        for (size_t ci = 0; ci < merged->getConcurrency(); ++ci)
+        {
+            auto output_block = merged->getData(ci);
+            if (!output_block)
+                continue;
+            size_t rows = output_block.rows();
+            if (rows == 0)
+                continue;
+            const auto & key_col = output_block.getByPosition(0).column;
+            const auto & cnt_col = output_block.getByPosition(1).column;
+            for (size_t i = 0; i < rows; ++i)
+            {
+                String key = key_col->getDataAt(i).toString();
+                UInt64 count = cnt_col->getUInt(i);
+                counts[key] += count;
+            }
+        }
+        return counts;
+    };
+
+    auto aggregator_with = createCountAggregatorWithCollator(string_block, collator);
+    auto counts_with = collect(*aggregator_with, string_block);
+
+    auto aggregator_without = createCountAggregator(string_block);
+    auto counts_without = collect(*aggregator_without, string_block);
+
+    ASSERT_EQ(counts_with.size(), num_distinct);
+    ASSERT_EQ(counts_without.size(), num_distinct);
+
+    for (size_t i = 0; i < num_distinct; ++i)
+    {
+        String key = "key_" + std::to_string(i);
+        ASSERT_EQ(counts_with[key], num_rows / num_distinct) << "Collator path mismatch for key: " << key;
+        ASSERT_EQ(counts_with[key], counts_without[key]) << "Collator vs no-collator mismatch for key: " << key;
+    }
+}
+CATCH
+
+/// Build a Nullable(ColumnDictionary) block: col0 = Nullable dict key, col1 = UInt64 values.
+/// Every null_every-th row is null (0 = no nulls).
+static Block buildNullableDictBlock(size_t num_rows, size_t num_distinct, size_t null_every)
+{
+    std::vector<Field> dict;
+    dict.reserve(num_distinct);
+    for (size_t i = 0; i < num_distinct; ++i)
+        dict.push_back(Field(String("key_") + std::to_string(i)));
+
+    PaddedPODArray<UInt32> ids;
+    ids.reserve(num_rows);
+    for (size_t i = 0; i < num_rows; ++i)
+        ids.push_back(static_cast<UInt32>(i % num_distinct));
+
+    auto dict_col = ColumnDictionary::createMutable(std::move(dict), std::move(ids), std::make_shared<DataTypeString>());
+
+    auto null_map = ColumnUInt8::create();
+    for (size_t i = 0; i < num_rows; ++i)
+        null_map->insert(Field(static_cast<UInt64>((null_every > 0 && i % null_every == 0) ? 1 : 0)));
+
+    auto nullable_col = ColumnNullable::create(std::move(dict_col), std::move(null_map));
+
+    auto val_col = ColumnUInt64::create();
+    for (size_t i = 0; i < num_rows; ++i)
+        val_col->insert(Field(static_cast<UInt64>(1)));
+
+    Block block;
+    block.insert(ColumnWithTypeAndName(
+        std::move(nullable_col),
+        std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>()),
+        "key"));
+    block.insert(ColumnWithTypeAndName(std::move(val_col), std::make_shared<DataTypeUInt64>(), "val"));
+    return block;
+}
+
+/// Build a Nullable(ColumnString) block for comparison.
+static Block buildNullableStringBlock(size_t num_rows, size_t num_distinct, size_t null_every)
+{
+    auto str_col = ColumnString::create();
+    auto null_map = ColumnUInt8::create();
+    for (size_t i = 0; i < num_rows; ++i)
+    {
+        str_col->insert(Field(String("key_") + std::to_string(i % num_distinct)));
+        null_map->insert(Field(static_cast<UInt64>((null_every > 0 && i % null_every == 0) ? 1 : 0)));
+    }
+
+    auto nullable_col = ColumnNullable::create(std::move(str_col), std::move(null_map));
+
+    auto val_col = ColumnUInt64::create();
+    for (size_t i = 0; i < num_rows; ++i)
+        val_col->insert(Field(static_cast<UInt64>(1)));
+
+    Block block;
+    block.insert(ColumnWithTypeAndName(
+        std::move(nullable_col),
+        std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>()),
+        "key"));
+    block.insert(ColumnWithTypeAndName(std::move(val_col), std::make_shared<DataTypeUInt64>(), "val"));
+    return block;
+}
+
+/// Nullable(ColumnDictionary) GROUP BY should produce correct results via the
+/// serialized-method fast path (executeDictionaryKeyFastPathNullable).
+TEST_F(AggregatorDictionaryVisitCacheTest, NullableDictionaryKeyCorrectness)
+try
+{
+    const size_t num_rows = 1000;
+    const size_t num_distinct = 5;
+    const size_t null_every = 7; // every 7th row is null
+
+    auto nullable_dict_block = buildNullableDictBlock(num_rows, num_distinct, null_every);
+    auto nullable_string_block = buildNullableStringBlock(num_rows, num_distinct, null_every);
+
+    auto dict_counts = runAggregation(nullable_dict_block);
+    auto string_counts = runAggregation(nullable_string_block);
+
+    // Both should produce the same results (including null group).
+    ASSERT_EQ(dict_counts.size(), string_counts.size())
+        << "Dict has " << dict_counts.size() << " groups, String has " << string_counts.size();
+
+    for (const auto & [key, count] : string_counts)
+    {
+        ASSERT_TRUE(dict_counts.count(key))
+            << "Missing key in dict result: " << key;
+        ASSERT_EQ(dict_counts[key], count)
+            << "Count mismatch for key: " << key << " (dict=" << dict_counts[key] << ", string=" << count << ")";
+    }
+}
+CATCH
+
+/// Verify dict_ids + dict_null_map are set for Nullable(ColumnDictionary)
+TEST_F(AggregatorDictionaryVisitCacheTest, NullableDictVisitCacheActivation)
+try
+{
+    auto block = buildNullableDictBlock(512, 3, 10);
+    auto aggregator = createCountAggregator(block);
+    Aggregator::AggProcessInfo info(aggregator.get());
+    info.resetBlock(block);
+    info.prepareForAgg();
+
+    ASSERT_NE(info.dict_ids, nullptr) << "dict_ids should be set for Nullable(ColumnDictionary)";
+    ASSERT_EQ(info.dict_size, 3u);
+    ASSERT_NE(info.dict_null_map, nullptr) << "dict_null_map should be set for nullable key";
+}
+CATCH
+
+/// Verify dict_ids + dict_null_map are set for Nullable(ColumnString) auto-encode
+TEST_F(AggregatorDictionaryVisitCacheTest, NullableStringAutoEncodeActivation)
+try
+{
+    auto block = buildNullableStringBlock(512, 3, 10);
+    auto aggregator = createCountAggregator(block);
+    Aggregator::AggProcessInfo info(aggregator.get());
+    info.resetBlock(block);
+    info.prepareForAgg();
+
+    ASSERT_NE(info.dict_ids, nullptr) << "dict_ids should be set for Nullable(ColumnString) auto-encode";
+    ASSERT_EQ(info.dict_size, 3u);
+    ASSERT_NE(info.dict_null_map, nullptr) << "dict_null_map should be set for nullable key";
+    ASSERT_NE(info.auto_encoded_dict_col, nullptr) << "auto_encoded_dict_col should hold temporary";
+}
+CATCH
+
+/// Nullable with no actual nulls should still use the fast path and produce correct results
+TEST_F(AggregatorDictionaryVisitCacheTest, NullableDictNoActualNulls)
+try
+{
+    const size_t num_rows = 1000;
+    const size_t num_distinct = 5;
+
+    auto block = buildNullableDictBlock(num_rows, num_distinct, 0);
+    auto counts = runAggregation(block);
+
+    ASSERT_EQ(counts.size(), num_distinct);
+    for (size_t i = 0; i < num_distinct; ++i)
+    {
+        String key = "key_" + std::to_string(i);
+        ASSERT_EQ(counts[key], num_rows / num_distinct) << "Mismatch for key: " << key;
+    }
+}
+CATCH
+
+} // namespace DB::tests

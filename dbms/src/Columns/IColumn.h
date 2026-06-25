@@ -72,6 +72,14 @@ public:
       */
     virtual Ptr convertToFullColumnIfConst() const { return {}; }
 
+    /** If column is dictionary-encoded, materializes it to a regular column.
+      * Returns the column itself if not dictionary-encoded.
+      */
+    virtual Ptr convertToFullColumnIfDictionary() const { return getPtr(); }
+
+    /// Returns true if this column is dictionary-encoded
+    virtual bool isDictionaryEncoded() const { return false; }
+
     /// Creates empty column with the same type.
     virtual MutablePtr cloneEmpty() const { return cloneResized(0); }
 

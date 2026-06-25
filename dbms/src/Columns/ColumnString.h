@@ -143,6 +143,12 @@ public:
 
     void insertFrom(const IColumn & src_, size_t n) override
     {
+        if (unlikely(src_.isDictionaryEncoded()))
+        {
+            auto materialized = src_.convertToFullColumnIfDictionary();
+            insertFrom(*materialized, n);
+            return;
+        }
         const auto & src = static_cast<const ColumnString &>(src_);
         insertFromImpl(src, n);
     }
@@ -150,6 +156,12 @@ public:
     /// TODO: might be further optimized by using the same char* and offeset
     void insertManyFrom(const IColumn & src_, size_t position, size_t length) override
     {
+        if (unlikely(src_.isDictionaryEncoded()))
+        {
+            auto materialized = src_.convertToFullColumnIfDictionary();
+            insertManyFrom(*materialized, position, length);
+            return;
+        }
         const auto & src = static_cast<const ColumnString &>(src_);
         offsets.reserve(offsets.size() + length);
         for (size_t i = 0; i < length; ++i)
@@ -159,6 +171,12 @@ public:
     void insertSelectiveRangeFrom(const IColumn & src_, const Offsets & selective_offsets, size_t start, size_t length)
         override
     {
+        if (unlikely(src_.isDictionaryEncoded()))
+        {
+            auto materialized = src_.convertToFullColumnIfDictionary();
+            insertSelectiveRangeFrom(*materialized, selective_offsets, start, length);
+            return;
+        }
         RUNTIME_CHECK(selective_offsets.size() >= start + length);
         const auto & src = static_cast<const ColumnString &>(src_);
         offsets.reserve(offsets.size() + length);

@@ -44,6 +44,7 @@ const std::unordered_map<CompressionMethodByte, CompressionMethod> method_map = 
     {CompressionMethodByte::RunLength, CompressionMethod::NONE},
     {CompressionMethodByte::FOR, CompressionMethod::NONE},
     {CompressionMethodByte::Lightweight, CompressionMethod::Lightweight},
+    {CompressionMethodByte::Dictionary, CompressionMethod::NONE},
 };
 
 struct CompressionSetting

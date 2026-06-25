@@ -13,6 +13,8 @@
 // limitations under the License.
 
 #include <IO/Compression/CompressedReadBufferFromFile.h>
+#include <IO/Compression/CompressionCodecDictionary.h>
+#include <IO/Compression/CompressionInfo.h>
 
 namespace DB
 {
@@ -134,6 +136,54 @@ size_t CompressedReadBufferFromFileImpl<has_legacy_checksum>::readBig(char * to,
     }
 
     return bytes_read;
+}
+
+template <bool has_legacy_checksum>
+ColumnPtr CompressedReadBufferFromFileImpl<has_legacy_checksum>::tryReadBlockAsColumnDictionary(
+    const DataTypePtr & value_type)
+{
+    size_t size_decompressed;
+    size_t size_compressed_without_checksum;
+    size_t new_size_compressed = this->readCompressedData(size_decompressed, size_compressed_without_checksum);
+    if (!new_size_compressed)
+        return nullptr;
+
+    UInt8 method_byte = ICompressionCodec::readMethod(this->compressed_buffer);
+    if (method_byte == static_cast<UInt8>(CompressionMethodByte::Dictionary))
+    {
+        constexpr UInt8 header_size = ICompressionCodec::getHeaderSize();
+        const char * data = this->compressed_buffer + header_size;
+        UInt32 data_size = static_cast<UInt32>(size_compressed_without_checksum - header_size);
+
+        CompressionCodecDictionary dict_codec;
+        auto result = dict_codec.decompressAsColumnDictionary(data, data_size, size_decompressed, value_type);
+        if (result)
+        {
+            size_compressed = new_size_compressed;
+            memory.resize(0);
+            working_buffer = Buffer(memory.data(), memory.data());
+            pos = working_buffer.begin();
+            return result;
+        }
+    }
+
+    // Not dictionary-encoded or fallback: decompress normally
+    assert(size_decompressed > 0);
+    memory.resize(size_decompressed);
+    working_buffer = Buffer(&memory[0], &memory[size_decompressed]);
+    this->decompress(working_buffer.begin(), size_decompressed, size_compressed_without_checksum);
+    size_compressed = new_size_compressed;
+    return nullptr;
+}
+
+template <bool has_legacy_checksum>
+void CompressedReadBufferFromFileImpl<has_legacy_checksum>::seekToFilePosition(size_t offset_in_compressed_file)
+{
+    [[maybe_unused]] auto ret = file_in.seek(offset_in_compressed_file);
+    size_compressed = 0;
+    memory.resize(0);
+    working_buffer = Buffer(memory.data(), memory.data());
+    pos = working_buffer.begin();
 }
 
 template class CompressedReadBufferFromFileImpl<true>;

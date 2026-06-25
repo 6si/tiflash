@@ -17,6 +17,7 @@
 #pragma once
 
 #include <Columns/ColumnAggregateFunction.h>
+#include <Columns/ColumnDictionary.h>
 #include <Columns/ColumnFixedString.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
@@ -994,6 +995,25 @@ public:
         size_t hit_row_cnt = 0;
         std::vector<UInt64> not_found_rows;
 
+        /// Visit-cache: when the single key column is ColumnDictionary (or a
+        /// low-cardinality ColumnString that we auto-encode), we save dictionary
+        /// entries and per-row IDs so the fast path can do K hash lookups
+        /// (K = dictionary size) instead of N (N = row count).
+        const PaddedPODArray<UInt32> * dict_ids = nullptr;
+        std::vector<StringRef> dict_entries_refs;
+        size_t dict_size = 0;
+        /// Null map for Nullable<ColumnString> keys. When non-null, rows where
+        /// (*dict_null_map)[i] != 0 are null and get a separate aggregate state.
+        const PaddedPODArray<UInt8> * dict_null_map = nullptr;
+        /// Holds the auto-encoded ColumnDictionary when we build one on-the-fly
+        /// from a low-cardinality ColumnString key. Prevents dangling pointers.
+        ColumnPtr auto_encoded_dict_col;
+        /// Collator for the dictionary key column. When non-null,
+        /// executeDictionaryKeyFastPath applies sortKey() to each dictionary
+        /// entry before hash-table insertion so that collation-aware grouping
+        /// is correct (e.g. utf8mb4_bin trailing-space trimming).
+        TiDB::TiDBCollatorPtr dict_collator = nullptr;
+
         void prepareForAgg();
         bool allBlockDataHandled() const
         {
@@ -1012,6 +1032,12 @@ public:
             hit_row_cnt = 0;
             not_found_rows.clear();
             not_found_rows.reserve(block_.rows() / 2);
+
+            dict_ids = nullptr;
+            dict_entries_refs.clear();
+            dict_size = 0;
+            dict_null_map = nullptr;
+            auto_encoded_dict_col = nullptr;
         }
     };
 
@@ -1028,6 +1054,23 @@ public:
 
     template <bool collect_hit_rate, bool only_lookup>
     bool executeOnBlockImpl(AggProcessInfo & agg_process_info, AggregatedDataVariants & result, size_t thread_num);
+
+    /// Visit-cache fast path for dictionary-encoded key columns.
+    /// Does K hash lookups (K = dictionary size) instead of N (N = rows).
+    template <typename Method>
+    void executeDictionaryKeyFastPath(
+        Method & method,
+        AggregatedDataVariants & result,
+        AggProcessInfo & agg_process_info) const;
+
+    /// Nullable variant: handles Nullable(ColumnDictionary) keys with the
+    /// serialized aggregation method. Constructs serialized keys for each
+    /// dictionary entry (K+1 lookups including null) instead of N.
+    template <typename Method>
+    void executeDictionaryKeyFastPathNullable(
+        Method & method,
+        AggregatedDataVariants & result,
+        AggProcessInfo & agg_process_info) const;
 
     /** Merge several aggregation data structures and output the MergingBucketsPtr used to merge.
       * Return nullptr if there are no non empty data_variant.

@@ -15,7 +15,9 @@
 // limitations under the License.
 
 #include <Columns/ColumnConst.h>
+#include <Columns/ColumnDictionary.h>
 #include <Columns/ColumnNullable.h>
+#include <Columns/ColumnString.h>
 #include <Common/typeid_cast.h>
 #include <DataTypes/DataTypeNothing.h>
 #include <DataTypes/DataTypeNullable.h>
@@ -24,6 +26,8 @@
 
 #include <ext/collection_cast.h>
 #include <ext/range.h>
+
+#include <unordered_map>
 
 
 namespace DB
@@ -226,12 +230,206 @@ bool IExecutableFunction::defaultImplementationForNulls(Block & block, const Col
     return false;
 }
 
+bool IExecutableFunction::defaultImplementationForDictionaryColumns(
+    Block & block,
+    const ColumnNumbers & args,
+    size_t result) const
+{
+    if (args.empty() || !useDefaultImplementationForDictionaryColumns())
+        return false;
+
+    // Find dictionary columns among arguments
+    size_t dict_arg_idx = args.size(); // sentinel: not found
+    size_t num_dict_cols = 0;
+    for (size_t i = 0; i < args.size(); ++i)
+    {
+        const auto & col = block.getByPosition(args[i]).column;
+        if (col && col->isDictionaryEncoded())
+        {
+            dict_arg_idx = i;
+            ++num_dict_cols;
+        }
+    }
+
+    // Auto-encode: If no dictionary columns found, check if there's a String column
+    // alongside constants that could benefit from dictionary encoding.
+    // Only try if block is large enough to justify the O(N) scan.
+    static constexpr size_t MIN_ROWS_FOR_AUTO_ENCODE = 256;
+    static constexpr UInt32 MAX_DICT_SIZE_AUTO = 65536;
+    ColumnPtr original_string_col; // saved for restoration after auto-encode fast path
+    size_t auto_encoded_arg_idx = args.size(); // sentinel
+    if (num_dict_cols == 0 && args.size() >= 2)
+    {
+        size_t string_arg_idx = args.size();
+        bool has_const_arg = false;
+        for (size_t i = 0; i < args.size(); ++i)
+        {
+            const auto & col = block.getByPosition(args[i]).column;
+            if (!col)
+                continue;
+            if (col->isColumnConst())
+            {
+                has_const_arg = true;
+            }
+            else if (string_arg_idx == args.size() && typeid_cast<const ColumnString *>(col.get()))
+            {
+                string_arg_idx = i;
+            }
+        }
+
+        if (has_const_arg && string_arg_idx != args.size())
+        {
+            const auto & col = block.getByPosition(args[string_arg_idx]).column;
+            auto encoded = ColumnDictionary::tryAutoEncode(col, MIN_ROWS_FOR_AUTO_ENCODE, MAX_DICT_SIZE_AUTO);
+            if (encoded.get() != col.get())
+            {
+                original_string_col = block.getByPosition(args[string_arg_idx]).column;
+                auto_encoded_arg_idx = string_arg_idx;
+                block.getByPosition(args[string_arg_idx]).column = encoded;
+                dict_arg_idx = string_arg_idx;
+                num_dict_cols = 1;
+            }
+        }
+    }
+
+    if (num_dict_cols == 0)
+        return false;
+
+    const auto * dict_col = typeid_cast<const ColumnDictionary *>(
+        block.getByPosition(args[dict_arg_idx]).column.get());
+    if (!dict_col)
+        return false;
+
+    // Fast path: single dictionary column + all other args are const
+    // Execute function on dictionary entries only (K values), then remap via IDs
+    bool all_others_const = true;
+    if (num_dict_cols == 1)
+    {
+        for (size_t i = 0; i < args.size(); ++i)
+        {
+            if (i == dict_arg_idx)
+                continue;
+            const auto & col = block.getByPosition(args[i]).column;
+            if (col && !col->isColumnConst())
+            {
+                all_others_const = false;
+                break;
+            }
+        }
+    }
+    else
+    {
+        all_others_const = false;
+    }
+
+    if (all_others_const && num_dict_cols == 1)
+    {
+        const auto & dictionary = dict_col->getDictionary();
+        const auto & ids = dict_col->getDictionaryIds();
+        size_t dict_size = dictionary.size();
+        size_t num_rows = ids.size();
+
+        // Build a temporary block with dictionary entries as a regular column
+        Block dict_block;
+        for (size_t i = 0; i < args.size(); ++i)
+        {
+            const auto & original = block.getByPosition(args[i]);
+            if (i == dict_arg_idx)
+            {
+                // Replace dictionary column with its dictionary entries as ColumnString
+                auto dict_string_col = dict_col->getValueType()->createColumn();
+                for (size_t d = 0; d < dict_size; ++d)
+                    dict_string_col->insert(dictionary[d]);
+                dict_block.insert({std::move(dict_string_col), original.type, original.name});
+            }
+            else
+            {
+                // Resize const column to dict_size
+                if (const auto * const_col = typeid_cast<const ColumnConst *>(original.column.get()))
+                {
+                    dict_block.insert(
+                        {ColumnConst::create(const_col->getDataColumnPtr(), dict_size),
+                         original.type,
+                         original.name});
+                }
+                else
+                {
+                    dict_block.insert(original);
+                }
+            }
+        }
+
+        // Add result column placeholder
+        dict_block.insert(block.getByPosition(result));
+
+        // Build argument indices for the temporary block
+        ColumnNumbers dict_args(args.size());
+        for (size_t i = 0; i < args.size(); ++i)
+            dict_args[i] = i;
+        size_t dict_result = args.size();
+
+        // Execute function on dictionary entries only
+        executeImpl(dict_block, dict_args, dict_result);
+
+        // Remap results: for each row, look up the pre-computed result using its dictionary ID
+        const auto & dict_result_col = dict_block.getByPosition(dict_result).column;
+        MutableColumnPtr remapped;
+
+        // Fast remap for UInt8 result (common for comparison/filter functions)
+        if (const auto * uint8_result = typeid_cast<const ColumnUInt8 *>(dict_result_col.get()))
+        {
+            auto uint8_remapped = ColumnUInt8::create();
+            auto & out_data = uint8_remapped->getData();
+            out_data.resize(num_rows);
+            const auto & src_data = uint8_result->getData();
+            for (size_t i = 0; i < num_rows; ++i)
+                out_data[i] = src_data[ids[i]];
+            remapped = std::move(uint8_remapped);
+        }
+        else
+        {
+            remapped = dict_result_col->cloneEmpty();
+            remapped->reserve(num_rows);
+            for (size_t i = 0; i < num_rows; ++i)
+                remapped->insertFrom(*dict_result_col, ids[i]);
+        }
+
+        block.getByPosition(result).column = std::move(remapped);
+        // Restore original ColumnString if we auto-encoded it
+        if (original_string_col && auto_encoded_arg_idx < args.size())
+            block.getByPosition(args[auto_encoded_arg_idx]).column = original_string_col;
+        return true;
+    }
+
+    // Slow path: multiple dictionary columns or mixed with non-const columns
+    // Materialize all dictionary columns to regular columns
+    Block materialized_block = block;
+    for (size_t i = 0; i < args.size(); ++i)
+    {
+        auto & col_ref = materialized_block.getByPosition(args[i]);
+        if (col_ref.column && col_ref.column->isDictionaryEncoded())
+        {
+            col_ref.column = col_ref.column->convertToFullColumnIfDictionary();
+        }
+    }
+
+    executeImpl(materialized_block, args, result);
+    block.getByPosition(result).column = materialized_block.getByPosition(result).column;
+    // Restore original ColumnString if we auto-encoded it
+    if (original_string_col && auto_encoded_arg_idx < args.size())
+        block.getByPosition(args[auto_encoded_arg_idx]).column = original_string_col;
+    return true;
+}
+
 void IExecutableFunction::execute(Block & block, const ColumnNumbers & args, size_t result) const
 {
     if (defaultImplementationForConstantArguments(block, args, result))
         return;
 
     if (defaultImplementationForNulls(block, args, result))
+        return;
+
+    if (defaultImplementationForDictionaryColumns(block, args, result))
         return;
 
     executeImpl(block, args, result);

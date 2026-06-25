@@ -154,6 +154,11 @@ public:
     std::atomic<uint64_t> fts_brute_total_read_ms{0};
     std::atomic<uint64_t> fts_brute_total_search_ms{0};
 
+    // dictionary encoding related
+    std::atomic<uint64_t> dict_encoded_columns{0};
+    std::atomic<uint64_t> dict_total_rows_encoded{0};
+    std::atomic<uint64_t> dict_max_cardinality{0};
+
     const KeyspaceID keyspace_id;
     ReadMode read_mode = ReadMode::Normal; // note: share struct padding with keyspace_id
     const String resource_group_name;
@@ -263,6 +268,10 @@ public:
         fts_idx_tiny_total_read_others_ms = tiflash_scan_context_pb.fts_idx_tiny_total_read_others_ms();
         fts_brute_total_read_ms = tiflash_scan_context_pb.fts_brute_total_read_ms();
         fts_brute_total_search_ms = tiflash_scan_context_pb.fts_brute_total_search_ms();
+
+        dict_encoded_columns = tiflash_scan_context_pb.dict_encoded_columns();
+        dict_total_rows_encoded = tiflash_scan_context_pb.dict_total_rows_encoded();
+        dict_max_cardinality = tiflash_scan_context_pb.dict_max_cardinality();
     }
 
     tipb::TiFlashScanContext serialize()
@@ -351,6 +360,10 @@ public:
         tiflash_scan_context_pb.set_fts_idx_tiny_total_read_others_ms(fts_idx_tiny_total_read_others_ms);
         tiflash_scan_context_pb.set_fts_brute_total_read_ms(fts_brute_total_read_ms);
         tiflash_scan_context_pb.set_fts_brute_total_search_ms(fts_brute_total_search_ms);
+
+        tiflash_scan_context_pb.set_dict_encoded_columns(dict_encoded_columns);
+        tiflash_scan_context_pb.set_dict_total_rows_encoded(dict_total_rows_encoded);
+        tiflash_scan_context_pb.set_dict_max_cardinality(dict_max_cardinality);
 
         return tiflash_scan_context_pb;
     }
@@ -448,6 +461,11 @@ public:
         fts_idx_tiny_total_read_others_ms += other.fts_idx_tiny_total_read_others_ms;
         fts_brute_total_read_ms += other.fts_brute_total_read_ms;
         fts_brute_total_search_ms += other.fts_brute_total_search_ms;
+
+        dict_encoded_columns += other.dict_encoded_columns;
+        dict_total_rows_encoded += other.dict_total_rows_encoded;
+        if (other.dict_max_cardinality > dict_max_cardinality)
+            dict_max_cardinality.store(other.dict_max_cardinality.load());
     }
 
     void merge(const tipb::TiFlashScanContext & other)
@@ -537,6 +555,11 @@ public:
         fts_idx_tiny_total_read_others_ms += other.fts_idx_tiny_total_read_others_ms();
         fts_brute_total_read_ms += other.fts_brute_total_read_ms();
         fts_brute_total_search_ms += other.fts_brute_total_search_ms();
+
+        dict_encoded_columns += other.dict_encoded_columns();
+        dict_total_rows_encoded += other.dict_total_rows_encoded();
+        if (other.dict_max_cardinality() > dict_max_cardinality)
+            dict_max_cardinality.store(other.dict_max_cardinality());
     }
 
     String toJson() const;

@@ -2046,6 +2046,119 @@ try
 }
 CATCH
 
+TEST_P(DMFileTest, DictionaryOnDiskStringColumn)
+try
+{
+    auto cols = DMTestEnv::getDefaultColumns();
+    ColumnDefine str_col(2, "status", typeFromString(DataTypeString::getDefaultName()));
+    cols->push_back(str_col);
+
+    reload(cols);
+
+    const size_t num_rows_write = 128;
+    // Low cardinality: 5 distinct values repeated across 128 rows
+    std::vector<String> values = {"active", "inactive", "pending", "deleted", "archived"};
+    Strings col_data;
+    col_data.reserve(num_rows_write);
+    for (size_t i = 0; i < num_rows_write; ++i)
+        col_data.push_back(values[i % values.size()]);
+
+    {
+        Block block = DMTestEnv::prepareSimpleWriteBlock(0, num_rows_write, false);
+        block.insert(ColumnWithTypeAndName{
+            DB::tests::makeColumn<String>(str_col.type, col_data),
+            str_col.type,
+            str_col.name,
+            str_col.id});
+
+        auto stream = std::make_unique<DMFileBlockOutputStream>(dbContext(), dm_file, *cols);
+        DMFileBlockOutputStream::BlockProperty block_property;
+        stream->writePrefix();
+        stream->write(block, block_property);
+        stream->writeSuffix();
+    }
+
+    {
+        // Verify the on-disk type is SizePrefix (not StringV2) for dictionary-encoded columns
+        auto type_on_disk = dm_file->getColumnStat(str_col.id).type;
+        ASSERT_EQ(type_on_disk->getName(), "String");
+    }
+
+    {
+        // Read back and verify data correctness
+        DMFileBlockInputStreamBuilder builder(dbContext());
+        auto stream
+            = builder.setColumnCache(column_cache)
+                  .build(dm_file, *cols, RowKeyRanges{RowKeyRange::newAll(false, 1)}, std::make_shared<ScanContext>());
+        ASSERT_INPUTSTREAM_COLS_UR(
+            stream,
+            Strings({DMTestEnv::pk_name, str_col.name}),
+            createColumns({
+                createColumn<Int64>(createNumbers<Int64>(0, num_rows_write)),
+                createColumn<String>(col_data),
+            }));
+    }
+}
+CATCH
+
+TEST_P(DMFileTest, DictionaryOnDiskMultiBlock)
+try
+{
+    auto cols = DMTestEnv::getDefaultColumns();
+    ColumnDefine str_col(2, "status", typeFromString(DataTypeString::getDefaultName()));
+    cols->push_back(str_col);
+
+    reload(cols);
+
+    // Write multiple packs to force multi-block compressed data.
+    // Each pack becomes a separate compressed block in the DMFile.
+    const size_t packs = 4;
+    const size_t rows_per_pack = 8192;
+    const size_t total_rows = packs * rows_per_pack;
+
+    std::vector<String> values = {"active", "inactive", "pending", "deleted", "archived"};
+    Strings all_data;
+    all_data.reserve(total_rows);
+    for (size_t i = 0; i < total_rows; ++i)
+        all_data.push_back(values[i % values.size()]);
+
+    {
+        auto stream = std::make_unique<DMFileBlockOutputStream>(dbContext(), dm_file, *cols);
+        stream->writePrefix();
+        for (size_t p = 0; p < packs; ++p)
+        {
+            size_t start = p * rows_per_pack;
+            Block block = DMTestEnv::prepareSimpleWriteBlock(start, start + rows_per_pack, false);
+            Strings pack_data(all_data.begin() + start, all_data.begin() + start + rows_per_pack);
+            block.insert(ColumnWithTypeAndName{
+                DB::tests::makeColumn<String>(str_col.type, pack_data),
+                str_col.type,
+                str_col.name,
+                str_col.id});
+            DMFileBlockOutputStream::BlockProperty block_property;
+            stream->write(block, block_property);
+        }
+        stream->writeSuffix();
+    }
+
+    {
+        // Read all packs in one go — exercises multi-block dictionary read path
+        DMFileBlockInputStreamBuilder builder(dbContext());
+        auto stream
+            = builder.setColumnCache(column_cache)
+                  .build(dm_file, *cols, RowKeyRanges{RowKeyRange::newAll(false, 1)}, std::make_shared<ScanContext>());
+
+        ASSERT_INPUTSTREAM_COLS_UR(
+            stream,
+            Strings({DMTestEnv::pk_name, str_col.name}),
+            createColumns({
+                createColumn<Int64>(createNumbers<Int64>(0, total_rows)),
+                createColumn<String>(all_data),
+            }));
+    }
+}
+CATCH
+
 TEST_P(DMFileTest, NullableType)
 try
 {

@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include <Columns/IColumn.h>
+#include <DataTypes/IDataType.h>
 #include <IO/Buffer/ReadBufferFromFileBase.h>
 #include <IO/Compression/CompressedReadBufferBase.h>
 
@@ -30,6 +32,18 @@ struct CompressedSeekableReaderBuffer : public BufferWithOwnMemory<ReadBuffer>
         = 0;
 
     virtual void seek(size_t offset_in_compressed_file, size_t offset_in_decompressed_block) = 0;
+
+    /// Position the file pointer at a compressed block boundary WITHOUT decompressing.
+    /// After this call, tryReadBlockAsColumnDictionary() will read from the positioned block.
+    virtual void seekToFilePosition(size_t offset_in_compressed_file)
+    {
+        seek(offset_in_compressed_file, 0);
+    }
+
+    /// Try to read the next compressed block as a ColumnDictionary.
+    /// Returns ColumnDictionary if the block uses Dictionary codec, nullptr otherwise.
+    /// On nullptr, the block is decompressed normally into working_buffer.
+    virtual ColumnPtr tryReadBlockAsColumnDictionary(const DataTypePtr & /*value_type*/) { return nullptr; }
 
     CompressedSeekableReaderBuffer()
         : BufferWithOwnMemory<ReadBuffer>(0)
@@ -48,6 +62,10 @@ public:
     void seek(size_t offset_in_compressed_file, size_t offset_in_decompressed_block) override;
 
     size_t readBig(char * to, size_t n) override;
+
+    ColumnPtr tryReadBlockAsColumnDictionary(const DataTypePtr & value_type) override;
+
+    void seekToFilePosition(size_t offset_in_compressed_file) override;
 
     void setProfileCallback(const ReadBufferFromFileBase::ProfileCallback & profile_callback_, clockid_t clock_type_)
         override
